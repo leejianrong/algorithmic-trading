@@ -198,9 +198,7 @@ class Guardrails:
         # position cap is a concentration limit and stays fixed. The scale is 1.0
         # whenever targeting is off, so this term is unchanged in that case.
         effective_gross = self._config.max_gross_exposure * self._vol_scale
-        allowed_gross = (
-            effective_gross * equity - current_gross - self._committed_gross
-        ) / price
+        allowed_gross = (effective_gross * equity - current_gross - self._committed_gross) / price
         allowed = min(order.qty, allowed_position, allowed_gross)
 
         if allowed <= SHARE_EPS:
