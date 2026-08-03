@@ -1,154 +1,200 @@
 # Algorithmic Trading Test Bench: Slices
 
 Vertical increments. Each ends in something you can demonstrate. Slice 1
-confronts the riskiest unknown: whether the event-driven engine + data adapter +
-simulated broker + portfolio produce a correct, look-ahead-free equity curve.
+confronts the riskiest unknown: whether the event-driven engine + multi-symbol
+portfolio + simulated broker on adjusted data produce a correct, look-ahead-free
+equity curve.
 
-## V1: End-to-end backtest of buy-and-hold on one symbol
+## V1: End-to-end backtest of buy-and-hold across two symbols (adjusted data)
 
-**Delivers:** R0, R2 (partial), R3 (partial)
+**Delivers:** R0, R2, R3 (partial)
 
 **Build plan**
 
-1. Define core types: `Bar`, `Instrument`, `Order`, `Position`.
-2. Implement `DataAdapter` interface, `YFinanceAdapter` with read-through
-   parquet/CSV cache, and a `FakeAdapter` yielding a synthetic bar series.
+1. Define core types: tz-aware `Bar` (adjusted), `Instrument`, `Order`,
+   `Position`, and a multi-symbol `Portfolio` (positions keyed by symbol + cash).
+2. Implement `DataAdapter` + `YFinanceAdapter` (fetch **adjusted**, read-through
+   parquet/CSV cache keyed by symbol/interval/range/adjustment) + a `FakeAdapter`
+   yielding a synthetic multi-symbol series.
 3. Implement `SimulatedBroker`: next-open fills ± slippage, commission, cash and
-   position updates, underfunded-order rejection.
-4. Implement the engine loop + simulated clock (advance immediately) marking the
-   portfolio to each bar's close, and a `buy_and_hold` strategy.
-5. Wire `trading backtest --strategy buy_and_hold --symbol AAPL --from … --to …`
+   per-symbol position updates, underfunded-order rejection.
+4. Implement the engine loop + immediate clock: per timestamp, assemble the day's
+   bars across the universe, call the strategy, route orders, mark the portfolio
+   to each symbol's adjusted close. Ship a `buy_and_hold` strategy.
+5. Wire `trading backtest --strategy buy_and_hold --symbols AAPL,MSFT --from … --to …`
    to print final equity and write an equity-curve CSV.
 
-**Demo:** run the command on a cached range; see final equity and total return
-printed, and confirm they match a hand-computed `initial_cash / entry_price ×
-final_price` within commission/slippage. Re-run with the network off — it works
-from cache and prints identical numbers.
+**Demo:** run on a cached range; final equity and total return match a
+hand-computed split of capital across the two symbols within costs. Re-run with
+the network off — works from cache, identical numbers. Run buy-and-hold across a
+known split date and confirm no phantom crash appears in the curve.
 
-**Rests on assumptions:** Q14 (fills at next open ± slippage), Q17 (equity marked
-at close). If wrong, the numbers shift but the mechanism stands.
+**Rests on assumptions:** Q14 (next-open fills), Q17 (equity at adjusted close),
+Q22 (starting capital). Wrong → numbers shift, mechanism stands.
 
 ### Test plan
 
 #### End-to-end
-- Buy-and-hold on a 5-bar synthetic series yields the exact hand-computed equity
-  curve and final return (the acceptance criterion).
-- Cached real-data buy-and-hold matches `shares × final_close` within fees.
-- Second run with no network reproduces the first run bit-for-bit.
+- Buy-and-hold on a 5-bar, 2-symbol synthetic series yields the exact
+  hand-computed equity curve (acceptance criterion).
+- Cached real-data buy-and-hold matches Σ(shares × final adjusted close) within
+  fees; a run spanning a real split shows no phantom crash (ADR-0008).
+- Second offline run reproduces the first bit-for-bit.
 
 #### Integration
-- `YFinanceAdapter` cache miss writes the cache; cache hit reads it and skips the
-  network (asserted with a stubbed fetch).
-- `SimulatedBroker` rejects an order exceeding available cash and leaves state
-  unchanged.
+- `YFinanceAdapter` requests adjusted data; cache miss writes, cache hit skips the
+  network (stubbed fetch).
+- Broker rejects an order exceeding cash and leaves state unchanged.
 
 #### Unit
-- Next-open fill price = open × (1 + slippage) for a buy; commission deducted.
-- Portfolio equity = cash + Σ(position × close).
+- Next-open buy fill = open × (1 + slippage); commission deducted.
+- Portfolio equity = cash + Σ(position × adjusted close) across symbols.
 
-## V2: Pluggable strategy API + SMA-crossover, with look-ahead guard
+## V2: Strategy API + target-weight sizing + SMA crossover, with look-ahead guard
 
-**Delivers:** R1, R6
+**Delivers:** R1, R4
 
 **Build plan**
 
-1. Finalize `Strategy.on_bar(bar, context) -> list[Order]`; `context` exposes
-   positions, cash, and a rolling history window with no access to future bars.
-2. Implement the strategy loader (discover by name from a strategies package).
-3. Implement `sma_crossover` (fast/slow windows from config).
-4. Add a `context`-based indicator helper for rolling means.
+1. Finalize `Strategy.on_bar(ts, bars_by_symbol, context) -> list[TargetWeight | Order]`;
+   `context` exposes positions, cash, equity, and a rolling per-symbol history —
+   no future bars.
+2. Implement the sizing layer: target weight × equity ÷ latest price, floored to
+   whole shares; reconcile against the current position (rebalance delta).
+3. Implement the strategy loader (discover by name) and `sma_crossover`
+   (fast/slow from config), plus one simple multi-symbol allocation example.
 
-**Demo:** `trading backtest --strategy sma_crossover --symbol SPY …` prints a
-trade blotter (entries/exits) and final metrics; changing the fast/slow windows
-in config visibly changes the trades.
+**Demo:** `trading backtest --strategy sma_crossover --symbols SPY,QQQ …` prints a
+trade blotter and realized-vs-target weights; changing the windows in config
+visibly changes trades.
 
-**Rests on assumptions:** Q1 (single strategy per run), Q13 (config via TOML +
-flags). Low cost if wrong.
+**Rests on assumptions:** Q13 (config), whole-share rounding leaves small residual
+cash. Low cost if wrong.
 
 ### Test plan
 
 #### End-to-end
 - SMA crossover on a crafted series produces exactly the expected buy/sell bars.
-- A "cheating" strategy that tries to read bar *t+1* cannot — the `context` API
-  exposes no future data (the look-ahead guard; acceptance criterion).
+- A "cheating" strategy cannot read bar *t+1* — `context` exposes no future data
+  (look-ahead guard; acceptance criterion).
+- A 0.20 target weight on a known equity/price yields the expected whole-share
+  quantity with correct residual cash.
 
 #### Integration
-- Strategy loader resolves a strategy by name and rejects an unknown name with a
-  clear error.
+- Strategy loader resolves by name; unknown name → clear error.
 
 #### Unit
-- Rolling-mean helper matches a reference computation and never includes the
-  current unseen future.
+- Rolling-mean helper matches a reference and never includes the unseen future.
+- Sizing floors correctly and computes the rebalance delta from current holdings.
 
-## V3: Performance report and equity-curve output
+## V3: Enforced risk guardrails
 
-**Delivers:** R4
+**Delivers:** R5
 
 **Build plan**
 
-1. Compute metrics from the equity curve: total & annualized return, Sharpe
-   (daily returns, rf = 0), max drawdown, win rate.
-2. Render a text report (summary + trade blotter) to stdout.
-3. Write `equity_curve.csv` and, if `matplotlib` is available, an optional
-   `equity_curve.png`.
+1. Implement the pre-trade checker: cash, per-symbol max position %, max gross
+   exposure — reject or clamp with a logged reason.
+2. Implement the portfolio monitor: max-drawdown and daily-loss thresholds that
+   halt new entries (optionally flatten) for the session.
+3. Wire limits into config with defaults; thread guardrails into the engine's
+   order path so every mode is protected.
 
-**Demo:** any backtest ends with a readable summary table and writes the CSV;
-open the CSV/PNG to see the curve.
+**Demo:** run a strategy that requests 200% of equity and watch the exposure cap
+clamp it; run one on a scripted crash and watch the kill switch halt new entries;
+the report lists rejected/clamped orders and whether a halt fired.
 
-**Rests on assumptions:** Q17 (Sharpe basis and rf = 0). If wrong, one constant
-changes.
+**Rests on assumptions:** Q22 (default limits). Overridable per run.
 
 ### Test plan
 
 #### End-to-end
-- A known monotonic-up equity curve reports positive return, Sharpe > 0, and zero
-  drawdown; a known dip reports the exact max drawdown (acceptance criteria).
+- A strategy targeting 200% equity is clamped to the exposure cap (acceptance
+  criterion).
+- A scripted drawdown past the threshold halts new entries; existing positions
+  behave per config (acceptance criterion).
 
 #### Integration
-- Report writer emits a well-formed CSV with one row per trading day.
+- Guardrails sit on the shared order path, so an over-limit order is blocked
+  identically whether invoked in backtest or paper wiring.
 
 #### Unit
-- Max-drawdown, Sharpe, and win-rate functions match hand-computed values on
-  small fixtures.
+- Pre-trade checker accepts an in-limit order and rejects/clamps an over-limit one
+  with the right reason.
+- Drawdown monitor fires exactly at the configured threshold, not before.
 
-## V4: Paper mode on recent daily data (same engine, wall-clock)
+## V4: Performance report, exposure, and benchmark
 
-**Delivers:** R5, R7 (interface readiness)
+**Delivers:** R6
 
 **Build plan**
 
-1. Implement a wall-clock clock and a `RecentDataAdapter` (or yfinance in
-   recent-window mode) that yields only **completed** daily bars.
-2. Add `trading paper --strategy … --symbol …` reusing the engine, broker, and
-   portfolio unchanged; append each bar's state to a session log.
-3. Ensure a paper session can start, persist its running state to the result dir,
-   and print status per new completed bar.
+1. Compute metrics from the equity curve: total & annualized return, Sharpe
+   (daily returns, rf = 0), max drawdown, average/peak exposure, win rate.
+2. Optionally compute a buy-and-hold SPY benchmark for side-by-side comparison.
+3. Render a text report (summary + trade blotter + rejected/clamped orders) and
+   write `equity_curve.csv` (+ optional `equity_curve.png`).
 
-**Demo:** run `trading paper …`; on each new completed daily bar the session logs
-the strategy's decision and simulated fills, and the equity updates — visibly the
-same accounting as backtest, only paced by the calendar.
+**Demo:** any backtest ends with a readable summary (including exposure and, if
+enabled, vs-SPY) and writes the CSV; open it to see the curve.
 
-**Rests on assumptions:** the "latest" daily bar is only acted on once complete
-(avoids acting on a partial/forming bar). If wrong, decisions use unfinished data.
+**Rests on assumptions:** Q17 (Sharpe basis), Q24 (SPY benchmark). One
+constant/column each.
+
+### Test plan
+
+#### End-to-end
+- A known monotonic-up curve reports positive return, Sharpe > 0, zero drawdown;
+  a known dip reports the exact max drawdown (acceptance criteria).
+
+#### Integration
+- Report writer emits a well-formed CSV, one row per trading day, and a benchmark
+  column when enabled.
+
+#### Unit
+- Max-drawdown, Sharpe, exposure, and win-rate functions match hand-computed
+  values on small fixtures.
+
+## V5: Paper mode on recent daily data (same engine + guardrails, wall-clock)
+
+**Delivers:** R7, R8 (interface readiness)
+
+**Build plan**
+
+1. Implement a wall-clock clock and a recent-window feed that yields only
+   **completed** daily bars.
+2. Add `trading paper --strategy … --symbols …` reusing engine, sizing, broker,
+   portfolio, and guardrails unchanged; append each bar's state to a session log
+   and persist running state to the result dir.
+3. Print status per new completed bar; verify guardrails apply identically.
+
+**Demo:** run `trading paper …`; on each new completed daily bar it logs the
+strategy's decision, simulated fills, guardrail actions, and updated equity —
+visibly the same accounting and limits as backtest, only paced by the calendar.
+
+**Rests on assumptions:** act on a daily bar only once complete (avoid a forming
+bar). Wrong → decisions use unfinished data.
 
 ### Test plan
 
 #### End-to-end
 - Fed a scripted sequence of "newly completed" bars via a fake clock/feed, paper
-  mode places the same orders the backtest would for the same bars (parity —
+  mode places the same orders the backtest would for the same bars (parity;
   acceptance criterion).
 
 #### Integration
-- The wall-clock clock waits for and only emits completed bars (driven by a fake
-  clock, no real waiting in tests).
+- The wall-clock clock waits for and emits only completed bars (fake clock, no
+  real waiting).
+- Guardrails halt a paper session on a scripted drawdown exactly as in backtest.
 
 #### Unit
 - A forming/partial latest bar is excluded until marked complete.
 
 ## Roadmap (out of this milestone)
 
-- `AlpacaBroker` (real paper API) and an Alpaca data adapter — same interfaces
-  (ADR-0004, ADR-0003).
+- **Next milestone:** `AlpacaBroker` (real paper API) + an Alpaca data adapter —
+  same interfaces (ADR-0004, ADR-0003); introduces a raw-quote price notion
+  alongside adjusted (ADR-0008) and API-key handling via env/.env.
 - Intraday/tick frequency; other asset classes (each its own ADR).
 - Parameter optimization / walk-forward as an outer sweep over runs.
-- Web dashboard for live equity/positions.
+- Volatility targeting / per-sector risk caps; web dashboard.
