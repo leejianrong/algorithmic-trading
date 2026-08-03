@@ -5,6 +5,11 @@ confronts the riskiest unknown: whether the event-driven engine + multi-symbol
 portfolio + simulated broker on adjusted data produce a correct, look-ahead-free
 equity curve.
 
+**Tooling (DONE, between V2 and V3):** a deterministic synthetic GBM data adapter
+(`data/synthetic.py`, ADR-0012) plus `trading backtest --source synthetic` and
+`trading gen-data`, so the whole stack runs and is tested offline. All three
+strategies verified end to end on synthetic data.
+
 ## V1: End-to-end backtest of buy-and-hold across two symbols (adjusted data)
 
 **Status: DONE** — engine, simulated broker, cached yfinance adapter, buy-and-hold,

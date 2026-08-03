@@ -25,6 +25,12 @@ Fetcher = Callable[[str, datetime, datetime], pd.DataFrame]
 _COLUMNS = ["open", "high", "low", "close", "volume"]
 
 
+def cache_filename(symbol: str, start: datetime, end: datetime) -> str:
+    """The cache file name for a (symbol, range). Shared so other tools (e.g. the
+    synthetic ``gen-data`` command) can write files this adapter will read back."""
+    return f"{symbol}_{start:%Y%m%d}_{end:%Y%m%d}_adj.csv"
+
+
 class DataUnavailableError(Exception):
     """The provider returned no data for a symbol/range."""
 
@@ -80,8 +86,7 @@ class YFinanceAdapter:
         return self._to_bars(symbol, self._read_cache(path))
 
     def _cache_path(self, symbol: str, start: datetime, end: datetime) -> Path:
-        name = f"{symbol}_{start:%Y%m%d}_{end:%Y%m%d}_adj.csv"
-        return self._cache_dir / name
+        return self._cache_dir / cache_filename(symbol, start, end)
 
     def _write_cache(self, df: pd.DataFrame, path: Path) -> None:
         path.parent.mkdir(parents=True, exist_ok=True)
