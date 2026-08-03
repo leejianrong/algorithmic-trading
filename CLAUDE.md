@@ -11,13 +11,20 @@ capital, so it favors honest numbers over flattering ones. Full context:
 
 As of this writing:
 
-- **Done and tested:** project scaffold, quality gates, and the decided core
-  value types — `Bar`, `Order`, `TargetWeight`, `Fill`, `Position`, `Portfolio`
-  (`src/trading/types.py`); the DI-seam interfaces (`src/trading/interfaces.py`);
-  and an in-memory `FakeAdapter` (`src/trading/data/fake.py`). Fast tests green.
-- **NOT yet built:** the engine, the simulated broker, sizing, risk guardrails,
-  concrete data adapters (yfinance/CSV), strategies, the CLI, and reporting.
-  These are stubs-at-best. **Slice V1 in `SLICES.md` is the next work.**
+- **Done and tested:** the scaffold and quality gates; core value types
+  (`types.py`) and DI seams (`interfaces.py`); and **slice V1 — a working
+  backtest**: the event-driven `Engine` (`engine.py`), `SimulatedBroker`
+  (`broker.py`, next-open fills + slippage/commission + funding rejection), the
+  cached `YFinanceAdapter` (`data/yfinance_adapter.py`) and in-memory
+  `FakeAdapter`, the `buy_and_hold` strategy + registry (`strategies/`), a minimal
+  report (`report.py`), and the `trading backtest` CLI (`cli.py`). Fast tests
+  green; `trading backtest` runs end to end.
+- **NOT yet built:** target-weight **sizing** (V2 — strategies currently emit
+  `Order`s directly; `TargetWeight` raises `NotImplementedError` in the engine),
+  **SMA-crossover** and allocation strategies (V2), enforced **risk guardrails**
+  (V3), full **metrics/report** — Sharpe, drawdown, exposure, benchmark (V4),
+  **paper mode** (V5), and the **Alpaca** data/broker adapters (next milestone).
+  **Slice V2 in `SLICES.md` is the next work.**
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -68,10 +75,17 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
 
 ```
 src/trading/
-  types.py        # core value types (implemented, tested)
-  interfaces.py   # DI seams: DataAdapter, Broker, Strategy, RiskGuardrails
-  data/fake.py    # in-memory adapter for the fast test layer
-  # engine / broker / strategy / risk / cli / report  → V1 onward
+  types.py                 # core value types (implemented, tested)
+  interfaces.py            # DI seams: DataAdapter, Broker, Strategy, RiskGuardrails
+  config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps)
+  engine.py                # event-driven loop + feed builder + BacktestResult
+  broker.py                # SimulatedBroker + CostModel
+  report.py                # text summary + equity_curve.csv
+  cli.py                   # `trading backtest …`
+  data/fake.py             # in-memory adapter for the fast test layer
+  data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
+  strategies/              # buy_and_hold + name→strategy registry
+  # sizing / risk / paper clock / metrics  → V2 onward
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)

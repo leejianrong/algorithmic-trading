@@ -7,6 +7,11 @@ equity curve.
 
 ## V1: End-to-end backtest of buy-and-hold across two symbols (adjusted data)
 
+**Status: DONE** — engine, simulated broker, cached yfinance adapter, buy-and-hold,
+report, and `trading backtest` CLI are implemented; fast tests green and the CLI
+runs end to end. (Buy-and-hold leaves a small cost buffer so realistic slippage
+doesn't reject its initial allocation; proper cost-aware sizing lands in V2.)
+
 **Delivers:** R0, R2, R3 (partial)
 
 **Build plan**

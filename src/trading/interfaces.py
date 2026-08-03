@@ -12,7 +12,7 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Protocol, runtime_checkable
 
-from trading.types import Bar, Fill, Order, Portfolio
+from trading.types import Bar, Fill, Order, Portfolio, TargetWeight
 
 
 @runtime_checkable
@@ -37,41 +37,25 @@ class DataAdapter(Protocol):
 
 @runtime_checkable
 class Broker(Protocol):
-    """Order execution and position/cash state (ADR-0004).
+    """Order execution plus the portfolio it maintains (ADR-0004).
 
-    Implementations: ``SimulatedBroker`` (MVP) and, next milestone, an Alpaca
-    broker behind the same seam.
+    An order submitted while processing bar *t* fills no earlier than bar *t+1*
+    (ADR-0001): :meth:`submit` only queues, and :meth:`on_bar` executes queued
+    orders against the *new* bar. Implementations: ``SimulatedBroker`` (MVP) and,
+    next milestone, an Alpaca broker behind the same seam.
     """
 
+    @property
+    def portfolio(self) -> Portfolio:
+        """The broker's authoritative cash and positions."""
+        ...
+
     def submit(self, order: Order) -> None:
-        """Accept an order for execution on a subsequent bar."""
+        """Queue an order for execution on the next bar."""
         ...
 
     def on_bar(self, bars: dict[str, Bar]) -> list[Fill]:
-        """Advance to a new timestamp's bars and return any resulting fills."""
-        ...
-
-    def cash(self) -> float:
-        """Available cash."""
-        ...
-
-
-@runtime_checkable
-class Strategy(Protocol):
-    """User trading logic, called once per timestamp (ADR-0001, ADR-0006).
-
-    ``context`` exposes positions, cash, equity, and a rolling per-symbol history
-    window — never future bars, which is what makes look-ahead structurally
-    impossible (ADR-0001).
-    """
-
-    def on_bar(
-        self,
-        ts: datetime,
-        bars: dict[str, Bar],
-        context: StrategyContext,
-    ) -> list[Order | object]:
-        """Return orders or target weights in response to a timestamp's bars."""
+        """Execute queued orders against ``bars`` and return the resulting fills."""
         ...
 
 
@@ -90,8 +74,29 @@ class StrategyContext(Protocol):
 
 
 @runtime_checkable
+class Strategy(Protocol):
+    """User trading logic, called once per timestamp (ADR-0001, ADR-0006).
+
+    ``context`` exposes positions, cash, and a rolling per-symbol history window —
+    never future bars, which is what makes look-ahead structurally impossible
+    (ADR-0001). A strategy may return concrete :class:`~trading.types.Order`\\ s or
+    :class:`~trading.types.TargetWeight`\\ s (the sizing layer, V2, resolves the
+    latter).
+    """
+
+    def on_bar(
+        self,
+        ts: datetime,
+        bars: dict[str, Bar],
+        context: StrategyContext,
+    ) -> list[Order | TargetWeight]:
+        """Return orders or target weights in response to a timestamp's bars."""
+        ...
+
+
+@runtime_checkable
 class RiskGuardrails(Protocol):
-    """Enforced pre-trade and portfolio-level risk limits (ADR-0009)."""
+    """Enforced pre-trade and portfolio-level risk limits (ADR-0009). V3."""
 
     def check(
         self,

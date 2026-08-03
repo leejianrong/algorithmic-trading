@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Trading bench run artifacts (data cache defaults to .cache/, already ignored)
+/results/

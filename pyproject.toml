@@ -56,6 +56,11 @@ src = ["src", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
+[tool.ruff.lint.per-file-ignores]
+# Typer's API intentionally puts callables (typer.Option/Argument) in parameter
+# defaults; B008 is the wrong lint for that idiom.
+"src/trading/cli.py" = ["B008"]
+
 [tool.mypy]
 python_version = "3.13"
 strict = true
