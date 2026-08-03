@@ -141,7 +141,7 @@ order.
 
 ## Implementation decisions
 
-- **Language/stack:** Python 3.11+, `pandas`/`numpy`, `yfinance` (adjusted
+- **Language/stack:** Python 3.13+, `pandas`/`numpy`, `yfinance` (adjusted
   prices), `matplotlib` optional for the equity-curve image, `pytest`, `typer`
   (or argparse) for the CLI; packaged with `uv`/`pip`.
 - **Module boundaries:** `engine` (loop + clock + sizing), `data` (adapters +
@@ -190,7 +190,7 @@ live in `SLICES.md`.
 | Q13 | TOML config + CLI flags | Cheap; localized to `cli` |
 | Q14 | Fills at next open ± slippage (not close); default costs set realistically pessimistic | Alters returns; isolated to `SimulatedBroker` |
 | Q17 | Sharpe on daily returns, risk-free = 0; equity marked at adjusted close | One constant to change |
-| Q22 | Default starting capital $100,000; default limits (e.g. 25% max position, 100% max gross exposure, 20% drawdown halt) live in config | Just config defaults; per-run overridable |
+| Q22 | Default starting capital $1,000 (small, realistic; $500 is a one-line config change); default limits (e.g. 25% max position, 100% max gross exposure, 20% drawdown halt) live in config | Just config defaults; per-run overridable |
 | Q23 | Backtest trades on the adjusted series; the future paper/live path will trade on actual quotes | Revisit when wiring Alpaca; backtest accounting unaffected |
 | Q24 | Optional benchmark = buy-and-hold SPY for comparison in the report | Additive report column |
 
@@ -206,3 +206,11 @@ live in `SLICES.md`.
   kill-switch tests.
 - **Paper-mode clock/feed drift** (a forming daily bar isn't final until close).
   Revealed in **V5**; mitigated by acting only on completed daily bars.
+- **Whole-share sizing at small capital.** With a ~$1,000 account, whole-share
+  flooring makes stocks above ~$200 unbuyable at a 20% target and pushes realized
+  weights far from target for mid-priced names — the bench could become
+  effectively unusable for its own owner. Revealed the moment **V2** sizing runs
+  on a small account against higher-priced symbols. Likely resolution:
+  **fractional shares** (supported by Alpaca), which warrants its own ADR and a
+  change to the whole-share rule in ADR-0007. Interim workaround: pick low-priced
+  symbols or a broad low-priced ETF.

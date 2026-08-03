@@ -3,7 +3,7 @@ name = "algo-trading-bench"
 version = "0.0.0"
 description = "A test bench for backtesting, paper trading, and algorithmic trading strategies on US equities."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.13"
 license = { text = "MIT" }
 dependencies = [
     "numpy>=1.26",
@@ -49,7 +49,7 @@ markers = [
 ]
 
 [tool.ruff]
-target-version = "py311"
+target-version = "py313"
 line-length = 100
 src = ["src", "tests"]
 
@@ -57,7 +57,7 @@ src = ["src", "tests"]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 
 [tool.mypy]
-python_version = "3.11"
+python_version = "3.13"
 strict = true
 files = ["src", "tests"]
 # yfinance ships no types; don't fail the type gate on a third-party stub gap.

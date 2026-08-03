@@ -12,7 +12,7 @@ one you can carry toward real capital.
 
 ## Quickstart
 
-Requires [uv](https://docs.astral.sh/uv/) and Python 3.11+.
+Requires [uv](https://docs.astral.sh/uv/) and Python 3.13+.
 
 ```bash
 make setup   # install locked deps + the pre-push hook
