@@ -57,6 +57,12 @@ Q22 (starting capital). Wrong → numbers shift, mechanism stands.
 
 ## V2: Strategy API + target-weight sizing + SMA crossover, with look-ahead guard
 
+**Status: DONE** — the sizing layer resolves `TargetWeight` → fractional-share
+rebalance orders; `buy_and_hold` (now target-weight), `sma_crossover`, and a
+multi-symbol `equal_weight` strategy ship; a fill blotter on `BacktestResult`
+makes entry/exit bars observable; and the look-ahead guard is a test. Fast tests
+green; all three strategies run end to end.
+
 **Delivers:** R1, R4
 
 **Build plan**

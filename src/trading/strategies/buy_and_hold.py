@@ -1,9 +1,9 @@
-"""Buy-and-hold: the V1 correctness baseline.
+"""Buy-and-hold: the correctness baseline.
 
-On the first bar it splits available cash equally across the day's symbols and
-buys; thereafter it holds. Fractional shares (ADR-0011) let it deploy essentially
-all the cash even on high-priced symbols, which is the whole point of the small
-default account.
+On the first bar it targets an equal weight in each of the day's symbols; the
+sizing layer (ADR-0007) converts those weights to fractional-share orders and it
+holds thereafter. Fractional shares (ADR-0011) let it deploy essentially all the
+cash even on high-priced symbols.
 """
 
 from __future__ import annotations
@@ -11,14 +11,11 @@ from __future__ import annotations
 from datetime import datetime
 
 from trading.interfaces import StrategyContext
-from trading.types import Bar, Order, Side, TargetWeight
+from trading.types import Bar, Order, TargetWeight
 
-# Shares are sized at the decision bar's close, but fill at the next bar's open
-# plus slippage — so a naive 100%-of-cash allocation overshoots available cash and
-# the broker rejects it. Leaving a small headroom (0.2%) comfortably covers the
-# default 5 bps slippage and modest commission. Proper cost-aware sizing arrives
-# with the sizing layer in V2.
-CASH_BUFFER = 0.998
+# Target just under 100% so the initial buys still fit after the next-open fill
+# picks up slippage (a full 100% target would overshoot cash and be rejected).
+INVESTED_WEIGHT = 0.998
 
 
 class BuyAndHold:
@@ -37,11 +34,6 @@ class BuyAndHold:
         if self._invested or context.portfolio.positions or not bars:
             return []
 
-        allocation = context.portfolio.cash * CASH_BUFFER / len(bars)
-        orders: list[Order | TargetWeight] = []
-        for symbol, bar in sorted(bars.items()):
-            qty = allocation / bar.close
-            if qty > 0:
-                orders.append(Order(symbol, Side.BUY, qty))
+        weight = INVESTED_WEIGHT / len(bars)
         self._invested = True
-        return orders
+        return [TargetWeight(symbol, weight) for symbol in sorted(bars)]
