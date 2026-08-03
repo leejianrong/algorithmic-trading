@@ -102,3 +102,21 @@ class TestPortfolioAccounting:
         pf = Portfolio(cash=500.0, positions={"AAPL": Position("AAPL", qty=10, avg_price=50.0)})
         # equity = 500 + 500 = 1000; gross = 500 → 0.5
         assert pf.gross_exposure({"AAPL": 50.0}) == pytest.approx(0.5)
+
+    def test_buys_fractional_shares(self) -> None:
+        # $1,000 account, a $550 stock: 20% target is a fractional share (ADR-0011).
+        pf = Portfolio(cash=1_000.0)
+        pf.apply_fill(Fill("SPY", Side.BUY, qty=0.3636, price=550.0))
+        assert pf.position("SPY").qty == pytest.approx(0.3636)
+        assert pf.equity({"SPY": 550.0}) == pytest.approx(1_000.0)
+
+    def test_fractional_sell_to_near_flat_closes_position(self) -> None:
+        pf = Portfolio(cash=0.0, positions={"AAPL": Position("AAPL", qty=1.5, avg_price=10.0)})
+        # Selling the whole holding, off by a sub-epsilon rounding crumb, still flattens.
+        pf.apply_fill(Fill("AAPL", Side.SELL, qty=1.5 - 1e-12, price=12.0))
+        assert "AAPL" not in pf.positions
+
+    def test_fractional_overselling_beyond_tolerance_is_rejected(self) -> None:
+        pf = Portfolio(cash=0.0, positions={"AAPL": Position("AAPL", qty=1.5, avg_price=10.0)})
+        with pytest.raises(ValueError, match="implicit shorting"):
+            pf.apply_fill(Fill("AAPL", Side.SELL, qty=1.6, price=10.0))

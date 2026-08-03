@@ -59,8 +59,9 @@ Q22 (starting capital). Wrong → numbers shift, mechanism stands.
 1. Finalize `Strategy.on_bar(ts, bars_by_symbol, context) -> list[TargetWeight | Order]`;
    `context` exposes positions, cash, equity, and a rolling per-symbol history —
    no future bars.
-2. Implement the sizing layer: target weight × equity ÷ latest price, floored to
-   whole shares; reconcile against the current position (rebalance delta).
+2. Implement the sizing layer: target weight × equity ÷ latest price as a
+   fractional-share quantity (ADR-0011); reconcile against the current position
+   (rebalance delta).
 3. Implement the strategy loader (discover by name) and `sma_crossover`
    (fast/slow from config), plus one simple multi-symbol allocation example.
 
@@ -68,8 +69,8 @@ Q22 (starting capital). Wrong → numbers shift, mechanism stands.
 trade blotter and realized-vs-target weights; changing the windows in config
 visibly changes trades.
 
-**Rests on assumptions:** Q13 (config), whole-share rounding leaves small residual
-cash. Low cost if wrong.
+**Rests on assumptions:** Q13 (config), fractional quantities rounded to a defined
+share precision. Low cost if wrong.
 
 ### Test plan
 
@@ -77,15 +78,16 @@ cash. Low cost if wrong.
 - SMA crossover on a crafted series produces exactly the expected buy/sell bars.
 - A "cheating" strategy cannot read bar *t+1* — `context` exposes no future data
   (look-ahead guard; acceptance criterion).
-- A 0.20 target weight on a known equity/price yields the expected whole-share
-  quantity with correct residual cash.
+- A 0.20 target weight on a known equity/price yields the expected fractional-share
+  quantity so the realized weight matches the target.
 
 #### Integration
 - Strategy loader resolves by name; unknown name → clear error.
 
 #### Unit
 - Rolling-mean helper matches a reference and never includes the unseen future.
-- Sizing floors correctly and computes the rebalance delta from current holdings.
+- Sizing computes the fractional quantity and the rebalance delta from current
+  holdings.
 
 ## V3: Enforced risk guardrails
 

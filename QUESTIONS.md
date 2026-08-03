@@ -33,7 +33,7 @@ None — closed across two grill rounds.
 | Q20 | Live real-money trading? | DEFERRED | Explicitly out of scope; nothing in MVP can place a real order | PLAN §Scope (Out) |
 | Q21 | End goal / rigor level? | DECIDED (round 2) | Stepping stone to real capital → realism and enforced guardrails are first-class | PLAN §Problem, §Users; ADR-0009 |
 | Q22 | Portfolio breadth & sizing defaults? | DECIDED (round 2–3) | Multi-symbol portfolio from day one; target-percent-of-equity sizing; default capital $1,000 (small/realistic; $500 a config change) and default limits (25% position / 100% gross / 20% drawdown) in config | ADR-0006, ADR-0007, PLAN §Assumed defaults |
-| Q25 | Whole-share vs fractional sizing at small capital? | FORK (deferred) | Whole shares for now; small capital likely forces fractional shares (own ADR, amends ADR-0007) — surfaces at V2 | PLAN §Open risks |
+| Q25 | Whole-share vs fractional sizing at small capital? | DECIDED (round 3) | Fractional shares — usable at $1,000, avoids a low-price quality bias, matches how a real small account trades; amends ADR-0007 | ADR-0011 |
 | Q23 | Price adjustment? | DECIDED (round 2) | Backtest on split/dividend-adjusted (total-return) prices; paper/live path trades on actual quotes later | ADR-0008 |
 | Q24 | Risk guardrails: enforce or report? | DECIDED (round 2) | Full, enforced in-engine: per-order checks, position/exposure caps, drawdown/daily-loss kill switch; optional SPY benchmark in the report | ADR-0009, SLICES V3, V4 |
 

@@ -62,7 +62,7 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   drawdown kill switch can veto or clamp orders (ADR-0009).
 - **One execution path:** backtest and paper differ only in feed and clock;
   never fork strategy/broker/portfolio logic between them (ADR-0002).
-- **No implicit shorting; whole-share quantities only.**
+- **No implicit shorting; fractional-share quantities allowed** (ADR-0011).
 
 ## Layout
 

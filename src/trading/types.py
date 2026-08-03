@@ -13,6 +13,11 @@ from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import StrEnum
 
+# Share quantities are fractional (ADR-0011), so "flat" and "over-sell" are
+# tolerance comparisons, not exact-zero ones. Positions closer than this to zero
+# are treated as closed; a sell within this slack of the held size is allowed.
+SHARE_EPS = 1e-9
+
 
 class Side(StrEnum):
     """Order direction."""
@@ -55,22 +60,22 @@ class Bar:
 
 @dataclass(frozen=True, slots=True)
 class Order:
-    """An instruction to trade a whole number of shares of one symbol.
+    """An instruction to trade a (possibly fractional) number of shares.
 
     Produced either directly by a strategy or by the sizing layer from a
-    :class:`TargetWeight` (ADR-0007). Quantity is always positive; direction is
-    carried by :attr:`side`.
+    :class:`TargetWeight` (ADR-0007). Quantity is a positive share count —
+    fractional is allowed (ADR-0011); direction is carried by :attr:`side`.
     """
 
     symbol: str
     side: Side
-    qty: int
+    qty: float
     type: OrderType = OrderType.MARKET
     limit_price: float | None = None
 
     def __post_init__(self) -> None:
         if self.qty <= 0:
-            raise ValueError(f"Order.qty must be a positive whole number, got {self.qty}")
+            raise ValueError(f"Order.qty must be a positive share count, got {self.qty}")
         if self.type is OrderType.LIMIT and self.limit_price is None:
             raise ValueError("A limit order requires a limit_price")
         if self.type is OrderType.MARKET and self.limit_price is not None:
@@ -81,8 +86,9 @@ class Order:
 class TargetWeight:
     """A strategy's intent to hold ``weight`` of current equity in ``symbol``.
 
-    The engine's sizing layer (V2) turns this into a whole-share :class:`Order`;
-    the guardrails clamp anything over the position cap (ADR-0007, ADR-0009).
+    The engine's sizing layer (V2) turns this into a fractional-share
+    :class:`Order`; the guardrails clamp anything over the position cap
+    (ADR-0007, ADR-0009, ADR-0011).
     """
 
     symbol: str
@@ -99,7 +105,7 @@ class Fill:
 
     symbol: str
     side: Side
-    qty: int
+    qty: float
     price: float
     commission: float = 0.0
 
@@ -114,10 +120,10 @@ class Fill:
 
 @dataclass(frozen=True, slots=True)
 class Position:
-    """A holding in one symbol: signed share count and average entry price."""
+    """A holding in one symbol: signed (fractional) share count and average price."""
 
     symbol: str
-    qty: int = 0
+    qty: float = 0.0
     avg_price: float = 0.0
 
     def market_value(self, price: float) -> float:
@@ -149,7 +155,7 @@ class Portfolio:
         """
         total = self.cash
         for symbol, pos in self.positions.items():
-            if pos.qty == 0:
+            if abs(pos.qty) <= SHARE_EPS:
                 continue
             if symbol not in prices:
                 raise KeyError(f"No price to mark held position {symbol!r}")
@@ -164,7 +170,7 @@ class Portfolio:
         gross = sum(
             abs(pos.market_value(prices[symbol]))
             for symbol, pos in self.positions.items()
-            if pos.qty != 0
+            if abs(pos.qty) > SHARE_EPS
         )
         return gross / eq
 
@@ -179,7 +185,7 @@ class Portfolio:
         signed = fill.qty if fill.side is Side.BUY else -fill.qty
         new_qty = pos.qty + signed
 
-        if fill.side is Side.SELL and fill.qty > pos.qty:
+        if fill.side is Side.SELL and fill.qty > pos.qty + SHARE_EPS:
             raise ValueError(
                 f"Cannot sell {fill.qty} of {fill.symbol}; only {pos.qty} held "
                 "(implicit shorting is disallowed)"
@@ -189,7 +195,7 @@ class Portfolio:
         self.cash -= signed * fill.price
         self.cash -= fill.commission
 
-        if new_qty == 0:
+        if abs(new_qty) <= SHARE_EPS:
             self.positions.pop(fill.symbol, None)
             return
 

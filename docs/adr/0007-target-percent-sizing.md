@@ -1,6 +1,6 @@
 # ADR-0007: Target-percent-of-equity position sizing
 
-- Status: Accepted
+- Status: Accepted (sizing granularity amended by ADR-0011)
 - Date: 2026-08-03
 - Deciders: strategy developer (project owner)
 
@@ -15,11 +15,14 @@ should be hard to misuse and should compose with portfolio-level risk limits.
 ## Decision
 
 Strategies express intent as **target weights** (a fraction of current equity per
-symbol, e.g. 0.20). The engine's sizing layer converts a target weight to a
-whole-share order using `target_weight × equity ÷ latest_price`, floored to whole
-shares, then routes it through the guardrails (ADR-0009), which clamp anything
-over the position cap. Raw-quantity orders remain possible for advanced use but
-target weights are the default path.
+symbol, e.g. 0.20). The engine's sizing layer converts a target weight to an order
+using `target_weight × equity ÷ latest_price`, then routes it through the
+guardrails (ADR-0009), which clamp anything over the position cap. Raw-quantity
+orders remain possible for advanced use but target weights are the default path.
+
+**Amended by ADR-0011:** the quantity is a *fractional* share count, not floored
+to whole shares, so target weights hit their mark at small capital. The
+paragraphs below that reference whole-share flooring are superseded accordingly.
 
 ## Alternatives considered
 

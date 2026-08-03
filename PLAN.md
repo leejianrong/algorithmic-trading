@@ -60,7 +60,7 @@ order.
 - Custom **event-driven** engine driving a **multi-symbol** portfolio; the
   strategy sees a timestamp's bars across its universe and returns orders.
 - **Target-percent-of-equity** position sizing: strategies express target
-  weights; the engine converts to whole-share quantities.
+  weights; the engine converts to fractional-share quantities (ADR-0011).
 - Historical data via **yfinance**, **split/dividend adjusted**, fetched behind a
   pluggable adapter and cached locally so re-runs are offline and deterministic.
 - **Simulated broker**: market/limit orders, **conservative** next-open fills
@@ -101,7 +101,7 @@ order.
 | R1 | Strategies are written once against a bar-driven API and run unchanged across backtest, paper, and (later) real-broker modes | Must-have |
 | R2 | Data is fetched via a pluggable adapter (yfinance first), split/dividend adjusted, and cached for offline, deterministic re-runs | Must-have |
 | R3 | Simulated broker models conservative fills, commission, slippage, cash, and positions across a multi-symbol portfolio | Must-have |
-| R4 | Position sizing is target-percent-of-equity; the engine converts weights to whole-share orders | Must-have |
+| R4 | Position sizing is target-percent-of-equity; the engine converts weights to fractional-share orders | Must-have |
 | R5 | Risk guardrails are enforced, not just reported: per-order checks, position/exposure caps, drawdown/daily-loss kill switch | Must-have |
 | R6 | A run produces a report: return, Sharpe, max drawdown, exposure, win rate, trade blotter, equity-curve CSV | Must-have |
 | R7 | `paper` mode runs the same engine, broker, and guardrails against recent daily data on a wall-clock cadence | Must-have |
@@ -116,7 +116,7 @@ order.
 | S3 | **DataAdapter interface** returning normalized, adjusted `Bar` series; `YFinanceAdapter` fetches (adjusted) then caches to local parquet/CSV; `CSVAdapter` reads a supplied file. Cache is read-through, keyed by (symbol, interval, range, adjustment). | ADR-0003 |
 | S4 | **Broker interface** (`submit`, `on_bar`, `positions`, `cash`); `SimulatedBroker` fills market orders at next open ± slippage, applies commission, updates cash/positions, rejects invalid orders. Alpaca broker is the next implementation of the same interface. | ADR-0004 |
 | S5 | **Multi-symbol portfolio**: `Portfolio` holds positions keyed by symbol plus cash; equity = cash + Σ marked positions. All accounting and metrics are portfolio-level from day one. | ADR-0006 |
-| S6 | **Sizing layer**: strategies emit target weights; the engine converts a target weight to a whole-share order using current equity and the latest price, then hands it to the guardrails. | ADR-0007 |
+| S6 | **Sizing layer**: strategies emit target weights; the engine converts a target weight to a fractional-share order using current equity and the latest price, then hands it to the guardrails. | ADR-0007, ADR-0011 |
 | S7 | **Adjusted-price data**: backtests run on split/dividend-adjusted series end-to-end so returns are total return; a split is not misread as a crash and dividends are not lost. | ADR-0008 |
 | S8 | **Risk guardrails**: a pre-trade checker (cash, max position %, max gross exposure) plus a portfolio monitor (max drawdown / daily loss) that can veto orders and halt new entries. Enforced inside the engine, on by default. | ADR-0009 |
 | S9 | **Instrument & market model**: `Instrument(symbol)`, tz-aware `Bar(ts, o,h,l,c,v)`, a US calendar used only to enumerate trading days. | ADR-0005 |
@@ -152,7 +152,7 @@ order.
 - **Core contracts:**
   - `Bar`: `ts: datetime (tz-aware UTC), open/high/low/close: float (adjusted),
     volume: int`.
-  - `Order`: `symbol, side (buy|sell), qty (whole shares), type (market|limit),
+  - `Order`: `symbol, side (buy|sell), qty (fractional shares), type (market|limit),
     limit_price?` — produced by the sizing layer from a strategy's target weight.
   - `Strategy.on_bar(ts, bars_by_symbol, context) -> list[TargetWeight | Order]`;
     `context` exposes positions, cash, equity, and a rolling per-symbol history
@@ -160,9 +160,9 @@ order.
   - `Broker.submit(order)`, `.on_bar(bars)`, `.positions()`, `.cash()`.
   - `RiskGuardrails.check(order, portfolio) -> Accept | Reject(reason)` and
     `.monitor(portfolio) -> Halt?`.
-- **Sizing rule:** target weight × equity ÷ latest price, floored to whole
-  shares; a weight over the position cap is clamped by the guardrails (ADR-0007,
-  ADR-0009).
+- **Sizing rule:** target weight × equity ÷ latest price, as a fractional-share
+  quantity (ADR-0011); a weight over the position cap is clamped by the guardrails
+  (ADR-0007, ADR-0009).
 - **Determinism:** given the same cached adjusted data, config, and strategy, a
   backtest is bit-for-bit reproducible; no wall-clock or RNG in the backtest path.
 - **Config:** a TOML file (starting capital, commission, slippage, risk limits,
@@ -206,11 +206,10 @@ live in `SLICES.md`.
   kill-switch tests.
 - **Paper-mode clock/feed drift** (a forming daily bar isn't final until close).
   Revealed in **V5**; mitigated by acting only on completed daily bars.
-- **Whole-share sizing at small capital.** With a ~$1,000 account, whole-share
-  flooring makes stocks above ~$200 unbuyable at a 20% target and pushes realized
-  weights far from target for mid-priced names — the bench could become
-  effectively unusable for its own owner. Revealed the moment **V2** sizing runs
-  on a small account against higher-priced symbols. Likely resolution:
-  **fractional shares** (supported by Alpaca), which warrants its own ADR and a
-  change to the whole-share rule in ADR-0007. Interim workaround: pick low-priced
-  symbols or a broad low-priced ETF.
+- **Fractional-order fidelity at a real broker.** Sizing uses fractional shares
+  (ADR-0011), which makes the $1,000 account usable and matches Alpaca/Robinhood.
+  The residual risk is at the *live* seam, not the simulator: some symbols aren't
+  fractionable, and fractional orders are typically notional market orders (no
+  fractional limit orders). Revealed when the **Alpaca broker** lands (next
+  milestone, ADR-0004); the `SimulatedBroker` need not model it yet, but the
+  broker interface should not assume every order is fractionable.
