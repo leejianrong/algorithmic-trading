@@ -44,9 +44,7 @@ def test_rsi_mixed_window_matches_hand_computation() -> None:
 def test_rsi_uses_only_the_last_period_plus_one_bars() -> None:
     # Leading bars beyond the window must not change the result.
     tail = [100, 110, 105, 115, 110]
-    assert rsi(_bars([1, 2, 3, *tail]), period=4) == pytest.approx(
-        rsi(_bars(tail), period=4)
-    )
+    assert rsi(_bars([1, 2, 3, *tail]), period=4) == pytest.approx(rsi(_bars(tail), period=4))
 
 
 def test_rsi_none_when_too_few_bars() -> None:

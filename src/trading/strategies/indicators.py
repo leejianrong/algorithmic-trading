@@ -36,9 +36,7 @@ def rolling_std(bars: list[Bar], n: int) -> float | None:
     return math.sqrt(variance)
 
 
-def bollinger(
-    bars: list[Bar], n: int, num_std: float = 2.0
-) -> tuple[float, float, float] | None:
+def bollinger(bars: list[Bar], n: int, num_std: float = 2.0) -> tuple[float, float, float] | None:
     """Bollinger bands as ``(lower, mid, upper)``, or ``None`` if too few bars.
 
     ``mid`` is the ``n``-period :func:`sma`; the bands sit ``num_std`` population
