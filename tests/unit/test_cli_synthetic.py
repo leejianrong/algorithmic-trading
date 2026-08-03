@@ -37,6 +37,47 @@ def test_backtest_source_synthetic_runs_end_to_end(tmp_path: Path) -> None:
     assert len(out.read_text().splitlines()) > 100
 
 
+def test_backtest_target_vol_runs_offline(tmp_path: Path) -> None:
+    out = tmp_path / "equity.csv"
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--source",
+            "synthetic",
+            "--target-vol",
+            "0.05",
+            "--out",
+            str(out),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Final equity" in result.output
+
+
+def test_backtest_target_vol_rejects_nonpositive(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--source",
+            "synthetic",
+            "--target-vol",
+            "0",
+            "--out",
+            str(tmp_path / "e.csv"),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "target_volatility" in result.output
+
+
 def test_unknown_source_is_rejected(tmp_path: Path) -> None:
     result = runner.invoke(
         app,

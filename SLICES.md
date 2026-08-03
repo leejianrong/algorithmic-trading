@@ -251,5 +251,7 @@ bar). Wrong → decisions use unfinished data.
   same interfaces (ADR-0004, ADR-0003); introduces a raw-quote price notion
   alongside adjusted (ADR-0008) and API-key handling via env/.env.
 - Intraday/tick frequency; other asset classes (each its own ADR).
-- Parameter optimization / walk-forward as an outer sweep over runs.
-- Volatility targeting / per-sector risk caps; web dashboard.
+- Parameter optimization / walk-forward as an outer sweep over runs. **Done** —
+  `sweep.py` + `trading sweep` (ADR-0016).
+- Volatility targeting **done** (`RiskConfig.target_volatility` / `--target-vol`,
+  ADR-0015); per-sector risk caps and a web dashboard still open.
