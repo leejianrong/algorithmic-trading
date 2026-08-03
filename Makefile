@@ -15,8 +15,9 @@ install-hooks:  ## Point git at the versioned hooks in .githooks/.
 # --- The fast gate: what pre-push runs and what cheap CI mirrors -------------
 check: lint typecheck test  ## Fast gate: lint + type-check + no-infra tests.
 
-lint:  ## Static lint.
+lint:  ## Static lint + format check (mirrors CI's lint job).
 	uv run ruff check .
+	uv run ruff format --check .
 
 format:  ## Auto-format.
 	uv run ruff format .

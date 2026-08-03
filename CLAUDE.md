@@ -48,6 +48,17 @@ As of this writing:
   `trading paper` CLI mirrors `backtest` plus `--live/--once` (default `--once`
   replays offline and terminates; persists a session log, `paper_state.json`, and
   the equity CSV). Fast tests green (parity, completed-bars-only, halt parity).
+- **Offline enhancement batch:** three parallel, offline-verified additions.
+  **Strategies** — `momentum` (time-series trailing-return) and `mean_reversion`
+  (RSI oversold/recovery) join the registry, with `rsi`/`rolling_std`/`bollinger`
+  in `strategies/indicators.py`; both long-or-flat, transition-driven, no look-ahead.
+  **Parameter sweep** — `sweep.py` (`run_sweep`) + the `trading sweep` CLI expand a
+  param grid (optional per-window walk-forward) over `Engine.run` as a pure outer
+  loop, ranked by Sharpe/total return, writing a CSV (ADR-0016). **Vol-target risk +
+  richer metrics** — opt-in `RiskConfig.target_volatility` (CLI `--target-vol`) scales
+  the effective gross-exposure cap by realized-vs-target vol inside `Guardrails`, off
+  by default (ADR-0015); `metrics.py` adds Sortino, Calmar, and turnover to the report.
+  Fast tests green.
 - **NOT yet built:** the **Alpaca** data/broker adapters (next milestone). **That
   Alpaca milestone (see the roadmap at the end of `SLICES.md`) is the next work.**
 
@@ -106,15 +117,16 @@ src/trading/
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5)
   broker.py                # SimulatedBroker + CostModel
   report.py                # text summary + equity_curve.csv
-  cli.py                   # `trading backtest / paper / gen-data`
+  cli.py                   # `trading backtest / paper / gen-data / sweep`
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
   data/fake.py             # in-memory adapter for the fast test layer
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
   data/synthetic.py        # deterministic GBM adapter — offline backtests (ADR-0012)
   data/recent_window.py    # completed-bars feed for paper mode (V5)
-  strategies/              # buy_and_hold, sma_crossover, equal_weight + registry
-  metrics.py               # pure performance metrics over the equity curve (V4)
+  strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion + registry
+  metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure
+  sweep.py                 # parameter sweep / walk-forward over Engine.run (ADR-0016)
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)

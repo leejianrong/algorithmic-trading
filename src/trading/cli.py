@@ -87,6 +87,11 @@ def backtest(
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
     ),
+    target_vol: float | None = typer.Option(
+        None,
+        "--target-vol",
+        help="Annualized volatility target (e.g. 0.10) that scales gross exposure; off by default.",
+    ),
     benchmark: str = typer.Option(
         "", "--benchmark", help="Benchmark symbol for a buy-and-hold comparison, e.g. SPY."
     ),
@@ -115,6 +120,7 @@ def backtest(
                 max_position_pct=max_position,
                 max_gross_exposure=max_gross,
                 max_drawdown_pct=max_drawdown,
+                target_volatility=target_vol,
             )
         )
     except ValueError as exc:
@@ -248,6 +254,11 @@ def paper(
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
     ),
+    target_vol: float | None = typer.Option(
+        None,
+        "--target-vol",
+        help="Annualized volatility target (e.g. 0.10) that scales gross exposure; off by default.",
+    ),
     live: bool = typer.Option(
         False,
         "--live/--once",
@@ -281,6 +292,7 @@ def paper(
                 max_position_pct=max_position,
                 max_gross_exposure=max_gross,
                 max_drawdown_pct=max_drawdown,
+                target_volatility=target_vol,
             )
         )
     except ValueError as exc:
@@ -473,6 +485,11 @@ def sweep(
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
     ),
+    target_vol: float | None = typer.Option(
+        None,
+        "--target-vol",
+        help="Annualized volatility target (e.g. 0.10) that scales gross exposure; off by default.",
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/sweep.csv"), "--out", help="Results CSV path."),
 ) -> None:
@@ -508,6 +525,7 @@ def sweep(
                 max_position_pct=max_position,
                 max_gross_exposure=max_gross,
                 max_drawdown_pct=max_drawdown,
+                target_volatility=target_vol,
             )
         )
     except ValueError as exc:
