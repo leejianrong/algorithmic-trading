@@ -31,14 +31,18 @@ class RiskConfig:
     Guardrails are on by default with a small, real-account posture: no single
     symbol over a quarter of equity, no leverage (gross ≤ 100%), and a hard halt
     once drawdown from the equity peak reaches a fifth. ``max_daily_loss_pct`` is
-    an optional single-bar circuit breaker, off by default. Every limit is
-    overridable per run; :meth:`unlimited` returns the permissive opt-out.
+    an optional single-bar circuit breaker, off by default. ``target_volatility``
+    is an optional annualized volatility target (e.g. 0.10 for 10%) that scales the
+    effective gross-exposure cap up or down toward that target (ADR-0015); off by
+    default, so behavior is unchanged unless it is set. Every limit is overridable
+    per run; :meth:`unlimited` returns the permissive opt-out.
     """
 
     max_position_pct: float = 0.25
     max_gross_exposure: float = 1.0
     max_drawdown_pct: float = 0.20
     max_daily_loss_pct: float | None = None
+    target_volatility: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_position_pct <= 0:
@@ -49,6 +53,8 @@ class RiskConfig:
             raise ValueError("max_drawdown_pct must be in (0, 1]")
         if self.max_daily_loss_pct is not None and not 0 < self.max_daily_loss_pct <= 1.0:
             raise ValueError("max_daily_loss_pct must be None or in (0, 1]")
+        if self.target_volatility is not None and self.target_volatility <= 0:
+            raise ValueError("target_volatility must be None or positive")
 
     @classmethod
     def unlimited(cls) -> RiskConfig:
