@@ -21,6 +21,9 @@ As of this writing:
   orders), the `sma_crossover` and `equal_weight` strategies plus `buy_and_hold`
   baseline (`strategies/`), and a fill blotter on `BacktestResult`. Fast tests
   green; `trading backtest` runs end to end for all three strategies.
+- **Offline data:** a deterministic **synthetic** GBM adapter (`data/synthetic.py`,
+  ADR-0012) drives the whole stack without a network — `trading backtest --source
+  synthetic` and `trading gen-data`. All three strategies verified end to end on it.
 - **NOT yet built:** enforced **risk guardrails** — position/exposure caps,
   drawdown kill switch (V3); full **metrics/report** — Sharpe, drawdown, exposure,
   benchmark, trade blotter formatting (V4); **paper mode** (V5); and the **Alpaca**
@@ -86,6 +89,7 @@ src/trading/
   sizing.py                # target-weight → fractional-share orders (V2)
   data/fake.py             # in-memory adapter for the fast test layer
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
+  data/synthetic.py        # deterministic GBM adapter — offline backtests (ADR-0012)
   strategies/              # buy_and_hold, sma_crossover, equal_weight + registry
   # risk / paper clock / metrics  → V3 onward
 tests/

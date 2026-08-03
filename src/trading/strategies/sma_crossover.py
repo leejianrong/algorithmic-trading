@@ -34,6 +34,10 @@ class SmaCrossover:
         bars: dict[str, Bar],
         context: StrategyContext,
     ) -> list[Order | TargetWeight]:
+        # Split the target across the universe so several simultaneous long
+        # signals don't over-leverage (which the broker would reject). The
+        # exposure cap in V3 (ADR-0009) will enforce this centrally.
+        long_weight = self.weight / len(bars)
         intents: list[Order | TargetWeight] = []
         for symbol in sorted(bars):
             history = context.history(symbol, self.slow)
@@ -47,5 +51,5 @@ class SmaCrossover:
                 continue  # no crossover this bar → nothing to do
 
             self._long[symbol] = want_long
-            intents.append(TargetWeight(symbol, self.weight if want_long else 0.0))
+            intents.append(TargetWeight(symbol, long_weight if want_long else 0.0))
         return intents

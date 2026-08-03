@@ -17,7 +17,14 @@ Requires [uv](https://docs.astral.sh/uv/) and Python 3.13+.
 ```bash
 make setup   # install locked deps + the pre-push hook
 make check   # lint + type-check + fast tests
+
+# Run a backtest with no network, using the deterministic synthetic generator:
+uv run trading backtest --strategy equal_weight --source synthetic \
+  --symbols AAA,BBB,CCC --from 2021-01-01 --to 2022-12-31
 ```
+
+Drop `--source synthetic` (the default is `yfinance`) to backtest real
+split/dividend-adjusted data once you have network access.
 
 ## Docs
 
