@@ -55,6 +55,35 @@ def test_unknown_source_is_rejected(tmp_path: Path) -> None:
     assert "source" in result.output.lower()
 
 
+def test_paper_source_synthetic_runs_offline_and_terminates(tmp_path: Path) -> None:
+    out = tmp_path / "paper"
+    result = runner.invoke(
+        app,
+        [
+            "paper",
+            "--strategy",
+            "sma_crossover",
+            "--source",
+            "synthetic",
+            "--seed",
+            "5",
+            "--out",
+            str(out),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Paper session (once)" in result.output
+    assert "Final equity" in result.output
+    assert "completed bar(s)." in result.output
+    # The session log, running-state JSON, and equity CSV are all persisted.
+    assert (out / "paper_session.log").exists()
+    assert (out / "paper_state.json").exists()
+    assert (out / "equity_curve.csv").exists()
+    # One logged line per completed bar (~120 trading days over six months).
+    assert len((out / "paper_session.log").read_text().splitlines()) > 100
+
+
 def test_gen_data_writes_cache_compatible_files_backtestable_offline(tmp_path: Path) -> None:
     cache = tmp_path / "cache"
     gen = runner.invoke(app, ["gen-data", "--seed", "5", "--out-dir", str(cache), *_COMMON])
