@@ -1,8 +1,9 @@
 """V4 reporting: a full metrics summary, an equity-curve CSV, and an optional PNG.
 
 ``summarize`` renders the headline performance block — total & annualized return,
-Sharpe, max drawdown, average/peak exposure, win rate — alongside the V3
-guardrail lines (rejected/clamped orders, halt). ``write_equity_csv`` writes one
+Sharpe, Sortino, Calmar, max drawdown, average/peak exposure, win rate, and
+turnover — alongside the V3 guardrail lines (rejected/clamped orders, halt).
+``write_equity_csv`` writes one
 row per trading day with an ``exposure`` column and, when a benchmark run is
 supplied, a ``benchmark_equity`` column aligned by timestamp. ``write_equity_png``
 plots the curve; matplotlib is an optional dependency imported lazily inside the
@@ -35,10 +36,13 @@ def summarize(result: BacktestResult, benchmark: BacktestResult | None = None) -
         f"Total return:  {metrics.total_return * 100:+.2f}%",
         f"Annualized:    {metrics.annualized_return * 100:+.2f}%",
         f"Sharpe:        {metrics.sharpe:.2f}",
+        f"Sortino:       {metrics.sortino:.2f}",
+        f"Calmar:        {metrics.calmar:.2f}",
         f"Max drawdown:  {metrics.max_drawdown * 100:.2f}%",
         f"Avg exposure:  {metrics.avg_exposure * 100:.2f}%",
         f"Peak exposure: {metrics.peak_exposure * 100:.2f}%",
         f"Win rate:      {metrics.win_rate * 100:.2f}%",
+        f"Turnover:      {metrics.turnover * 100:.2f}%",
         f"Bars:          {len(result.equity_curve)}",
     ]
     if benchmark is not None:

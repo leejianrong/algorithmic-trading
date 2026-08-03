@@ -85,6 +85,67 @@ def sharpe(
     return mean / stdev * sqrt(periods_per_year)
 
 
+def sortino(
+    curve: Sequence[EquityPoint],
+    periods_per_year: int = 252,
+    rf: float = 0.0,
+) -> float:
+    """Annualized Sortino ratio: mean excess return over *downside* deviation.
+
+    Like :func:`sharpe` but the denominator penalizes only harmful volatility.
+    Downside deviation is the sample standard deviation (``n - 1`` basis, matching
+    :func:`sharpe`) computed over the shortfalls ``min(r - rf, 0)`` of every return
+    in the series — upside steps contribute a zero, not a drop from the count.
+    Returns 0.0 when there are fewer than two returns or there is no downside at
+    all, so no NaN/inf leaks out (consistent with :func:`sharpe`'s zero-stdev rule).
+    """
+    returns = daily_returns(curve)
+    if len(returns) < 2:
+        return 0.0
+    excess = [r - rf for r in returns]
+    mean = sum(excess) / len(excess)
+    downside_sq = sum(min(r, 0.0) ** 2 for r in excess)
+    downside_dev = sqrt(downside_sq / (len(excess) - 1))
+    if downside_dev == 0.0:
+        return 0.0
+    return mean / downside_dev * sqrt(periods_per_year)
+
+
+def calmar(curve: Sequence[EquityPoint], periods_per_year: int = 252) -> float:
+    """Calmar ratio: annualized return divided by max drawdown.
+
+    A reward-per-unit-of-worst-pain figure. Returns 0.0 when the max drawdown is
+    zero (a monotonic-up or degenerate curve), avoiding a divide-by-zero blow-up.
+    """
+    dd = max_drawdown(curve)
+    if dd == 0.0:
+        return 0.0
+    return annualized_return(curve, periods_per_year) / dd
+
+
+def turnover(
+    fills: Sequence[tuple[object, Fill]],
+    curve: Sequence[EquityPoint],
+    periods_per_year: int = 252,
+) -> float:
+    """Annualized portfolio turnover: traded notional over average equity.
+
+    Sums the absolute notional (``qty * price``) of every fill, divides by the mean
+    equity across the curve to express it as a fraction of the book, then annualizes
+    by ``periods_per_year / n_bars`` so a half-year run and a full-year run of the
+    same trading intensity report the same rate. Returns 0.0 for an empty curve or
+    non-positive average equity.
+    """
+    n = len(curve)
+    if n == 0:
+        return 0.0
+    avg_equity = sum(point.equity for point in curve) / n
+    if avg_equity <= 0:
+        return 0.0
+    traded = sum(abs(fill.qty * fill.price) for _ts, fill in fills)
+    return traded / avg_equity * (periods_per_year / n)
+
+
 def max_drawdown(curve: Sequence[EquityPoint]) -> float:
     """Largest peak-to-trough decline as a positive fraction.
 
@@ -168,8 +229,11 @@ class PerformanceMetrics:
     total_return: float
     annualized_return: float
     sharpe: float
+    sortino: float
+    calmar: float
     max_drawdown: float
     win_rate: float
+    turnover: float
     avg_exposure: float
     peak_exposure: float
 
@@ -182,8 +246,11 @@ def compute(result: BacktestResult, periods_per_year: int = 252) -> PerformanceM
         total_return=total_return(curve),
         annualized_return=annualized_return(curve, periods_per_year),
         sharpe=sharpe(curve, periods_per_year),
+        sortino=sortino(curve, periods_per_year),
+        calmar=calmar(curve, periods_per_year),
         max_drawdown=max_drawdown(curve),
         win_rate=win_rate(result.fills),
+        turnover=turnover(result.fills, curve, periods_per_year),
         avg_exposure=avg_exposure(exposures),
         peak_exposure=peak_exposure(exposures),
     )

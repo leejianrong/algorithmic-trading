@@ -72,6 +72,19 @@ class TestSummaryMetricsBlock:
         summary = summarize(_result([100.0, 110.0, 120.0], fills=fills))
         assert "Win rate:      100.00%" in summary
 
+    def test_sortino_calmar_turnover_lines_render(self) -> None:
+        # Two flat bars (avg equity 100) with a round-trip of 2,000 traded notional:
+        # turnover = 2000 / 100 * (252 / 2) = 2,520 → 252,000.00%.
+        fills = [
+            (_ts(1), Fill("AAA", Side.BUY, 10.0, 100.0)),
+            (_ts(2), Fill("AAA", Side.SELL, 10.0, 100.0)),
+        ]
+        summary = summarize(_result([100.0, 100.0], fills=fills))
+        lines = summary.splitlines()
+        assert any(ln.startswith("Sortino:") for ln in lines)
+        assert any(ln.startswith("Calmar:") for ln in lines)
+        assert "Turnover:      252000.00%" in summary
+
 
 class TestBenchmarkSummary:
     def test_benchmark_comparison_line_present_only_with_benchmark(self) -> None:

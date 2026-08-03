@@ -20,12 +20,15 @@ from trading.metrics import (
     PerformanceMetrics,
     annualized_return,
     avg_exposure,
+    calmar,
     compute,
     daily_returns,
     max_drawdown,
     peak_exposure,
     sharpe,
+    sortino,
     total_return,
+    turnover,
     win_rate,
 )
 from trading.types import Fill, Side
@@ -130,6 +133,57 @@ class TestWinRate:
         assert win_rate(fills) == 0.0
 
 
+class TestSortino:
+    def test_literal_two_returns(self) -> None:
+        # Returns 0.20, -0.10; mean 0.05; the only downside shortfall is -0.10, so
+        # downside deviation = sqrt(0.10**2 / (2 - 1)) = 0.10.
+        curve = _curve([100.0, 120.0, 108.0])
+        assert sortino(curve) == pytest.approx(0.05 / 0.10 * sqrt(252))
+
+    def test_matches_hand_downside(self) -> None:
+        curve = _curve([100.0, 110.0, 104.5, 125.4])
+        rets = daily_returns(curve)
+        mean = statistics.fmean(rets)
+        downside_dev = sqrt(sum(min(r, 0.0) ** 2 for r in rets) / (len(rets) - 1))
+        expected = mean / downside_dev * sqrt(252)
+        assert sortino(curve) == pytest.approx(expected, rel=1e-12)
+
+    def test_no_downside_is_zero(self) -> None:
+        # Strictly rising: no negative returns → downside deviation 0 → 0.0.
+        assert sortino(_curve([100.0, 110.0, 121.0])) == 0.0
+
+    def test_single_return_is_zero(self) -> None:
+        assert sortino(_curve([100.0, 110.0])) == 0.0
+
+
+class TestCalmar:
+    def test_annualized_over_max_drawdown(self) -> None:
+        # Max drawdown 0.25 (peak 120 → trough 90); calmar = annualized / 0.25.
+        curve = _curve([100.0, 120.0, 90.0, 110.0, 105.0])
+        assert calmar(curve) == pytest.approx(annualized_return(curve) / 0.25)
+
+    def test_zero_drawdown_is_zero(self) -> None:
+        assert calmar(_curve([100.0, 101.0, 102.0])) == 0.0
+
+
+class TestTurnover:
+    def test_traded_notional_over_avg_equity_annualized(self) -> None:
+        # Two bars (avg equity 100); buy 10 @100 then sell 10 @100 → traded 2,000.
+        # turnover = 2000 / 100 * (252 / 2).
+        curve = _curve([100.0, 100.0])
+        fills = [
+            (_ts(1), Fill("A", Side.BUY, 10.0, 100.0)),
+            (_ts(2), Fill("A", Side.SELL, 10.0, 100.0)),
+        ]
+        assert turnover(fills, curve) == pytest.approx(2000.0 / 100.0 * (252 / 2))
+
+    def test_no_fills_is_zero(self) -> None:
+        assert turnover([], _curve([100.0, 100.0])) == 0.0
+
+    def test_empty_curve_is_zero(self) -> None:
+        assert turnover([], []) == 0.0
+
+
 class TestExposureHelpers:
     exposures: ClassVar[list[float]] = [0.5, 1.0, 0.75, 0.25]
 
@@ -168,6 +222,9 @@ class TestCompute:
         assert metrics.win_rate == 1.0
         assert metrics.sharpe == pytest.approx(sharpe(curve))
         assert metrics.annualized_return == pytest.approx(annualized_return(curve))
+        assert metrics.sortino == pytest.approx(sortino(curve))
+        assert metrics.calmar == pytest.approx(calmar(curve))
+        assert metrics.turnover == pytest.approx(turnover(result.fills, curve))
 
     def test_surfaces_exposure_from_curve(self) -> None:
         # Curve carries a known per-bar exposure series → avg 0.625, peak 1.0.

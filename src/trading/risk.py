@@ -15,15 +15,35 @@ Two layers sit on the shared execution path so every mode is protected equally
 
 The implementation-level choices (latching, exits-allowed-while-halted,
 clamp-not-reject, cash left with the broker) are recorded in ADR-0013.
+
+A third, opt-in layer (ADR-0015) sits on the same per-bar equity the drawdown
+monitor already observes: when ``RiskConfig.target_volatility`` is set, the
+monitor maintains a rolling window of portfolio returns, estimates realized
+(annualized) volatility, and scales the *effective* gross-exposure cap by
+``target_vol / max(realized_vol, floor)`` (clamped to a sane maximum). A calm book
+is allowed more gross, a turbulent one less. When the target is unset the scale is
+a constant ``1.0`` and every path behaves exactly as before.
 """
 
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import replace
+from math import sqrt
 
 from trading.config import RiskConfig
 from trading.sizing import SHARE_PRECISION
 from trading.types import SHARE_EPS, Order, Portfolio, Side
+
+# Volatility-target tuning (ADR-0015). The window is the lookback (in bars) over
+# which realized volatility is estimated; TRADING_DAYS annualizes the per-bar
+# standard deviation (same 252 basis as the Sharpe metric, Q17). The floor keeps a
+# near-flat book from dividing by ~zero and demanding infinite leverage, and the
+# max scale caps how far the cap can be levered up when realized vol is very low.
+_VOL_WINDOW = 20
+_TRADING_DAYS = 252
+_VOL_FLOOR = 1e-6
+_MAX_VOL_SCALE = 3.0
 
 
 class Guardrails:
@@ -52,10 +72,26 @@ class Guardrails:
         # cap would collectively breach it. Reset once per bar by halted().
         self._committed_gross = 0.0
         self._committed_qty: dict[str, float] = {}
+        # Volatility-target state (ADR-0015): a rolling window of portfolio returns
+        # and the resulting multiplier on the gross cap. The scale stays 1.0 (a
+        # no-op) until a target is configured and there are enough returns to
+        # estimate realized volatility, so the unset path is byte-identical.
+        self._returns: deque[float] = deque(maxlen=_VOL_WINDOW)
+        self._vol_scale = 1.0
 
     @property
     def config(self) -> RiskConfig:
         return self._config
+
+    @property
+    def vol_scale(self) -> float:
+        """Current multiplier applied to the gross-exposure cap (ADR-0015).
+
+        ``1.0`` when volatility targeting is off or there is not yet enough return
+        history; otherwise ``target_vol / max(realized_vol, floor)`` clamped to
+        ``[0, _MAX_VOL_SCALE]``. Recomputed once per bar in :meth:`halted`.
+        """
+        return self._vol_scale
 
     @property
     def is_halted(self) -> bool:
@@ -81,6 +117,13 @@ class Guardrails:
         equity = portfolio.equity(prices)
         peak = equity if self._peak is None else max(self._peak, equity)
         self._peak = peak
+
+        # Feed the volatility-target window with this bar's portfolio return, then
+        # refresh the gross-cap multiplier off the updated window (ADR-0015). Done
+        # on the same equity the drawdown monitor observes so the two share one mark.
+        if self._prev_equity is not None and self._prev_equity > 0:
+            self._returns.append(equity / self._prev_equity - 1.0)
+        self._vol_scale = self._compute_vol_scale()
 
         if not self._halted:
             drawdown = (peak - equity) / peak if peak > 0 else 0.0
@@ -151,8 +194,12 @@ class Guardrails:
         # snapshot as the denominator, consistent with sizing.
         committed_qty = self._committed_qty.get(order.symbol, 0.0)
         allowed_position = self._config.max_position_pct * equity / price - pos.qty - committed_qty
+        # Volatility targeting scales only the gross cap (ADR-0015); the per-symbol
+        # position cap is a concentration limit and stays fixed. The scale is 1.0
+        # whenever targeting is off, so this term is unchanged in that case.
+        effective_gross = self._config.max_gross_exposure * self._vol_scale
         allowed_gross = (
-            self._config.max_gross_exposure * equity - current_gross - self._committed_gross
+            effective_gross * equity - current_gross - self._committed_gross
         ) / price
         allowed = min(order.qty, allowed_position, allowed_gross)
 
@@ -175,6 +222,26 @@ class Guardrails:
         self._committed_gross += accepted_qty * price
         self._committed_qty[order.symbol] = committed_qty + accepted_qty
         return result
+
+    def _compute_vol_scale(self) -> float:
+        """The gross-cap multiplier from realized vs. target volatility (ADR-0015).
+
+        Returns ``1.0`` (a no-op) when targeting is off or fewer than two returns
+        are in the window. Otherwise estimates realized volatility as the sample
+        standard deviation of the windowed returns annualized by ``√252``, and
+        returns ``target_vol / max(realized_vol, floor)`` clamped to
+        ``[0, _MAX_VOL_SCALE]`` so a calm book earns more gross and a turbulent one
+        less, without ever demanding unbounded leverage.
+        """
+        target = self._config.target_volatility
+        if target is None or len(self._returns) < 2:
+            return 1.0
+        n = len(self._returns)
+        mean = sum(self._returns) / n
+        variance = sum((r - mean) ** 2 for r in self._returns) / (n - 1)
+        realized_vol = sqrt(variance) * sqrt(_TRADING_DAYS)
+        scale = target / max(realized_vol, _VOL_FLOOR)
+        return min(scale, _MAX_VOL_SCALE)
 
     def _binding(self, allowed_position: float, allowed_gross: float) -> str:
         """Name the cap that bound (the one leaving the least room)."""
