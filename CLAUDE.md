@@ -24,10 +24,16 @@ As of this writing:
 - **Offline data:** a deterministic **synthetic** GBM adapter (`data/synthetic.py`,
   ADR-0012) drives the whole stack without a network — `trading backtest --source
   synthetic` and `trading gen-data`. All three strategies verified end to end on it.
-- **NOT yet built:** enforced **risk guardrails** — position/exposure caps,
-  drawdown kill switch (V3); full **metrics/report** — Sharpe, drawdown, exposure,
+- **V3 — enforced risk guardrails:** `RiskConfig` + a stateful `Guardrails`
+  (`risk.py`, ADR-0013) sit on the engine's order path, enforced by default
+  (`--no-guardrails` opts out): a per-symbol position cap and a gross-exposure cap
+  clamp over-cap buys (net of same-bar committed exposure), and a latching
+  drawdown / daily-loss kill switch blocks new entries while still allowing exits.
+  `BacktestResult` carries `clamps` + merged `rejections` + halt state; the report
+  surfaces them. Fast tests green.
+- **NOT yet built:** full **metrics/report** — Sharpe, drawdown, exposure,
   benchmark, trade blotter formatting (V4); **paper mode** (V5); and the **Alpaca**
-  data/broker adapters (next milestone). **Slice V3 in `SLICES.md` is the next
+  data/broker adapters (next milestone). **Slice V4 in `SLICES.md` is the next
   work.**
 
 If code and prose disagree, the code wins — update the prose.

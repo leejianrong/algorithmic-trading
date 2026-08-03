@@ -107,6 +107,16 @@ share precision. Low cost if wrong.
 
 ## V3: Enforced risk guardrails
 
+**Status: DONE** — `RiskConfig` + a stateful `Guardrails` (`risk.py`) enforce a
+per-symbol position cap and a gross-exposure cap (clamping over-cap buys, net of
+same-bar committed exposure) plus a latching drawdown / daily-loss kill switch
+that blocks new entries while still allowing exits. Wired into the engine's order
+path (enforced by default, `--no-guardrails` to opt out); `BacktestResult`
+carries `clamps`, merged `rejections`, and the halt state, and the report
+surfaces them. ADR-0013 records the enforcement semantics. Fast tests green
+(incl. the 200%→cap clamp, the scripted-drawdown halt, and the multi-order
+gross-cap guard).
+
 **Delivers:** R5
 
 **Build plan**
