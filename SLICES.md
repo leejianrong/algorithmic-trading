@@ -153,6 +153,18 @@ the report lists rejected/clamped orders and whether a halt fired.
 
 ## V4: Performance report, exposure, and benchmark
 
+**Status: DONE** — pure metrics (`metrics.py`: total & annualized return, Sharpe
+per Q17, max drawdown, win rate, avg/peak exposure, assembled into
+`PerformanceMetrics` via `compute`) run over the equity curve. The engine now
+records per-bar gross exposure on each `EquityPoint` (guarded to 0.0 on a flat
+book / non-positive equity). The report (`report.py`) renders the full metrics
+block beside the V3 guardrail lines, `write_equity_csv` adds an `exposure` column
+(+ a timestamp-aligned `benchmark_equity` column when a benchmark is supplied),
+and an optional `write_equity_png` plots the curve (matplotlib imported lazily).
+The CLI adds `--benchmark SYMBOL` (an unconstrained buy-and-hold benchmark over
+the same dates/source, works offline under `--source synthetic`) and
+`--plot/--no-plot`. Fast tests green.
+
 **Delivers:** R6
 
 **Build plan**

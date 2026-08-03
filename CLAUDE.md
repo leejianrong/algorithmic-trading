@@ -31,10 +31,15 @@ As of this writing:
   drawdown / daily-loss kill switch blocks new entries while still allowing exits.
   `BacktestResult` carries `clamps` + merged `rejections` + halt state; the report
   surfaces them. Fast tests green.
-- **NOT yet built:** full **metrics/report** — Sharpe, drawdown, exposure,
-  benchmark, trade blotter formatting (V4); **paper mode** (V5); and the **Alpaca**
-  data/broker adapters (next milestone). **Slice V4 in `SLICES.md` is the next
-  work.**
+- **V4 — performance report, exposure & benchmark:** `metrics.py` computes total
+  & annualized return, Sharpe (Q17), max drawdown, win rate, and avg/peak exposure
+  (`PerformanceMetrics` via `compute`). The engine records per-bar gross exposure
+  on each `EquityPoint`; the report renders the full metrics block, writes an
+  `exposure` column (+ aligned `benchmark_equity` when enabled) to the CSV, and an
+  optional lazy-matplotlib PNG. The CLI gains `--benchmark SYMBOL` (unconstrained
+  buy-and-hold, offline-capable) and `--plot/--no-plot`. Fast tests green.
+- **NOT yet built:** **paper mode** (V5); and the **Alpaca** data/broker adapters
+  (next milestone). **Slice V5 in `SLICES.md` is the next work.**
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -97,7 +102,8 @@ src/trading/
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
   data/synthetic.py        # deterministic GBM adapter — offline backtests (ADR-0012)
   strategies/              # buy_and_hold, sma_crossover, equal_weight + registry
-  # risk / paper clock / metrics  → V3 onward
+  metrics.py               # pure performance metrics over the equity curve (V4)
+  # paper clock  → V5
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)
