@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+# Fast pre-push gate (dev-playbook principle 6): mirror the cheap CI jobs so a
+# push rarely lands red. Only the no-infra layer runs here — never let a slow
+# check (network, browser) gate a local push.
+#
+# Bypass for a rare, scoped exception with:  git push --no-verify
+set -euo pipefail
+
+echo "pre-push: running fast gate (lint + type-check + fast tests)…"
+make check
+echo "pre-push: fast gate passed."
