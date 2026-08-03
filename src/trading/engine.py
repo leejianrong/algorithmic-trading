@@ -17,9 +17,11 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from datetime import datetime
 
-from trading.interfaces import Broker, DataAdapter, Strategy
+from trading.config import RiskConfig
+from trading.interfaces import Broker, DataAdapter, RiskGuardrails, Strategy
+from trading.risk import Guardrails
 from trading.sizing import size
-from trading.types import Bar, Fill, Order, Portfolio
+from trading.types import SHARE_EPS, Bar, Fill, Order, Portfolio
 
 # A single timestamp's bars across the universe, and the whole ordered feed.
 BarSlice = dict[str, Bar]
@@ -57,7 +59,13 @@ class BacktestResult:
     equity_curve: list[EquityPoint]
     final_portfolio: Portfolio
     fills: list[tuple[datetime, Fill]] = field(default_factory=list)
+    # Guardrail rejections (halt block / cap collapse) merged with the broker's.
     rejections: list[tuple[Order, str]] = field(default_factory=list)
+    # (original, clamped, reason) for each order a guardrail cap trimmed down.
+    clamps: list[tuple[Order, Order, str]] = field(default_factory=list)
+    halted: bool = False
+    halt_ts: datetime | None = None
+    halt_reason: str | None = None
 
     @property
     def final_equity(self) -> float:
@@ -87,9 +95,17 @@ class _Context:
 class Engine:
     """Runs a strategy over a data feed through a broker."""
 
-    def __init__(self, adapter: DataAdapter, broker: Broker) -> None:
+    def __init__(
+        self,
+        adapter: DataAdapter,
+        broker: Broker,
+        guardrails: RiskGuardrails | None = None,
+    ) -> None:
         self._adapter = adapter
         self._broker = broker
+        # Enforced by default (ADR-0009); pass Guardrails(RiskConfig.unlimited())
+        # to opt out.
+        self._guardrails: RiskGuardrails = guardrails or Guardrails(RiskConfig())
 
     def run(
         self,
@@ -106,6 +122,9 @@ class Engine:
         last_close: dict[str, float] = {}
         curve: list[EquityPoint] = []
         blotter: list[tuple[datetime, Fill]] = []
+        rejections: list[tuple[Order, str]] = []
+        clamps: list[tuple[Order, Order, str]] = []
+        halt_ts: datetime | None = None
 
         for ts, bars in feed:
             # 1. Execute orders queued on the previous bar at this bar's open.
@@ -116,22 +135,40 @@ class Engine:
             for symbol, bar in bars.items():
                 history[symbol].append(bar)
                 last_close[symbol] = bar.close
+
+            # 3. Portfolio monitor: update/latch the kill switch on the marked book.
+            if self._guardrails.halted(self._broker.portfolio, last_close) and halt_ts is None:
+                halt_ts = ts
+
             context = _Context(self._broker.portfolio, history)
             intents = strategy.on_bar(ts, bars, context)
 
-            # 3. Size intents into orders; they can fill no earlier than next bar.
+            # 4. Size intents into orders, run each through the pre-trade check,
+            #    then queue survivors (they fill no earlier than the next bar).
             for order in size(intents, self._broker.portfolio, last_close):
-                self._broker.submit(order)
+                checked = self._guardrails.check(order, self._broker.portfolio, last_close)
+                reason = getattr(self._guardrails, "last_reason", None)
+                if checked is None:
+                    rejections.append((order, reason or "rejected by guardrails"))
+                    continue
+                if abs(checked.qty - order.qty) > SHARE_EPS:
+                    clamps.append((order, checked, reason or "clamped by guardrails"))
+                self._broker.submit(checked)
 
-            # 4. Mark equity to this bar's close.
+            # 5. Mark equity to this bar's close.
             equity = self._broker.portfolio.equity(last_close)
             curve.append(EquityPoint(ts, equity))
 
+        rejections.extend(getattr(self._broker, "rejections", []))
         return BacktestResult(
             symbols=list(symbols),
             starting_cash=starting_cash,
             equity_curve=curve,
             final_portfolio=self._broker.portfolio,
             fills=blotter,
-            rejections=list(getattr(self._broker, "rejections", [])),
+            rejections=rejections,
+            clamps=clamps,
+            halted=halt_ts is not None,
+            halt_ts=halt_ts,
+            halt_reason=getattr(self._guardrails, "halt_reason", None),
         )

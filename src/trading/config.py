@@ -25,6 +25,48 @@ class CostConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class RiskConfig:
+    """Enforced risk limits (ADR-0009, ADR-0013).
+
+    Guardrails are on by default with a small, real-account posture: no single
+    symbol over a quarter of equity, no leverage (gross ≤ 100%), and a hard halt
+    once drawdown from the equity peak reaches a fifth. ``max_daily_loss_pct`` is
+    an optional single-bar circuit breaker, off by default. Every limit is
+    overridable per run; :meth:`unlimited` returns the permissive opt-out.
+    """
+
+    max_position_pct: float = 0.25
+    max_gross_exposure: float = 1.0
+    max_drawdown_pct: float = 0.20
+    max_daily_loss_pct: float | None = None
+
+    def __post_init__(self) -> None:
+        if self.max_position_pct <= 0:
+            raise ValueError("max_position_pct must be positive")
+        if self.max_gross_exposure <= 0:
+            raise ValueError("max_gross_exposure must be positive")
+        if not 0 < self.max_drawdown_pct <= 1.0:
+            raise ValueError("max_drawdown_pct must be in (0, 1]")
+        if self.max_daily_loss_pct is not None and not 0 < self.max_daily_loss_pct <= 1.0:
+            raise ValueError("max_daily_loss_pct must be None or in (0, 1]")
+
+    @classmethod
+    def unlimited(cls) -> RiskConfig:
+        """A fully permissive config — the explicit opt-out from enforcement.
+
+        Position and gross caps are infinite (never clamp), the drawdown halt is
+        unreachable (fires only at total wipe-out), and the daily-loss breaker is
+        off. Pass this to disable guardrails without forking the engine's path.
+        """
+        return cls(
+            max_position_pct=float("inf"),
+            max_gross_exposure=float("inf"),
+            max_drawdown_pct=1.0,
+            max_daily_loss_pct=None,
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class BacktestConfig:
     """Everything a backtest run needs beyond the strategy and the data."""
 

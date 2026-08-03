@@ -24,6 +24,11 @@ def summarize(result: BacktestResult) -> str:
     ]
     if result.rejections:
         lines.append(f"Rejected:      {len(result.rejections)} order(s)")
+    if result.clamps:
+        lines.append(f"Clamped:       {len(result.clamps)} order(s)")
+    if result.halted and result.halt_ts is not None:
+        reason = result.halt_reason or "new entries halted"
+        lines.append(f"Halt:          fired at {result.halt_ts.isoformat()} ({reason})")
     return "\n".join(lines)
 
 
