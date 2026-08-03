@@ -38,8 +38,18 @@ As of this writing:
   `exposure` column (+ aligned `benchmark_equity` when enabled) to the CSV, and an
   optional lazy-matplotlib PNG. The CLI gains `--benchmark SYMBOL` (unconstrained
   buy-and-hold, offline-capable) and `--plot/--no-plot`. Fast tests green.
-- **NOT yet built:** **paper mode** (V5); and the **Alpaca** data/broker adapters
-  (next milestone). **Slice V5 in `SLICES.md` is the next work.**
+- **V5 — paper mode:** the per-bar loop body is a shared `Engine._step` (with
+  `_RunState`/`_finalize`) that both backtest (`Engine.run`) and paper
+  (`PaperSession`, `engine.py`) drive, so the modes can't fork (ADR-0002/0014);
+  backtest stays byte-identical. A `Clock` seam (`clock.py`: `WallClock` /
+  `ImmediateClock` / `FakeClock`) and a completed-bars `RecentWindowFeed`
+  (`data/recent_window.py`) feed paper; the loop processes each newly completed
+  bar once (idempotent), logs a `BarOutcome`, and sleeps until the next is due. The
+  `trading paper` CLI mirrors `backtest` plus `--live/--once` (default `--once`
+  replays offline and terminates; persists a session log, `paper_state.json`, and
+  the equity CSV). Fast tests green (parity, completed-bars-only, halt parity).
+- **NOT yet built:** the **Alpaca** data/broker adapters (next milestone). **That
+  Alpaca milestone (see the roadmap at the end of `SLICES.md`) is the next work.**
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -93,17 +103,18 @@ src/trading/
   types.py                 # core value types (implemented, tested)
   interfaces.py            # DI seams: DataAdapter, Broker, Strategy, RiskGuardrails
   config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps)
-  engine.py                # event-driven loop + feed builder + BacktestResult
+  engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5)
   broker.py                # SimulatedBroker + CostModel
   report.py                # text summary + equity_curve.csv
-  cli.py                   # `trading backtest …`
+  cli.py                   # `trading backtest / paper / gen-data`
   sizing.py                # target-weight → fractional-share orders (V2)
+  clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
   data/fake.py             # in-memory adapter for the fast test layer
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
   data/synthetic.py        # deterministic GBM adapter — offline backtests (ADR-0012)
+  data/recent_window.py    # completed-bars feed for paper mode (V5)
   strategies/              # buy_and_hold, sma_crossover, equal_weight + registry
   metrics.py               # pure performance metrics over the equity curve (V4)
-  # paper clock  → V5
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)

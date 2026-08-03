@@ -197,6 +197,21 @@ constant/column each.
 
 ## V5: Paper mode on recent daily data (same engine + guardrails, wall-clock)
 
+**Status: DONE** — the per-bar loop body is extracted into a shared
+`Engine._step` (with `_RunState` + `_finalize`) that BOTH backtest (`Engine.run`)
+and paper (`PaperSession`) drive, so the two modes cannot fork (ADR-0002/0014);
+backtest results are byte-identical (every prior test stays green). `PaperSession`
+polls a `RecentWindowFeed` on an injected `Clock`, processes each newly completed
+bar exactly once (idempotent via a seen-timestamp set), records a per-bar
+`BarOutcome`, and sleeps until the next bar is due — bounded by `max_new_bars` /
+consecutive-empty-polls for tests and offline demos. The `trading paper` CLI
+mirrors `backtest`'s options plus `--live/--once`: `--once` (default) replays
+`[from, to]` with a `FakeClock` offline and terminates, printing each bar's
+decision/fills/guardrail actions/equity, appending to a session log, persisting
+running state (`paper_state.json`), and writing the equity CSV; `--live` runs on
+the wall clock until interrupted. ADR-0014 records the loop mechanism. Fast tests
+green (parity, completed-bars-only, idempotency, guardrail-halt parity).
+
 **Delivers:** R7, R8 (interface readiness)
 
 **Build plan**
