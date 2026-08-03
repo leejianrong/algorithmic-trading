@@ -18,7 +18,8 @@ from dataclasses import dataclass, field
 from datetime import datetime
 
 from trading.interfaces import Broker, DataAdapter, Strategy
-from trading.types import Bar, Order, Portfolio, TargetWeight
+from trading.sizing import size
+from trading.types import Bar, Fill, Order, Portfolio
 
 # A single timestamp's bars across the universe, and the whole ordered feed.
 BarSlice = dict[str, Bar]
@@ -55,6 +56,7 @@ class BacktestResult:
     starting_cash: float
     equity_curve: list[EquityPoint]
     final_portfolio: Portfolio
+    fills: list[tuple[datetime, Fill]] = field(default_factory=list)
     rejections: list[tuple[Order, str]] = field(default_factory=list)
 
     @property
@@ -82,14 +84,6 @@ class _Context:
         return bars[-lookback:]
 
 
-def _to_order(intent: Order | TargetWeight) -> Order:
-    if isinstance(intent, Order):
-        return intent
-    raise NotImplementedError(
-        "TargetWeight sizing arrives in V2 (ADR-0007); V1 strategies emit Orders directly"
-    )
-
-
 class Engine:
     """Runs a strategy over a data feed through a broker."""
 
@@ -111,10 +105,12 @@ class Engine:
         history: dict[str, list[Bar]] = defaultdict(list)
         last_close: dict[str, float] = {}
         curve: list[EquityPoint] = []
+        blotter: list[tuple[datetime, Fill]] = []
 
         for ts, bars in feed:
             # 1. Execute orders queued on the previous bar at this bar's open.
-            self._broker.on_bar(bars)
+            fills = self._broker.on_bar(bars)
+            blotter.extend((ts, fill) for fill in fills)
 
             # 2. Reveal the now-complete bar to the strategy (never the future).
             for symbol, bar in bars.items():
@@ -123,9 +119,9 @@ class Engine:
             context = _Context(self._broker.portfolio, history)
             intents = strategy.on_bar(ts, bars, context)
 
-            # 3. Queue new orders; they can fill no earlier than the next bar.
-            for intent in intents:
-                self._broker.submit(_to_order(intent))
+            # 3. Size intents into orders; they can fill no earlier than next bar.
+            for order in size(intents, self._broker.portfolio, last_close):
+                self._broker.submit(order)
 
             # 4. Mark equity to this bar's close.
             equity = self._broker.portfolio.equity(last_close)
@@ -136,5 +132,6 @@ class Engine:
             starting_cash=starting_cash,
             equity_curve=curve,
             final_portfolio=self._broker.portfolio,
+            fills=blotter,
             rejections=list(getattr(self._broker, "rejections", [])),
         )

@@ -16,7 +16,7 @@ from trading.broker import SimulatedBroker
 from trading.config import CostConfig
 from trading.data.fake import FakeAdapter
 from trading.engine import Engine
-from trading.strategies.buy_and_hold import CASH_BUFFER, BuyAndHold
+from trading.strategies.buy_and_hold import INVESTED_WEIGHT, BuyAndHold
 from trading.types import Bar, Portfolio
 
 
@@ -48,7 +48,7 @@ def test_buy_and_hold_two_symbols_exact_equity_curve() -> None:
     # Buy-and-hold leaves a small cash buffer B for costs, so it buys 50*B AAA
     # and 5*B BBB. With zero costs the equity curve is exact:
     #   day1 = 1000 (flat); day2 = 1000 + 50*B; day3 = 1000 + 150*B.
-    b = CASH_BUFFER
+    b = INVESTED_WEIGHT
     equities = [p.equity for p in result.equity_curve]
     assert equities == pytest.approx([1_000.0, 1_000.0 + 50 * b, 1_000.0 + 150 * b])
     assert result.total_return == pytest.approx(0.15 * b)

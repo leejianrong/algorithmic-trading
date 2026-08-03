@@ -12,19 +12,20 @@ capital, so it favors honest numbers over flattering ones. Full context:
 As of this writing:
 
 - **Done and tested:** the scaffold and quality gates; core value types
-  (`types.py`) and DI seams (`interfaces.py`); and **slice V1 — a working
-  backtest**: the event-driven `Engine` (`engine.py`), `SimulatedBroker`
-  (`broker.py`, next-open fills + slippage/commission + funding rejection), the
-  cached `YFinanceAdapter` (`data/yfinance_adapter.py`) and in-memory
-  `FakeAdapter`, the `buy_and_hold` strategy + registry (`strategies/`), a minimal
-  report (`report.py`), and the `trading backtest` CLI (`cli.py`). Fast tests
-  green; `trading backtest` runs end to end.
-- **NOT yet built:** target-weight **sizing** (V2 — strategies currently emit
-  `Order`s directly; `TargetWeight` raises `NotImplementedError` in the engine),
-  **SMA-crossover** and allocation strategies (V2), enforced **risk guardrails**
-  (V3), full **metrics/report** — Sharpe, drawdown, exposure, benchmark (V4),
-  **paper mode** (V5), and the **Alpaca** data/broker adapters (next milestone).
-  **Slice V2 in `SLICES.md` is the next work.**
+  (`types.py`) and DI seams (`interfaces.py`); **V1 — a working backtest**: the
+  event-driven `Engine` (`engine.py`), `SimulatedBroker` (`broker.py`, next-open
+  fills + slippage/commission + funding rejection), the cached `YFinanceAdapter`
+  (`data/yfinance_adapter.py`) and in-memory `FakeAdapter`, a minimal report
+  (`report.py`), and the `trading backtest` CLI (`cli.py`); and **V2 — target-weight
+  sizing** (`sizing.py`, resolves `TargetWeight` → fractional-share rebalance
+  orders), the `sma_crossover` and `equal_weight` strategies plus `buy_and_hold`
+  baseline (`strategies/`), and a fill blotter on `BacktestResult`. Fast tests
+  green; `trading backtest` runs end to end for all three strategies.
+- **NOT yet built:** enforced **risk guardrails** — position/exposure caps,
+  drawdown kill switch (V3); full **metrics/report** — Sharpe, drawdown, exposure,
+  benchmark, trade blotter formatting (V4); **paper mode** (V5); and the **Alpaca**
+  data/broker adapters (next milestone). **Slice V3 in `SLICES.md` is the next
+  work.**
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -82,10 +83,11 @@ src/trading/
   broker.py                # SimulatedBroker + CostModel
   report.py                # text summary + equity_curve.csv
   cli.py                   # `trading backtest …`
+  sizing.py                # target-weight → fractional-share orders (V2)
   data/fake.py             # in-memory adapter for the fast test layer
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
-  strategies/              # buy_and_hold + name→strategy registry
-  # sizing / risk / paper clock / metrics  → V2 onward
+  strategies/              # buy_and_hold, sma_crossover, equal_weight + registry
+  # risk / paper clock / metrics  → V3 onward
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)
