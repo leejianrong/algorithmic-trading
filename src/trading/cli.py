@@ -28,6 +28,7 @@ from trading.interfaces import DataAdapter
 from trading.report import summarize, write_equity_csv, write_equity_png
 from trading.risk import Guardrails
 from trading.strategies import get_strategy
+from trading.sweep import SweepSummary, run_sweep
 from trading.types import Portfolio
 
 app = typer.Typer(add_completion=False, help="Algorithmic trading test bench.")
@@ -333,6 +334,213 @@ def paper(
     typer.echo("\n" + summarize(result))
     typer.echo(f"\nProcessed {len(session.session_log)} completed bar(s).")
     typer.echo(f"Session log: {log_path}\nRunning state: {state_path}\nEquity curve: {csv_path}")
+
+
+def _coerce_param_value(token: str) -> object:
+    """Coerce one grid value token to int, else float, else leave it a string.
+
+    ``"5"`` -> ``5`` (int), ``"0.95"`` -> ``0.95`` (float), ``"fast"`` -> ``"fast"``.
+    Integer-looking tokens stay ints so parameters like ``fast``/``slow`` reach the
+    strategy as the ints it expects.
+    """
+    try:
+        return int(token)
+    except ValueError:
+        pass
+    try:
+        return float(token)
+    except ValueError:
+        return token
+
+
+def _parse_grid(params: list[str]) -> dict[str, list[object]]:
+    """Parse repeatable ``--param name=v1,v2,...`` options into a grid.
+
+    Each option contributes one axis; values are comma-separated and coerced by
+    :func:`_coerce_param_value`. A malformed spec (no ``=``, empty name, or no
+    values) or a duplicated name exits with code 2.
+    """
+    grid: dict[str, list[object]] = {}
+    for spec in params:
+        name, sep, raw = spec.partition("=")
+        name = name.strip()
+        if not sep or not name:
+            typer.echo(f"error: --param must be name=v1,v2,..., got {spec!r}", err=True)
+            raise typer.Exit(2)
+        values = [_coerce_param_value(v.strip()) for v in raw.split(",") if v.strip()]
+        if not values:
+            typer.echo(f"error: --param {name!r} has no values", err=True)
+            raise typer.Exit(2)
+        if name in grid:
+            typer.echo(f"error: --param {name!r} given more than once", err=True)
+            raise typer.Exit(2)
+        grid[name] = values
+    return grid
+
+
+# The metric columns written for every sweep run, in order (attr, header).
+_SWEEP_METRIC_COLUMNS: list[tuple[str, str]] = [
+    ("sharpe", "sharpe"),
+    ("total_return", "total_return"),
+    ("annualized_return", "annualized_return"),
+    ("max_drawdown", "max_drawdown"),
+    ("win_rate", "win_rate"),
+    ("avg_exposure", "avg_exposure"),
+    ("peak_exposure", "peak_exposure"),
+]
+
+
+def _write_sweep_csv(summary: SweepSummary, out: Path, rank_by: str, param_keys: list[str]) -> None:
+    """Write the ranked sweep results to ``out`` — one row per run, best first."""
+    out.parent.mkdir(parents=True, exist_ok=True)
+    ranked = summary.ranked(by=rank_by)
+    header = ["rank", *param_keys, "window", "win_start", "win_end"] + [
+        name for _attr, name in _SWEEP_METRIC_COLUMNS
+    ]
+    with out.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        for rank, run in enumerate(ranked, start=1):
+            row: list[object] = [rank]
+            row.extend(run.params.get(key, "") for key in param_keys)
+            row.extend([run.window, run.start.date().isoformat(), run.end.date().isoformat()])
+            row.extend(
+                round(getattr(run.metrics, attr), 6) for attr, _name in _SWEEP_METRIC_COLUMNS
+            )
+            writer.writerow(row)
+
+
+def _format_sweep_table(summary: SweepSummary, rank_by: str, param_keys: list[str]) -> str:
+    """Render the ranked runs as a plain-text table, ordered by ``rank_by``."""
+    ranked = summary.ranked(by=rank_by)
+    headers = ["rank", *param_keys, "window", "sharpe", "total_return", "max_drawdown"]
+    rows: list[list[str]] = []
+    for rank, run in enumerate(ranked, start=1):
+        cells = [str(rank)]
+        cells.extend(_format_param(run.params.get(key)) for key in param_keys)
+        cells.append(str(run.window))
+        cells.append(f"{run.metrics.sharpe:.3f}")
+        cells.append(f"{run.metrics.total_return * 100:.2f}%")
+        cells.append(f"{run.metrics.max_drawdown * 100:.2f}%")
+        rows.append(cells)
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+    lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))]
+    lines.append("  ".join("-" * widths[i] for i in range(len(headers))))
+    lines.extend("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)) for row in rows)
+    return "\n".join(lines)
+
+
+def _format_param(value: object) -> str:
+    """Compact rendering of one parameter value for the table (empty for None)."""
+    if value is None:
+        return ""
+    if isinstance(value, float):
+        return f"{value:g}"
+    return str(value)
+
+
+@app.command()
+def sweep(
+    strategy: str = typer.Option(..., "--strategy", "-s", help="Registered strategy name."),
+    symbols: str = typer.Option(..., "--symbols", help="Comma-separated tickers, e.g. AAA,BBB."),
+    from_: str = typer.Option(..., "--from", help="Start date, YYYY-MM-DD."),
+    to: str = typer.Option(..., "--to", help="End date, YYYY-MM-DD."),
+    param: list[str] = typer.Option(
+        [], "--param", "-p", help="Repeatable grid axis: name=v1,v2,... (e.g. fast=5,10,20)."
+    ),
+    rank_by: str = typer.Option(
+        "sharpe", "--rank-by", help="Ranking metric: sharpe | total_return."
+    ),
+    windows: int = typer.Option(
+        1, "--windows", help="Walk-forward: split [from, to] into N consecutive windows (1 = off)."
+    ),
+    source: str = typer.Option("yfinance", "--source", help="Data source: yfinance | synthetic."),
+    seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
+    cash: float = typer.Option(1_000.0, "--cash", help="Starting cash per run."),
+    max_position: float = typer.Option(
+        0.25, "--max-position", help="Per-symbol position cap, fraction of equity."
+    ),
+    max_gross: float = typer.Option(
+        1.0, "--max-gross", help="Max gross exposure, fraction of equity."
+    ),
+    max_drawdown: float = typer.Option(
+        0.20, "--max-drawdown", help="Drawdown kill-switch threshold, fraction from peak."
+    ),
+    no_guardrails: bool = typer.Option(
+        False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
+    ),
+    cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
+    out: Path = typer.Option(Path("results/sweep.csv"), "--out", help="Results CSV path."),
+) -> None:
+    """Grid-sweep a strategy's parameters over a date range, ranked by a metric.
+
+    Runs the backtest engine once per parameter combination (an OUTER loop, not an
+    engine feature — ADR-0016), computes the same metrics as ``backtest``, prints a
+    ranked table, and writes a results CSV. Deterministic and offline-capable with
+    ``--source synthetic``. ``--windows N`` adds a simple per-window walk-forward.
+    """
+    start = _parse_date("--from", from_)
+    end = _parse_date("--to", to)
+    tickers = _parse_symbols(symbols)
+    grid = _parse_grid(param)
+    if rank_by not in {"sharpe", "total_return"}:
+        typer.echo(
+            f"error: --rank-by must be 'sharpe' or 'total_return', got {rank_by!r}", err=True
+        )
+        raise typer.Exit(2)
+
+    if strategy not in _known_strategy_names():
+        typer.echo(
+            f"error: unknown strategy {strategy!r}; known: {', '.join(_known_strategy_names())}",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+    try:
+        risk = (
+            RiskConfig.unlimited()
+            if no_guardrails
+            else RiskConfig(
+                max_position_pct=max_position,
+                max_gross_exposure=max_gross,
+                max_drawdown_pct=max_drawdown,
+            )
+        )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    adapter = _make_adapter(source, cache_dir, seed)
+    summary = run_sweep(
+        strategy, grid, adapter, tickers, start, end, cash=cash, risk=risk, windows=windows
+    )
+
+    param_keys = list(grid)
+    if not summary.runs:
+        typer.echo("No runs produced — every parameter combination was invalid.")
+    else:
+        typer.echo(
+            f"Sweep: strategy={strategy} symbols={','.join(tickers)} "
+            f"combos={len(summary.runs)} ranked by {rank_by}\n"
+        )
+        typer.echo(_format_sweep_table(summary, rank_by, param_keys))
+        _write_sweep_csv(summary, out, rank_by, param_keys)
+        typer.echo(f"\nWrote sweep results to {out}")
+
+    for combo, reason in summary.skipped:
+        pretty = ", ".join(f"{k}={_format_param(v)}" for k, v in combo.items())
+        typer.echo(f"skipped {{{pretty}}}: {reason}")
+
+
+def _known_strategy_names() -> list[str]:
+    """Sorted registry names, for a friendly error before running the sweep."""
+    from trading.strategies import STRATEGIES
+
+    return sorted(STRATEGIES)
 
 
 if __name__ == "__main__":
