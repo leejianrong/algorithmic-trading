@@ -55,6 +55,26 @@ class _OverleverOnce:
         return [Order(self._symbol, Side.BUY, qty)]
 
 
+class _EqualWeightOnce:
+    """On the first bar, target ``weight`` of equity in each of ``symbols``."""
+
+    def __init__(self, symbols: list[str], weight: float) -> None:
+        self._symbols = symbols
+        self._weight = weight
+        self._done = False
+
+    def on_bar(
+        self,
+        ts: datetime,
+        bars: dict[str, Bar],
+        context: StrategyContext,
+    ) -> list[Order | TargetWeight]:
+        if self._done or not all(s in bars for s in self._symbols):
+            return []
+        self._done = True
+        return [TargetWeight(s, self._weight) for s in self._symbols]
+
+
 class _ScriptedCrash:
     """Invest half on bar 1, try to add more after the crash, then exit."""
 
@@ -105,6 +125,27 @@ def test_two_hundred_percent_target_is_clamped_to_the_gross_cap() -> None:
 
     final_gross = result.final_portfolio.gross_exposure({"AAA": 100.0})
     assert final_gross == pytest.approx(1.0)  # ≈100%, decisively not 200%
+
+
+def test_multi_symbol_rebalance_respects_gross_cap_across_orders() -> None:
+    # Two symbols targeted 50% + 50% (100% gross intended) under an 80% gross cap.
+    # The orders queue together, so the cap must account for exposure the sibling
+    # order committed this bar; realized gross must land at ≤ 80%, not sail to 100%.
+    bars = [_bar(s, d, o=100, c=100) for s in ("AAA", "BBB") for d in (1, 2, 3)]
+    broker = SimulatedBroker(Portfolio(cash=1_000.0), _ZERO_COST)
+    guardrails = Guardrails(
+        RiskConfig(max_gross_exposure=0.8, max_position_pct=1.0, max_drawdown_pct=1.0)
+    )
+    result = Engine(FakeAdapter(bars), broker, guardrails).run(
+        _EqualWeightOnce(["AAA", "BBB"], weight=0.5),
+        ["AAA", "BBB"],
+        datetime(2024, 1, 1, tzinfo=UTC),
+        datetime(2024, 1, 3, tzinfo=UTC),
+    )
+
+    assert result.clamps, "expected the shared gross cap to clamp a sibling order"
+    final_gross = result.final_portfolio.gross_exposure({"AAA": 100.0, "BBB": 100.0})
+    assert final_gross <= 0.8 + 1e-6  # cap enforced across the whole rebalance
 
 
 def test_scripted_drawdown_halts_new_entries_but_allows_the_exit() -> None:

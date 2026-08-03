@@ -98,6 +98,42 @@ class TestPreTradeCheck:
         checked = guard.check(order, pf, {"AAA": 100.0})
         assert checked is order
 
+    def test_gross_cap_accounts_for_earlier_same_bar_orders(self) -> None:
+        # Same-bar multi-order rebalance: the orders queue and don't fill until the
+        # next bar, so the pre-trade portfolio never changes between checks. The
+        # second symbol must still be clamped by the room the first one *committed*,
+        # not by the full cap. First buy 50% (under 80%), second wants 50% but only
+        # 30% of gross room is left → clamped to 3 shares.
+        guard = Guardrails(
+            RiskConfig(max_gross_exposure=0.8, max_position_pct=1.0, max_drawdown_pct=1.0)
+        )
+        pf = _portfolio(1_000.0)
+        prices = {"AAA": 100.0, "BBB": 100.0}
+        guard.halted(pf, prices)  # begin the bar → reset the within-bar tally
+        first = guard.check(Order("AAA", Side.BUY, 5.0), pf, prices)
+        assert first is not None and first.qty == pytest.approx(5.0)
+        second = guard.check(Order("BBB", Side.BUY, 5.0), pf, prices)
+        assert second is not None
+        assert second.qty == pytest.approx(3.0)
+        assert "gross exposure cap" in (guard.last_reason or "")
+
+    def test_position_cap_accounts_for_earlier_same_symbol_orders(self) -> None:
+        # Two raw buys of the *same* symbol in one bar: the position cap must see
+        # the first buy's committed quantity. 25% cap = 2.5 shares; first takes 2,
+        # so the second (wanting 2 more) is clamped to the remaining 0.5.
+        guard = Guardrails(
+            RiskConfig(max_position_pct=0.25, max_gross_exposure=10.0, max_drawdown_pct=1.0)
+        )
+        pf = _portfolio(1_000.0)
+        prices = {"AAA": 100.0}
+        guard.halted(pf, prices)  # begin the bar → reset the within-bar tally
+        first = guard.check(Order("AAA", Side.BUY, 2.0), pf, prices)
+        assert first is not None and first.qty == pytest.approx(2.0)
+        second = guard.check(Order("AAA", Side.BUY, 2.0), pf, prices)
+        assert second is not None
+        assert second.qty == pytest.approx(0.5)
+        assert "position cap" in (guard.last_reason or "")
+
 
 class TestKillSwitch:
     def _monitor(self, threshold: float = 0.20) -> Guardrails:

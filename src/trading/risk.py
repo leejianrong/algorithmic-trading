@@ -46,6 +46,12 @@ class Guardrails:
         # Set on every check() call so the engine can log the clamp/reject reason
         # (the RiskGuardrails protocol returns only Order | None).
         self.last_reason: str | None = None
+        # Within-bar tally of exposure this bar's orders have already committed.
+        # Same-bar orders queue and don't fill until the next bar, so the pre-trade
+        # portfolio doesn't move between checks; without this, N orders each under a
+        # cap would collectively breach it. Reset once per bar by halted().
+        self._committed_gross = 0.0
+        self._committed_qty: dict[str, float] = {}
 
     @property
     def config(self) -> RiskConfig:
@@ -62,7 +68,16 @@ class Guardrails:
         Drawdown is measured from the highest equity seen so far; the daily-loss
         breaker, when configured, compares against the previous bar. The halt
         latches: once ``True`` it stays ``True`` for the rest of the session.
+
+        The engine calls this exactly once per bar, immediately before the check
+        loop, so it also **begins a new bar for the pre-trade tally**: the
+        within-bar committed-exposure counters are reset here so this bar's orders
+        accumulate against a clean slate (ADR-0013).
         """
+        # Begin a new bar: forget last bar's committed exposure.
+        self._committed_gross = 0.0
+        self._committed_qty = {}
+
         equity = portfolio.equity(prices)
         peak = equity if self._peak is None else max(self._peak, equity)
         self._peak = peak
@@ -130,9 +145,17 @@ class Guardrails:
             for s, p in portfolio.positions.items()
             if abs(p.qty) > SHARE_EPS and s in prices
         )
-        # Room left under each cap, in shares of this symbol.
-        allowed_position = self._config.max_position_pct * equity / price - pos.qty
-        allowed_gross = (self._config.max_gross_exposure * equity - current_gross) / price
+        # Room left under each cap, in shares of this symbol — net of what this
+        # bar's earlier orders have already committed (they queue, so the pre-trade
+        # portfolio above doesn't yet reflect them). Equity stays the pre-trade
+        # snapshot as the denominator, consistent with sizing.
+        committed_qty = self._committed_qty.get(order.symbol, 0.0)
+        allowed_position = (
+            self._config.max_position_pct * equity / price - pos.qty - committed_qty
+        )
+        allowed_gross = (
+            self._config.max_gross_exposure * equity - current_gross - self._committed_gross
+        ) / price
         allowed = min(order.qty, allowed_position, allowed_gross)
 
         if allowed <= SHARE_EPS:
@@ -140,14 +163,20 @@ class Guardrails:
             return None
 
         if allowed < order.qty - SHARE_EPS:
-            clamped = round(allowed, SHARE_PRECISION)
+            accepted_qty = round(allowed, SHARE_PRECISION)
             self.last_reason = (
-                f"clamped {order.qty:.6f}→{clamped:.6f}: "
+                f"clamped {order.qty:.6f}→{accepted_qty:.6f}: "
                 f"{self._binding(allowed_position, allowed_gross)}"
             )
-            return replace(order, qty=clamped)
+            result = replace(order, qty=accepted_qty)
+        else:
+            accepted_qty = order.qty
+            result = order
 
-        return order
+        # Commit the approved notional so later same-bar orders see less room.
+        self._committed_gross += accepted_qty * price
+        self._committed_qty[order.symbol] = committed_qty + accepted_qty
+        return result
 
     def _binding(self, allowed_position: float, allowed_gross: float) -> str:
         """Name the cap that bound (the one leaving the least room)."""
