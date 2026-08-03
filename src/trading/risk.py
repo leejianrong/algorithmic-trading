@@ -150,9 +150,7 @@ class Guardrails:
         # portfolio above doesn't yet reflect them). Equity stays the pre-trade
         # snapshot as the denominator, consistent with sizing.
         committed_qty = self._committed_qty.get(order.symbol, 0.0)
-        allowed_position = (
-            self._config.max_position_pct * equity / price - pos.qty - committed_qty
-        )
+        allowed_position = self._config.max_position_pct * equity / price - pos.qty - committed_qty
         allowed_gross = (
             self._config.max_gross_exposure * equity - current_gross - self._committed_gross
         ) / price
