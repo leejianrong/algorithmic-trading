@@ -12,8 +12,10 @@ from datetime import UTC, datetime
 import pytest
 
 from trading.broker import SimulatedBroker
+from trading.config import RiskConfig
 from trading.data.synthetic import SyntheticAdapter
 from trading.engine import BacktestResult, Engine
+from trading.risk import Guardrails
 from trading.strategies import get_strategy
 from trading.types import Portfolio
 
@@ -23,9 +25,15 @@ _END = datetime(2021, 12, 31, tzinfo=UTC)
 
 
 def _run(strategy_name: str, seed: int = 3) -> BacktestResult:
+    # Plumbing test — guardrails disabled so fully-invested strategies deploy all
+    # capital without the default position/exposure caps clamping them. Enforced
+    # caps are exercised in test_risk.py and test_risk_e2e.py.
     adapter = SyntheticAdapter(seed=seed)
     broker = SimulatedBroker(Portfolio(cash=1_000.0))
-    return Engine(adapter, broker).run(get_strategy(strategy_name), _SYMBOLS, _START, _END)
+    guardrails = Guardrails(RiskConfig.unlimited())
+    return Engine(adapter, broker, guardrails).run(
+        get_strategy(strategy_name), _SYMBOLS, _START, _END
+    )
 
 
 @pytest.mark.parametrize("strategy", ["buy_and_hold", "sma_crossover", "equal_weight"])

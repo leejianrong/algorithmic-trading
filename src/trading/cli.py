@@ -14,11 +14,13 @@ from pathlib import Path
 import typer
 
 from trading.broker import SimulatedBroker
+from trading.config import RiskConfig
 from trading.data.synthetic import SyntheticAdapter
 from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
 from trading.engine import Engine
 from trading.interfaces import DataAdapter
 from trading.report import summarize, write_equity_csv
+from trading.risk import Guardrails
 from trading.strategies import get_strategy
 from trading.types import Portfolio
 
@@ -66,6 +68,18 @@ def backtest(
     source: str = typer.Option("yfinance", "--source", help="Data source: yfinance | synthetic."),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash."),
+    max_position: float = typer.Option(
+        0.25, "--max-position", help="Per-symbol position cap, fraction of equity."
+    ),
+    max_gross: float = typer.Option(
+        1.0, "--max-gross", help="Max gross exposure, fraction of equity."
+    ),
+    max_drawdown: float = typer.Option(
+        0.20, "--max-drawdown", help="Drawdown kill-switch threshold, fraction from peak."
+    ),
+    no_guardrails: bool = typer.Option(
+        False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/equity_curve.csv"), "--out"),
 ) -> None:
@@ -80,9 +94,23 @@ def backtest(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
+    try:
+        risk = (
+            RiskConfig.unlimited()
+            if no_guardrails
+            else RiskConfig(
+                max_position_pct=max_position,
+                max_gross_exposure=max_gross,
+                max_drawdown_pct=max_drawdown,
+            )
+        )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
     adapter = _make_adapter(source, cache_dir, seed)
     broker = SimulatedBroker(Portfolio(cash=cash))
-    result = Engine(adapter, broker).run(strat, tickers, start, end)
+    result = Engine(adapter, broker, Guardrails(risk)).run(strat, tickers, start, end)
 
     typer.echo(summarize(result))
     write_equity_csv(result, out)

@@ -13,11 +13,16 @@ from datetime import UTC, datetime
 import pytest
 
 from trading.broker import SimulatedBroker
-from trading.config import CostConfig
+from trading.config import CostConfig, RiskConfig
 from trading.data.fake import FakeAdapter
 from trading.engine import Engine
+from trading.risk import Guardrails
 from trading.strategies.buy_and_hold import INVESTED_WEIGHT, BuyAndHold
 from trading.types import Bar, Portfolio
+
+# Accounting tests — guardrails disabled so the hand-computed curve/rejection holds
+# (enforced caps would clamp these fully-invested buys). V3 caps are proven in
+# test_risk.py and test_risk_e2e.py. A fresh Guardrails per run: it is stateful.
 
 
 def _bar(symbol: str, day: int, o: float, c: float) -> Bar:
@@ -39,7 +44,7 @@ def test_buy_and_hold_two_symbols_exact_equity_curve() -> None:
     broker = SimulatedBroker(
         Portfolio(cash=1_000.0), CostConfig(commission_per_share=0, slippage_bps=0)
     )
-    engine = Engine(adapter, broker)
+    engine = Engine(adapter, broker, Guardrails(RiskConfig.unlimited()))
 
     start = datetime(2024, 1, 1, tzinfo=UTC)
     end = datetime(2024, 1, 3, tzinfo=UTC)
@@ -68,7 +73,7 @@ def test_no_look_ahead_order_fills_next_bar_not_this_one() -> None:
     broker = SimulatedBroker(
         Portfolio(cash=100.0), CostConfig(commission_per_share=0, slippage_bps=0)
     )
-    result = Engine(adapter, broker).run(
+    result = Engine(adapter, broker, Guardrails(RiskConfig.unlimited())).run(
         BuyAndHold(), ["AAA"], datetime(2024, 1, 1, tzinfo=UTC), datetime(2024, 1, 2, tzinfo=UTC)
     )
 
