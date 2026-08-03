@@ -219,3 +219,6 @@ __marimo__/
 
 # Trading bench run artifacts (data cache defaults to .cache/, already ignored)
 /results/
+
+# Claude Code agent worktrees and local scaffolding (transient)
+.claude/
