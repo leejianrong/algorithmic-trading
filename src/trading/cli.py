@@ -394,19 +394,16 @@ def _write_sweep_csv(summary: SweepSummary, out: Path, rank_by: str, param_keys:
     """Write the ranked sweep results to ``out`` — one row per run, best first."""
     out.parent.mkdir(parents=True, exist_ok=True)
     ranked = summary.ranked(by=rank_by)
-    header = (
-        ["rank", *param_keys, "window", "win_start", "win_end"]
-        + [name for _attr, name in _SWEEP_METRIC_COLUMNS]
-    )
+    header = ["rank", *param_keys, "window", "win_start", "win_end"] + [
+        name for _attr, name in _SWEEP_METRIC_COLUMNS
+    ]
     with out.open("w", newline="") as fh:
         writer = csv.writer(fh)
         writer.writerow(header)
         for rank, run in enumerate(ranked, start=1):
             row: list[object] = [rank]
             row.extend(run.params.get(key, "") for key in param_keys)
-            row.extend(
-                [run.window, run.start.date().isoformat(), run.end.date().isoformat()]
-            )
+            row.extend([run.window, run.start.date().isoformat(), run.end.date().isoformat()])
             row.extend(
                 round(getattr(run.metrics, attr), 6) for attr, _name in _SWEEP_METRIC_COLUMNS
             )
