@@ -44,10 +44,16 @@ def build_feed(series: dict[str, list[Bar]]) -> Feed:
 
 @dataclass(frozen=True, slots=True)
 class EquityPoint:
-    """Portfolio equity marked at one bar's close."""
+    """Portfolio equity — and its gross exposure — marked at one bar's close.
+
+    ``exposure`` is Σ|position value| / equity at the close (0.0 when the book is
+    flat or equity is non-positive), the per-bar series the V4 metrics average and
+    peak. It defaults to 0.0 so pre-V4 constructions stay valid.
+    """
 
     ts: datetime
     equity: float
+    exposure: float = 0.0
 
 
 @dataclass(slots=True)
@@ -155,9 +161,15 @@ class Engine:
                     clamps.append((order, checked, reason or "clamped by guardrails"))
                 self._broker.submit(checked)
 
-            # 5. Mark equity to this bar's close.
-            equity = self._broker.portfolio.equity(last_close)
-            curve.append(EquityPoint(ts, equity))
+            # 5. Mark equity — and gross exposure — to this bar's close.
+            portfolio = self._broker.portfolio
+            equity = portfolio.equity(last_close)
+            # gross_exposure raises on non-positive equity; a flat book is 0.
+            if equity <= 0 or not portfolio.positions:
+                exposure = 0.0
+            else:
+                exposure = portfolio.gross_exposure(last_close)
+            curve.append(EquityPoint(ts, equity, exposure))
 
         rejections.extend(getattr(self._broker, "rejections", []))
         return BacktestResult(

@@ -49,9 +49,7 @@ def total_return(curve: Sequence[EquityPoint]) -> float:
     return curve[-1].equity / curve[0].equity - 1.0
 
 
-def annualized_return(
-    curve: Sequence[EquityPoint], periods_per_year: int = 252
-) -> float:
+def annualized_return(curve: Sequence[EquityPoint], periods_per_year: int = 252) -> float:
     """Geometric annualized return.
 
     ``(1 + total) ** (periods_per_year / n) - 1`` where ``n`` is the number of
@@ -161,22 +159,31 @@ def peak_exposure(exposures: list[float]) -> float:
 
 @dataclass(frozen=True, slots=True)
 class PerformanceMetrics:
-    """Headline performance figures for a run (exposure lands with V4 wiring)."""
+    """Headline performance figures for a run.
+
+    ``avg_exposure`` / ``peak_exposure`` are the mean and maximum of the per-bar
+    gross-exposure series carried on the equity curve (:attr:`EquityPoint.exposure`).
+    """
 
     total_return: float
     annualized_return: float
     sharpe: float
     max_drawdown: float
     win_rate: float
+    avg_exposure: float
+    peak_exposure: float
 
 
 def compute(result: BacktestResult, periods_per_year: int = 252) -> PerformanceMetrics:
     """Assemble :class:`PerformanceMetrics` from a run's curve and fills."""
     curve = result.equity_curve
+    exposures = [point.exposure for point in curve]
     return PerformanceMetrics(
         total_return=total_return(curve),
         annualized_return=annualized_return(curve, periods_per_year),
         sharpe=sharpe(curve, periods_per_year),
         max_drawdown=max_drawdown(curve),
         win_rate=win_rate(result.fills),
+        avg_exposure=avg_exposure(exposures),
+        peak_exposure=peak_exposure(exposures),
     )

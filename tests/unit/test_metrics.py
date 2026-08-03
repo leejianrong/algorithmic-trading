@@ -168,3 +168,35 @@ class TestCompute:
         assert metrics.win_rate == 1.0
         assert metrics.sharpe == pytest.approx(sharpe(curve))
         assert metrics.annualized_return == pytest.approx(annualized_return(curve))
+
+    def test_surfaces_exposure_from_curve(self) -> None:
+        # Curve carries a known per-bar exposure series → avg 0.625, peak 1.0.
+        from trading.engine import BacktestResult, EquityPoint
+        from trading.types import Portfolio
+
+        exposures = [0.5, 1.0, 0.75, 0.25]
+        curve = [EquityPoint(_ts(i + 1), 100.0, e) for i, e in enumerate(exposures)]
+        result = BacktestResult(
+            symbols=["A"],
+            starting_cash=100.0,
+            equity_curve=curve,
+            final_portfolio=Portfolio(cash=100.0),
+        )
+        metrics = compute(result)
+        assert metrics.avg_exposure == pytest.approx(0.625)
+        assert metrics.peak_exposure == 1.0
+
+    def test_exposure_defaults_to_zero_when_curve_flat(self) -> None:
+        from trading.engine import BacktestResult
+        from trading.types import Portfolio
+
+        # EquityPoint.exposure defaults to 0.0 → both exposure metrics are 0.
+        result = BacktestResult(
+            symbols=["A"],
+            starting_cash=100.0,
+            equity_curve=_curve([100.0, 101.0, 102.0]),
+            final_portfolio=Portfolio(cash=102.0),
+        )
+        metrics = compute(result)
+        assert metrics.avg_exposure == 0.0
+        assert metrics.peak_exposure == 0.0

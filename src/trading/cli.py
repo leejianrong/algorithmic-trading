@@ -17,9 +17,9 @@ from trading.broker import SimulatedBroker
 from trading.config import RiskConfig
 from trading.data.synthetic import SyntheticAdapter
 from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
-from trading.engine import Engine
+from trading.engine import BacktestResult, Engine
 from trading.interfaces import DataAdapter
-from trading.report import summarize, write_equity_csv
+from trading.report import summarize, write_equity_csv, write_equity_png
 from trading.risk import Guardrails
 from trading.strategies import get_strategy
 from trading.types import Portfolio
@@ -80,6 +80,12 @@ def backtest(
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
     ),
+    benchmark: str = typer.Option(
+        "", "--benchmark", help="Benchmark symbol for a buy-and-hold comparison, e.g. SPY."
+    ),
+    plot: bool = typer.Option(
+        False, "--plot/--no-plot", help="Also write an equity_curve.png next to the CSV."
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/equity_curve.csv"), "--out"),
 ) -> None:
@@ -112,9 +118,23 @@ def backtest(
     broker = SimulatedBroker(Portfolio(cash=cash))
     result = Engine(adapter, broker, Guardrails(risk)).run(strat, tickers, start, end)
 
-    typer.echo(summarize(result))
-    write_equity_csv(result, out)
+    # Optional buy-and-hold benchmark on the same dates/source, run UNCONSTRAINED
+    # (unlimited guardrails) so the benchmark itself is never clamped (Q24).
+    bench_result: BacktestResult | None = None
+    bench_symbol = benchmark.strip().upper()
+    if bench_symbol:
+        bench_broker = SimulatedBroker(Portfolio(cash=cash))
+        bench_result = Engine(adapter, bench_broker, Guardrails(RiskConfig.unlimited())).run(
+            get_strategy("buy_and_hold"), [bench_symbol], start, end
+        )
+
+    typer.echo(summarize(result, bench_result))
+    write_equity_csv(result, out, bench_result)
     typer.echo(f"\nWrote equity curve to {out}")
+    if plot:
+        png = out.with_suffix(".png")
+        write_equity_png(result, png, bench_result)
+        typer.echo(f"Wrote equity plot to {png}")
 
 
 @app.command(name="gen-data")
