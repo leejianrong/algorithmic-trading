@@ -291,3 +291,72 @@ def test_paper_broker_unknown_errors(tmp_path: Path) -> None:
     )
     assert result.exit_code == 2
     assert "broker" in result.output.lower()
+
+
+_DATES = ["--from", "2019-01-01", "--to", "2020-12-31"]
+
+
+def test_backtest_symbols_basket_runs(tmp_path: Path) -> None:
+    # `@blue20` expands to the curated universe; synthetic generates any ticker.
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--symbols",
+            "@blue20",
+            "--source",
+            "synthetic",
+            "--out",
+            str(tmp_path / "e.csv"),
+            *_DATES,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Final equity" in result.output
+
+
+def test_backtest_basket_sector_map_and_cap_runs(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--symbols",
+            "@blue20",
+            "--sector-map",
+            "@blue20",
+            "--max-sector-exposure",
+            "0.3",
+            "--source",
+            "synthetic",
+            "--out",
+            str(tmp_path / "e.csv"),
+            *_DATES,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Final equity" in result.output
+
+
+def test_backtest_unknown_basket_errors(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--symbols",
+            "@nope",
+            "--source",
+            "synthetic",
+            "--out",
+            str(tmp_path / "e.csv"),
+            *_DATES,
+        ],
+    )
+    assert result.exit_code == 2
+    # The error names the known baskets so the mistake is self-correcting.
+    assert "blue20" in result.output

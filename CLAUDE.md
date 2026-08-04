@@ -99,6 +99,17 @@ As of this writing:
   backtest & paper now emit `result.json`; new `trading dashboard --static|--serve`.
   Fast gate green; the full daily→intraday→result.json→dashboard pipeline verified end
   to end offline on synthetic data.
+- **Curated universes (offline-verified):** `universe.py` (ADR-0024) holds named
+  stock baskets — a frozen `Basket` + `BASKETS` registry with `get_universe` /
+  `get_sector_map`, seeded by `blue20` (20 mega-cap US names across 8 sectors). The
+  CLI expands a `@name` sigil on `--symbols` (unknown -> exit 2 naming the baskets)
+  and `--sector-map` (unknown -> the ValueError CLI-error path); plain comma lists
+  are unchanged. Honesty caveat, stated in the module docstring: `blue20` is a
+  *curation, not a broker fact* — fractionability/tradability are authoritative only
+  via Alpaca's `get_asset` (a seam extension not yet built), so the universe must be
+  verified against the broker before live use. Fast gate green; `backtest --source
+  synthetic --symbols @blue20 --sector-map @blue20 --max-sector-exposure 0.30` runs
+  end to end offline.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR); and
   locking `alpaca-py` into the dependency set (deferred while the build sandbox is
   offline). Real Alpaca paper/live-quote runs need `pip install alpaca-py` plus
@@ -165,7 +176,7 @@ src/trading/
   broker.py                # SimulatedBroker + CostModel
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020)
   report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023)
-  cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard` (--source, --broker, --interval)
+  cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard` (--source, --broker, --interval, @basket)
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
   frequency.py             # Frequency value: label/delta/periods_per_year — interval abstraction (ADR-0022)
@@ -178,6 +189,7 @@ src/trading/
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion + registry
+  universe.py              # curated named stock baskets (blue20) + @name CLI expansion (ADR-0024)
   metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure (periods_per_year)
   sweep.py                 # parameter sweep / walk-forward over Engine.run (ADR-0016)
 tests/
