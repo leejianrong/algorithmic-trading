@@ -60,6 +60,15 @@ across a nominal session (13:30–20:00 UTC = 9:30–16:00 ET) for each trading
 weekday, stamped at each bar's start, with GBM drift/vol scaled to the bar via
 `periods_per_year`, deterministically per seed+symbol.
 
+> **Narrowed by [ADR-0030](0030-synthetic-range-consistency.md) (2026-08-05)** — the
+> last clause only. The generator no longer scales its own draws by
+> `periods_per_year`: an intraday session is now a Brownian bridge onto the daily
+> close, so the daily backbone sets the annualized shape and the last intraday bar of
+> a session closes exactly on the daily bar. This ADR's actual invariant — frequency
+> is an adapter-construction property, and neither the `DataAdapter` protocol nor the
+> engine's per-bar step ever learns the interval — is untouched, as is
+> `periods_per_year`'s role in metrics annualization.
+
 **Real intraday behind integration.** `AlpacaAdapter` gains a construction-time
 `interval`; a daily interval keeps routing through `get_daily_bars` (unchanged),
 a sub-daily one routes through a new `get_bars(..., interval)` on the

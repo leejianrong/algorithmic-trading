@@ -24,6 +24,18 @@ As of this writing:
 - **Offline data:** a deterministic **synthetic** GBM adapter (`data/synthetic.py`,
   ADR-0012) drives the whole stack without a network — `trading backtest --source
   synthetic` and `trading gen-data`. All three strategies verified end to end on it.
+  **Range-independent since ADR-0030:** there is one canonical series per
+  `(symbol, seed, params, frequency)` anchored at a fixed `EPOCH` (1990-01-01), and a
+  request is a *slice* of it — a bar is a pure function of its absolute position, drawn
+  from a counter-based `blake2b` + Box-Muller stream, so overlapping ranges agree on
+  every shared timestamp. Before that the adapter reseeded per call and walked from the
+  requested `start`, so two different spans came back byte-identical (which made a
+  synthetic walk-forward a null test) and `paper --live --source synthetic` walked from
+  year 1 to price a 2022 bar at `1.5e+81`. Costs, both documented in the module: the
+  price level walks from the epoch (`O(bars from the epoch)`, ~20 ms/symbol, memoized
+  per instance), and bars before 1990 do not exist (a `datetime.min` request is
+  clipped, which is what the paper feed does). Intraday is a Brownian bridge onto the
+  daily close, so 1h/30m/5m/1m agree with 1d at every session close.
 - **V3 — enforced risk guardrails:** `RiskConfig` + a stateful `Guardrails`
   (`risk.py`, ADR-0013) sit on the engine's order path, enforced by default
   (`--no-guardrails` opts out): a per-symbol position cap and a gross-exposure cap
@@ -206,6 +218,9 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
 - **Frequency is an adapter property, not a `get_bars` argument** — the protocol and
   the engine per-bar step never learn the interval; act on a bar only once complete
   (`ts+interval`); daily stays byte-identical (ADR-0022).
+- **A bar belongs to a symbol and a timestamp, not to a request** — any adapter's
+  overlapping ranges must agree bar-for-bar on the timestamps they share; a sub-range
+  is a slice of its parent, never a re-anchored replay (ADR-0030).
 - **Guardrails are enforced, not advisory:** position/exposure caps and the
   drawdown kill switch can veto or clamp orders (ADR-0009).
 - **One execution path:** backtest and paper differ only in feed and clock;
@@ -231,7 +246,8 @@ src/trading/
   dashboard/               # web dashboard (ADR-0023): payload + static_export (stdlib) + server (lazy FastAPI)
   data/fake.py             # in-memory adapter for the fast test layer
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
-  data/synthetic.py        # deterministic GBM adapter, daily+intraday — offline (ADR-0012/0022)
+  data/synthetic.py        # deterministic GBM adapter, daily+intraday — offline (ADR-0012/0022);
+                           #   range-independent: one canonical series from EPOCH (ADR-0030)
   data/csv_adapter.py      # bring-your-own-data OHLCV CSV DataAdapter (--source csv)
   data/alpaca_client.py    # AlpacaClient seam + Fake/Real clients (ADR-0017/0018)
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
