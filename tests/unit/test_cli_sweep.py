@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from typer.testing import CliRunner
+from typer.testing import CliRunner, Result
 
 from trading.cli import app
 
@@ -176,3 +176,70 @@ def test_sweep_reports_skipped_invalid_combos(tmp_path: Path) -> None:
     )
     assert result.exit_code == 0, result.output
     assert "skipped" in result.output.lower()
+
+
+class TestWalkForwardCli:
+    """`--folds` runs TRUE out-of-sample validation (ADR-0026)."""
+
+    def _invoke(self, tmp_path: Path, *extra: str) -> Result:
+        return runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "sma_crossover",
+                "--param",
+                "fast=5,10",
+                "--param",
+                "slow=20,30",
+                "--source",
+                "synthetic",
+                "--seed",
+                "5",
+                "--out",
+                str(tmp_path / "wf.csv"),
+                *extra,
+                *_COMMON,
+            ],
+        )
+
+    def test_folds_prints_per_fold_is_and_oos(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, "--folds", "2")
+        assert result.exit_code == 0, result.output
+        assert "Walk-forward:" in result.output
+        assert "IS sharpe" in result.output
+        assert "OOS sharpe" in result.output
+        # The aggregate the whole exercise exists to produce.
+        assert "OUT-OF-SAMPLE mean sharpe" in result.output
+        assert "profitable out of sample" in result.output
+
+    def test_folds_writes_a_csv_that_labels_is_vs_oos(self, tmp_path: Path) -> None:
+        out = tmp_path / "wf.csv"
+        result = self._invoke(tmp_path, "--folds", "2")
+        assert result.exit_code == 0, result.output
+        header = out.read_text().splitlines()[0]
+        # A reader must never mistake a tuned number for a validated one.
+        assert "is_sharpe" in header
+        assert "oos_sharpe" in header
+
+    def test_rolling_mode_accepted(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, "--folds", "2", "--wf-mode", "rolling")
+        assert result.exit_code == 0, result.output
+        assert "mode=rolling" in result.output
+
+    def test_bad_mode_rejected(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path, "--folds", "2", "--wf-mode", "sideways")
+        assert result.exit_code == 2, result.output
+        assert "--wf-mode must be" in result.output
+
+    def test_folds_and_windows_together_rejected(self, tmp_path: Path) -> None:
+        """Two different validation schemes; asking for both is ambiguous."""
+        result = self._invoke(tmp_path, "--folds", "2", "--windows", "3")
+        assert result.exit_code == 2, result.output
+        assert "only one" in result.output
+
+    def test_walk_forward_is_off_by_default(self, tmp_path: Path) -> None:
+        result = self._invoke(tmp_path)
+        assert result.exit_code == 0, result.output
+        assert "Walk-forward:" not in result.output
+        assert "Sweep:" in result.output

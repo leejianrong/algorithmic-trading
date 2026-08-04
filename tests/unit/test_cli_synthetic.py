@@ -360,3 +360,111 @@ def test_backtest_unknown_basket_errors(tmp_path: Path) -> None:
     assert result.exit_code == 2
     # The error names the known baskets so the mistake is self-correcting.
     assert "blue20" in result.output
+
+
+class TestLiquidityScreenCli:
+    """`--min-adv` wiring (ADR-0029): screen before the run, report every drop."""
+
+    def test_screen_reports_and_runs_when_symbols_qualify(self, tmp_path: Path) -> None:
+        out = tmp_path / "equity.csv"
+        result = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "equal_weight",
+                "--source",
+                "synthetic",
+                "--min-adv",
+                "1000",  # synthetic bars clear a low floor
+                "--out",
+                str(out),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Liquidity screen" in result.output
+        assert "no look-ahead" in result.output
+        assert "Final equity" in result.output
+
+    def test_impossible_floor_fails_loudly_instead_of_running_empty(self, tmp_path: Path) -> None:
+        """An empty universe must not look like a strategy that never traded."""
+        out = tmp_path / "equity.csv"
+        result = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "equal_weight",
+                "--source",
+                "synthetic",
+                "--min-adv",
+                "1e15",
+                "--out",
+                str(out),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 2, result.output
+        assert "no symbol met the" in result.output
+        assert not out.exists()
+
+    def test_screen_is_off_by_default(self, tmp_path: Path) -> None:
+        out = tmp_path / "equity.csv"
+        result = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "equal_weight",
+                "--source",
+                "synthetic",
+                "--out",
+                str(out),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Liquidity screen" not in result.output
+
+
+class TestSignificanceCli:
+    """Trades-per-parameter reaches the printed summary (ADR-0029)."""
+
+    def test_parameterized_strategy_reports_the_ratio(self, tmp_path: Path) -> None:
+        out = tmp_path / "equity.csv"
+        result = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "sma_crossover",  # 3 free parameters
+                "--source",
+                "synthetic",
+                "--out",
+                str(out),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Trades:" in result.output
+        assert "Trades/param:" in result.output
+
+    def test_parameterless_strategy_reports_no_ratio(self, tmp_path: Path) -> None:
+        out = tmp_path / "equity.csv"
+        result = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "buy_and_hold",  # nothing to curve-fit
+                "--source",
+                "synthetic",
+                "--out",
+                str(out),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Trades:" in result.output
+        assert "Trades/param:" not in result.output

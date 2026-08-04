@@ -104,12 +104,10 @@ As of this writing:
   `get_sector_map`, seeded by `blue20` (20 mega-cap US names across 8 sectors). The
   CLI expands a `@name` sigil on `--symbols` (unknown -> exit 2 naming the baskets)
   and `--sector-map` (unknown -> the ValueError CLI-error path); plain comma lists
-  are unchanged. Honesty caveat, stated in the module docstring: `blue20` is a
-  *curation, not a broker fact* — fractionability/tradability are authoritative only
-  via Alpaca's `get_asset` (a seam extension not yet built), so the universe must be
-  verified against the broker before live use. Fast gate green; `backtest --source
-  synthetic --symbols @blue20 --sector-map @blue20 --max-sector-exposure 0.30` runs
-  end to end offline.
+  are unchanged. Fast gate green; `backtest --source synthetic --symbols @blue20
+  --sector-map @blue20 --max-sector-exposure 0.30` runs end to end offline. The two
+  honesty caveats in the module docstring are now both *addressed* rather than merely
+  stated — see the validation batch below.
 - **Cross-sectional strategy (offline-verified):** `cross_sectional`
   (`strategies/cross_sectional.py`, ADR-0025) joins the registry — the first
   *cross-equity* (relative-strength) strategy. Each rebalance it ranks the whole
@@ -122,11 +120,43 @@ As of this writing:
   existing `Strategy` seam with no engine/interface change; `weight/top_k` must stay
   under the position cap (K=8 → ~11%, safe) or the guardrails clamp. Fast gate green;
   runs end to end on `--symbols @blue20 --source synthetic`.
+- **Validation-honesty batch (three lanes, offline-verified):** the checks that decide
+  whether a reported number means anything.
+  **True walk-forward** (`sweep.run_walk_forward`, ADR-0026) — `--folds N` cuts the
+  range into folds, tunes the whole grid **in-sample**, then runs the single winner
+  **exactly once out-of-sample**; the summary leads with mean OOS Sharpe and the
+  IS→OOS degradation. The pre-existing `--windows` is a *plain* per-window grid sweep
+  (all in-sample) and is unchanged; passing both is an error. A spy adapter proves the
+  OOS span is requested exactly once, and a rigged fixture proves the summary reports
+  the IS winner's *worse* OOS numbers rather than the best OOS combo.
+  **Broker-verified universe** (`universe.validate_universe` + `AlpacaClient.get_asset`,
+  ADR-0028) — sorts a candidate basket into `usable` (tradable **and** fractionable),
+  `unusable` (the broker said no), and `unverified` (the lookup failed — unknown, not
+  rejected); nothing is filtered silently. CLI: `trading verify-universe --symbols
+  @blue20` (needs creds + `alpaca-py`; exits 1 when not clean). `universe.py` still has
+  **no runtime import** of `trading.data` — the client is typed structurally, enforced
+  by a subprocess test.
+  **Survivorship bias** (ADR-0027) — recorded as an accepted, documented, *unfixed*
+  limitation: `blue20` is today's winners, yfinance has no delisted names, so curated
+  backtests are an **upper bound**; forward paper results are survivorship-free and
+  should outweigh them.
+  **Liquidity + significance** (`liquidity.py`, `metrics.entry_count`,
+  `strategies.free_parameter_count`, ADR-0029) — `--min-adv` screens the universe by
+  average dollar volume measured in a formation window ending **before** `--from`
+  (computing ADV over the backtest range would be look-ahead; a test records every
+  range requested from the adapter and asserts each ends before the start line). Every
+  run now reports its entry count, and below 30 trades per free parameter the summary
+  warns explicitly. `volume` was parsed by every adapter and read by nothing until now.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR); and
   locking `alpaca-py` into the dependency set (deferred while the build sandbox is
   offline). Real Alpaca paper/live-quote runs need `pip install alpaca-py` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment; the dashboard server
-  needs the `dashboard` extra (`uv sync --extra dashboard`).
+  needs the `dashboard` extra (`uv sync --extra dashboard`). Also open: a
+  **survivorship-bias-free point-in-time universe** (ADR-0027 records the gap; the
+  `--source csv` path is the hook), **per-bar rolling liquidity** (the ADV screen is
+  point-in-time, judged once before the run), **parameter-stability / heatmap output**
+  from a sweep, **regime-split metrics**, and a **paper-vs-simulated fill divergence
+  report** (the thing paper trading is actually for).
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -193,7 +223,8 @@ src/trading/
   broker.py                # SimulatedBroker + CostModel
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020)
   report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023)
-  cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard` (--source, --broker, --interval, @basket)
+  cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
+                           #   (--source, --broker, --interval, @basket, --min-adv, --folds)
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
   frequency.py             # Frequency value: label/delta/periods_per_year — interval abstraction (ADR-0022)
@@ -206,9 +237,11 @@ src/trading/
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry
-  universe.py              # curated named stock baskets (blue20) + @name CLI expansion (ADR-0024)
-  metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure (periods_per_year)
-  sweep.py                 # parameter sweep / walk-forward over Engine.run (ADR-0016)
+  universe.py              # curated baskets (blue20) + @name expansion (ADR-0024) + broker verification (ADR-0028)
+  liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029)
+  metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure,
+                           #   entry count + trades-per-parameter significance (ADR-0029)
+  sweep.py                 # parameter sweep (ADR-0016) + true IS->OOS walk-forward (ADR-0026)
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)

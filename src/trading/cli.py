@@ -1,10 +1,27 @@
-"""Command-line entry point: ``trading backtest``, ``paper``, and ``gen-data``.
+"""Command-line entry point: ``backtest``, ``paper``, ``sweep``, ``dashboard``, and more.
 
 Wires a data source (yfinance or the offline synthetic generator), the simulated
 broker, the chosen strategy, and the engine, then prints a summary and writes the
 equity curve. ``backtest`` iterates a historical range; ``paper`` (V5) drives the
 *same* engine/broker/guardrails over a completed-bar feed on a clock (ADR-0014),
 logging each new bar's decision, fills, guardrail actions, and equity.
+
+Three honesty knobs sit on top of that, all opt-in and all off by default:
+
+- ``sweep --folds N`` runs a **true** in-sample -> out-of-sample walk-forward
+  (ADR-0026): each fold tunes the grid on IS data, then runs the single winner
+  **once** on untouched OOS data, and the summary leads with the OOS figures and
+  the IS->OOS degradation. Distinct from ``--windows``, which runs the whole grid
+  on every window and is therefore all in-sample.
+- ``backtest --min-adv`` screens the universe by average dollar volume measured
+  **before** the backtest starts (ADR-0029), so the liquidity decision cannot see
+  volume the strategy hasn't reached. Every dropped symbol is printed.
+- ``verify-universe`` asks the broker which symbols are actually tradable and
+  fractionable (ADR-0028), instead of trusting a curated basket.
+
+The trades-per-parameter sample-size check is wired automatically: every run
+reports its entry count, and a run with too few trades for its number of tunable
+parameters says so (ADR-0029).
 """
 
 from __future__ import annotations
@@ -33,13 +50,14 @@ from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
 from trading.engine import DEFAULT_PAPER_LOOKBACK, BacktestResult, BarOutcome, Engine, PaperSession
 from trading.frequency import DAILY, Frequency
 from trading.interfaces import Broker, DataAdapter
+from trading.liquidity import DEFAULT_FORMATION_DAYS, screen_by_adv
 from trading.metrics import compute as compute_metrics
 from trading.report import summarize, write_equity_csv, write_equity_png, write_result_json
 from trading.risk import Guardrails
-from trading.strategies import get_strategy
-from trading.sweep import SweepSummary, run_sweep
+from trading.strategies import free_parameter_count, get_strategy
+from trading.sweep import SweepSummary, WalkForwardSummary, run_sweep, run_walk_forward
 from trading.types import Portfolio
-from trading.universe import get_sector_map, get_universe
+from trading.universe import get_sector_map, get_universe, validate_universe
 
 app = typer.Typer(add_completion=False, help="Algorithmic trading test bench.")
 
@@ -73,6 +91,32 @@ def _parse_symbols(symbols: str) -> list[str]:
         typer.echo("error: --symbols is empty", err=True)
         raise typer.Exit(2)
     return tickers
+
+
+def _apply_liquidity_screen(
+    adapter: DataAdapter,
+    tickers: list[str],
+    start: datetime,
+    min_adv: float,
+    formation_days: int,
+) -> list[str]:
+    """Screen ``tickers`` by pre-backtest ADV, print the verdict, return the keepers.
+
+    The screen reads only bars from before ``start`` (ADR-0029), so it cannot leak
+    future volume into the universe decision. Every dropped symbol is printed with
+    its reason; a screen that removed everything is a hard error (exit 2) rather
+    than an empty run that looks like a strategy that never traded.
+    """
+    screen = screen_by_adv(adapter, tickers, start, min_adv=min_adv, formation_days=formation_days)
+    typer.echo(screen.describe() + "\n")
+    if not screen.kept:
+        typer.echo(
+            f"error: no symbol met the ${min_adv:,.0f} ADV floor — "
+            "lower --min-adv or widen --symbols",
+            err=True,
+        )
+        raise typer.Exit(2)
+    return screen.kept
 
 
 def _parse_frequency(interval: str) -> Frequency:
@@ -240,6 +284,19 @@ def backtest(
     benchmark: str = typer.Option(
         "", "--benchmark", help="Benchmark symbol for a buy-and-hold comparison, e.g. SPY."
     ),
+    min_adv: float | None = typer.Option(
+        None,
+        "--min-adv",
+        help=(
+            "Liquidity floor: drop symbols whose average dollar volume BEFORE --from "
+            "is under this (e.g. 20000000). Off by default."
+        ),
+    ),
+    adv_window: int = typer.Option(
+        DEFAULT_FORMATION_DAYS,
+        "--adv-window",
+        help="Calendar days of pre-backtest history the --min-adv screen measures over.",
+    ),
     plot: bool = typer.Option(
         False, "--plot/--no-plot", help="Also write an equity_curve.png next to the CSV."
     ),
@@ -273,6 +330,8 @@ def backtest(
         raise typer.Exit(2) from exc
 
     adapter = _make_adapter(source, cache_dir, seed, freq)
+    if min_adv is not None:
+        tickers = _apply_liquidity_screen(adapter, tickers, start, min_adv, adv_window)
     broker = SimulatedBroker(Portfolio(cash=cash))
     result = Engine(adapter, broker, Guardrails(risk)).run(strat, tickers, start, end)
 
@@ -286,14 +345,24 @@ def backtest(
             get_strategy("buy_and_hold"), [bench_symbol], start, end
         )
 
-    typer.echo(summarize(result, bench_result, periods_per_year=freq.periods_per_year))
+    # The strategy's tunable-argument count turns on the trades-per-parameter
+    # sample-size check and its warning (ADR-0029).
+    free_params = free_parameter_count(strat)
+    typer.echo(
+        summarize(
+            result,
+            bench_result,
+            periods_per_year=freq.periods_per_year,
+            free_parameters=free_params,
+        )
+    )
     write_equity_csv(result, out, bench_result)
     typer.echo(f"\nWrote equity curve to {out}")
 
     # The canonical machine-readable artifact the dashboard consumes, alongside
     # the CSV. Metrics are computed once here at the run's frequency (default
     # 252/yr for daily keeps the numbers identical).
-    metrics = compute_metrics(result, freq.periods_per_year)
+    metrics = compute_metrics(result, freq.periods_per_year, free_parameters=free_params)
     result_json = out.parent / "result.json"
     write_result_json(
         result,
@@ -531,11 +600,19 @@ def paper(
 
     # The canonical machine-readable artifact the dashboard consumes, alongside the
     # CSV. Metrics are computed at the run's frequency (default 252/yr for daily).
-    metrics = compute_metrics(result, freq.periods_per_year)
+    free_params = free_parameter_count(strat)
+    metrics = compute_metrics(result, freq.periods_per_year, free_parameters=free_params)
     result_json = out / "result.json"
     write_result_json(result, result_json, mode="paper", frequency=freq.label, metrics=metrics)
 
-    typer.echo("\n" + summarize(result, periods_per_year=freq.periods_per_year))
+    typer.echo(
+        "\n"
+        + summarize(
+            result,
+            periods_per_year=freq.periods_per_year,
+            free_parameters=free_params,
+        )
+    )
     typer.echo(f"\nProcessed {len(session.session_log)} completed bar(s).")
     typer.echo(
         f"Session log: {log_path}\nRunning state: {state_path}\n"
@@ -663,7 +740,26 @@ def sweep(
         "sharpe", "--rank-by", help="Ranking metric: sharpe | total_return."
     ),
     windows: int = typer.Option(
-        1, "--windows", help="Walk-forward: split [from, to] into N consecutive windows (1 = off)."
+        1,
+        "--windows",
+        help=(
+            "Plain per-window sweep: split [from, to] into N windows and run the whole "
+            "grid on each (1 = off). This is all in-sample — see --folds for real "
+            "out-of-sample validation."
+        ),
+    ),
+    folds: int = typer.Option(
+        0,
+        "--folds",
+        help=(
+            "TRUE walk-forward (ADR-0026): N folds, each tuning the grid in-sample then "
+            "running the single winner ONCE out-of-sample. 0 = off."
+        ),
+    ),
+    wf_mode: str = typer.Option(
+        "anchored",
+        "--wf-mode",
+        help="Walk-forward in-sample window: anchored (expanding) | rolling (sliding).",
     ),
     source: str = typer.Option(
         "yfinance", "--source", help="Data source: yfinance | synthetic | csv | alpaca."
@@ -744,7 +840,36 @@ def sweep(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
+    if folds > 0 and windows > 1:
+        typer.echo(
+            "error: --folds (true walk-forward) and --windows (plain per-window sweep) "
+            "are different validation schemes; pass only one",
+            err=True,
+        )
+        raise typer.Exit(2)
+    if wf_mode not in {"anchored", "rolling"}:
+        typer.echo(f"error: --wf-mode must be 'anchored' or 'rolling', got {wf_mode!r}", err=True)
+        raise typer.Exit(2)
+
     adapter = _make_adapter(source, cache_dir, seed, freq)
+
+    if folds > 0:
+        _run_walk_forward_command(
+            strategy=strategy,
+            grid=grid,
+            adapter=adapter,
+            tickers=tickers,
+            start=start,
+            end=end,
+            folds=folds,
+            mode=wf_mode,
+            rank_by=rank_by,
+            cash=cash,
+            risk=risk,
+            out=out,
+        )
+        return
+
     summary = run_sweep(
         strategy, grid, adapter, tickers, start, end, cash=cash, risk=risk, windows=windows
     )
@@ -766,11 +891,164 @@ def sweep(
         typer.echo(f"skipped {{{pretty}}}: {reason}")
 
 
+@app.command("verify-universe")
+def verify_universe(
+    symbols: str = typer.Option(
+        ..., "--symbols", help="Comma-separated tickers or @basket (e.g. @blue20)."
+    ),
+) -> None:
+    """Check a universe against the broker: tradable AND fractionable? (ADR-0028)
+
+    A curated basket (ADR-0024) is a judgement call; only the broker knows what it
+    will actually trade. This asks Alpaca per symbol and prints the usable set plus
+    every dropped name with its reason. Symbols whose lookup *failed* are reported
+    as unverified — unknown, not rejected — and still excluded, because a name you
+    could not confirm is one you cannot size a real order in.
+
+    Needs ``ALPACA_API_KEY`` / ``ALPACA_SECRET_KEY`` and the optional ``alpaca-py``
+    SDK; it targets the paper endpoint. Exits 1 when the universe is not clean, so
+    a script can gate on it.
+    """
+    tickers = _parse_symbols(symbols)
+    try:
+        from trading.data.alpaca_client import RealAlpacaClient
+
+        client = RealAlpacaClient()
+    except (ImportError, ValueError) as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+    result = validate_universe(tickers, client)
+    for line in result.report_lines():
+        typer.echo(line)
+    if not result.is_clean:
+        raise typer.Exit(1)
+
+
 def _known_strategy_names() -> list[str]:
     """Sorted registry names, for a friendly error before running the sweep."""
     from trading.strategies import STRATEGIES
 
     return sorted(STRATEGIES)
+
+
+def _write_walk_forward_csv(summary: WalkForwardSummary, path: Path) -> None:
+    """One row per fold: its spans, winning params, and IS vs OOS metrics.
+
+    The out-of-sample columns are prefixed ``oos_`` and the in-sample ones ``is_``
+    so a reader can never mistake a tuned number for a validated one.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(
+            [
+                "fold",
+                "is_start",
+                "is_end",
+                "oos_start",
+                "oos_end",
+                "params",
+                "is_sharpe",
+                "is_total_return",
+                "oos_sharpe",
+                "oos_total_return",
+                "oos_max_drawdown",
+            ]
+        )
+        for fold in summary.folds:
+            params = ", ".join(f"{k}={_format_param(v)}" for k, v in fold.params.items())
+            writer.writerow(
+                [
+                    fold.index,
+                    fold.is_start.date().isoformat(),
+                    fold.is_end.date().isoformat(),
+                    fold.oos_start.date().isoformat(),
+                    fold.oos_end.date().isoformat(),
+                    params,
+                    f"{fold.in_sample_metrics.sharpe:.4f}",
+                    f"{fold.in_sample_metrics.total_return:.6f}",
+                    f"{fold.out_of_sample_metrics.sharpe:.4f}",
+                    f"{fold.out_of_sample_metrics.total_return:.6f}",
+                    f"{fold.out_of_sample_metrics.max_drawdown:.6f}",
+                ]
+            )
+
+
+def _run_walk_forward_command(
+    *,
+    strategy: str,
+    grid: dict[str, list[object]],
+    adapter: DataAdapter,
+    tickers: list[str],
+    start: datetime,
+    end: datetime,
+    folds: int,
+    mode: str,
+    rank_by: str,
+    cash: float,
+    risk: RiskConfig,
+    out: Path,
+) -> None:
+    """Run and print a true in-sample -> out-of-sample walk-forward (ADR-0026).
+
+    Prints one line per fold (which parameters in-sample picked, and how they then
+    did out-of-sample) followed by the aggregate the whole exercise exists to
+    produce: mean OOS performance and the IS->OOS degradation. The out-of-sample
+    figures are the honest ones; the in-sample figures are shown only so the gap
+    between them is visible.
+    """
+    summary = run_walk_forward(
+        strategy,
+        grid,
+        adapter,
+        tickers,
+        start,
+        end,
+        folds=folds,
+        mode=mode,
+        rank_by=rank_by,
+        cash=cash,
+        risk=risk,
+    )
+
+    typer.echo(
+        f"Walk-forward: strategy={strategy} symbols={','.join(tickers)} "
+        f"folds={summary.fold_count} mode={mode} tuned on {rank_by}\n"
+    )
+    if not summary.folds:
+        typer.echo("No folds produced — nothing was validated.")
+    else:
+        for fold in summary.folds:
+            params = ", ".join(f"{k}={_format_param(v)}" for k, v in fold.params.items())
+            typer.echo(
+                f"fold {fold.index}  "
+                f"IS {fold.is_start.date()}..{fold.is_end.date()} -> "
+                f"OOS {fold.oos_start.date()}..{fold.oos_end.date()}  "
+                f"[{params or 'defaults'}]  "
+                f"IS sharpe {fold.in_sample_metrics.sharpe:+.2f} -> "
+                f"OOS sharpe {fold.out_of_sample_metrics.sharpe:+.2f}"
+            )
+        retention = summary.sharpe_retention
+        retention_text = "n/a" if retention is None else f"{retention * 100:.0f}%"
+        typer.echo(
+            f"\nOUT-OF-SAMPLE mean sharpe {summary.mean_out_of_sample_sharpe:+.2f} "
+            f"(in-sample {summary.mean_in_sample_sharpe:+.2f}; "
+            f"degradation {summary.sharpe_degradation:+.2f}, retained {retention_text})"
+        )
+        typer.echo(
+            f"{summary.folds_with_positive_out_of_sample_return}/{summary.fold_count} "
+            "fold(s) profitable out of sample — this is the number that counts; "
+            "the in-sample figures are tuned and always flatter."
+        )
+        _write_walk_forward_csv(summary, out)
+        typer.echo(f"\nWrote walk-forward results to {out}")
+
+    for combo, reason in summary.skipped:
+        pretty = ", ".join(f"{k}={_format_param(v)}" for k, v in combo.items())
+        typer.echo(f"skipped {{{pretty}}}: {reason}")
+    for warning in summary.warnings:
+        typer.echo(f"warning: {warning}", err=True)
 
 
 @app.command()
