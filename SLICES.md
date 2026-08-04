@@ -270,3 +270,27 @@ bar). Wrong → decisions use unfinished data.
   ADR-0015) and per-sector risk caps **done** (`--max-sector-exposure` /
   `--sector-map`, ADR-0019); a bring-your-own-data CSV source is **done**
   (`--source csv`).
+- Curated named universes **done** — `universe.py` (`Basket` + `BASKETS`), the
+  `blue20` basket, and `@name` expansion on `--symbols` / `--sector-map`
+  (ADR-0024). The list is a curation, NOT broker-verified: fractionability is
+  authoritative only via Alpaca's `get_asset`, which the client seam does not yet
+  expose. This seeds the three open slices below.
+
+### Open (sequenced next)
+
+1. **Universe / asset-metadata layer.** Add `get_asset(symbol) -> AssetInfo(tradable,
+   fractionable, ...)` to the `AlpacaClient` seam (Fake + Real), then a universe
+   builder that filters a candidate basket to `tradable & fractionable & liquid` and
+   validates it live at connect-time. `universe.py` (ADR-0024) is the seed candidate
+   set; this closes the honesty gap — the backtest universe mirrors what is actually
+   tradable, not an assumed list.
+2. **Cross-sectional rank-and-hold-top-K strategy.** Score every symbol from
+   `context.history`, hold the top K at equal weight, flat the rest. Long-only (no
+   shorting, ADR-0011); needs a rebalance cadence / hysteresis to control turnover.
+   Fits the existing `Strategy` seam with no engine change — `@blue20` is a natural
+   candidate universe.
+3. **Limit / market-on-open order support.** Honor the already-present `Order.type` /
+   `Order.limit_price` fields: `SimulatedBroker` fills a limit only when the next
+   bar's OHLC reaches it (else a DAY cancel); `AlpacaBroker` maps to a limit or
+   at-the-open request; a `--limit-band` execution knob attaches limits at
+   `close +/- band` to cap overnight-gap slippage.

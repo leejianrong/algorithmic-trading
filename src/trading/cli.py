@@ -39,6 +39,7 @@ from trading.risk import Guardrails
 from trading.strategies import get_strategy
 from trading.sweep import SweepSummary, run_sweep
 from trading.types import Portfolio
+from trading.universe import get_sector_map, get_universe
 
 app = typer.Typer(add_completion=False, help="Algorithmic trading test bench.")
 
@@ -59,6 +60,14 @@ def _parse_date(label: str, value: str) -> datetime:
 
 
 def _parse_symbols(symbols: str) -> list[str]:
+    # `@name` expands a curated basket (universe.py); a plain comma list is verbatim.
+    if symbols.startswith("@"):
+        name = symbols[1:].strip()
+        try:
+            return get_universe(name)
+        except KeyError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(2) from exc
     tickers = [s.strip().upper() for s in symbols.split(",") if s.strip()]
     if not tickers:
         typer.echo("error: --symbols is empty", err=True)
@@ -113,10 +122,20 @@ def _make_adapter(
 
 
 def _parse_sector_map(spec: str) -> dict[str, str] | None:
-    """Parse ``SYM:sector,SYM:sector`` into a symbol->sector map (None if empty)."""
+    """Parse ``SYM:sector,SYM:sector`` into a symbol->sector map (None if empty).
+
+    ``@name`` instead loads a curated basket's map (universe.py). An unknown basket
+    is re-raised as ValueError so the caller's existing ``except ValueError`` path
+    surfaces it as a clean CLI error (exit 2), matching the malformed-spec case.
+    """
     spec = spec.strip()
     if not spec:
         return None
+    if spec.startswith("@"):
+        try:
+            return get_sector_map(spec[1:].strip())
+        except KeyError as exc:
+            raise ValueError(str(exc)) from exc
     result: dict[str, str] = {}
     for pair in spec.split(","):
         symbol, sep, sector = pair.partition(":")
