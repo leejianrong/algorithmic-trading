@@ -2,8 +2,11 @@
 
 Pure functions over the observable outputs of a run — the equity series and the
 fill blotter — so they can be unit-tested on tiny hand-built fixtures without
-touching the engine. The Sharpe basis is fixed by Q17: simple daily returns, a
-zero risk-free rate, annualized with √252 (252 trading days per year).
+touching the engine. The Sharpe basis is fixed by Q17: simple per-bar returns, a
+zero risk-free rate, annualized with √``periods_per_year``. That factor defaults
+to ``252.0`` (252 trading days), so every daily caller is unchanged; an intraday
+run passes its :attr:`~trading.frequency.Frequency.periods_per_year` so annualized
+figures scale to the bar cadence (ADR-0022).
 
 Nothing here reads a future bar or reaches into engine internals; callers pass a
 ``Sequence[EquityPoint]`` (or a whole :class:`BacktestResult` to :func:`compute`)
@@ -49,7 +52,7 @@ def total_return(curve: Sequence[EquityPoint]) -> float:
     return curve[-1].equity / curve[0].equity - 1.0
 
 
-def annualized_return(curve: Sequence[EquityPoint], periods_per_year: int = 252) -> float:
+def annualized_return(curve: Sequence[EquityPoint], periods_per_year: float = 252.0) -> float:
     """Geometric annualized return.
 
     ``(1 + total) ** (periods_per_year / n) - 1`` where ``n`` is the number of
@@ -64,7 +67,7 @@ def annualized_return(curve: Sequence[EquityPoint], periods_per_year: int = 252)
 
 def sharpe(
     curve: Sequence[EquityPoint],
-    periods_per_year: int = 252,
+    periods_per_year: float = 252.0,
     rf: float = 0.0,
 ) -> float:
     """Annualized Sharpe ratio of the daily returns (Q17).
@@ -87,7 +90,7 @@ def sharpe(
 
 def sortino(
     curve: Sequence[EquityPoint],
-    periods_per_year: int = 252,
+    periods_per_year: float = 252.0,
     rf: float = 0.0,
 ) -> float:
     """Annualized Sortino ratio: mean excess return over *downside* deviation.
@@ -111,7 +114,7 @@ def sortino(
     return mean / downside_dev * sqrt(periods_per_year)
 
 
-def calmar(curve: Sequence[EquityPoint], periods_per_year: int = 252) -> float:
+def calmar(curve: Sequence[EquityPoint], periods_per_year: float = 252.0) -> float:
     """Calmar ratio: annualized return divided by max drawdown.
 
     A reward-per-unit-of-worst-pain figure. Returns 0.0 when the max drawdown is
@@ -126,7 +129,7 @@ def calmar(curve: Sequence[EquityPoint], periods_per_year: int = 252) -> float:
 def turnover(
     fills: Sequence[tuple[object, Fill]],
     curve: Sequence[EquityPoint],
-    periods_per_year: int = 252,
+    periods_per_year: float = 252.0,
 ) -> float:
     """Annualized portfolio turnover: traded notional over average equity.
 
@@ -238,7 +241,7 @@ class PerformanceMetrics:
     peak_exposure: float
 
 
-def compute(result: BacktestResult, periods_per_year: int = 252) -> PerformanceMetrics:
+def compute(result: BacktestResult, periods_per_year: float = 252.0) -> PerformanceMetrics:
     """Assemble :class:`PerformanceMetrics` from a run's curve and fills."""
     curve = result.equity_curve
     exposures = [point.exposure for point in curve]

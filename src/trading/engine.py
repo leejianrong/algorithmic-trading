@@ -27,6 +27,7 @@ from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
 from trading.config import RiskConfig
+from trading.frequency import Frequency
 from trading.interfaces import Broker, DataAdapter, RiskGuardrails, Strategy
 from trading.risk import Guardrails
 from trading.sizing import size
@@ -333,7 +334,8 @@ class PaperSession:
         clock: Clock,
         *,
         lookback: int = DEFAULT_PAPER_LOOKBACK,
-        poll_interval: timedelta = timedelta(days=1),
+        poll_interval: timedelta | None = None,
+        frequency: Frequency | None = None,
     ) -> None:
         self._engine = engine
         self._strategy = strategy
@@ -341,6 +343,11 @@ class PaperSession:
         self._feed = feed
         self._clock = clock
         self._lookback = lookback
+        # Cadence: an explicit ``poll_interval`` wins; otherwise the frequency's
+        # bar length; otherwise the daily default — byte-compatible with V5, where
+        # the daily default was ``timedelta(days=1)``.
+        if poll_interval is None:
+            poll_interval = frequency.delta if frequency is not None else timedelta(days=1)
         self._poll_interval = poll_interval
         self._state = _RunState(starting_cash=engine._broker.portfolio.cash)
         self._seen: set[datetime] = set()
@@ -352,14 +359,22 @@ class PaperSession:
         return self._state
 
     def _next_due(self) -> datetime:
-        """The next poll instant: one ``poll_interval`` past the current UTC day.
+        """The next poll instant: the first ``poll_interval`` boundary after now.
 
-        Anchored to the start of the day so a daily cadence wakes just after each
-        session rolls over — the moment the previous day's bar becomes complete.
+        Boundaries are anchored to the start of the current UTC day and stepped by
+        ``poll_interval``; the result is the first one *strictly after* ``now`` —
+        the moment the bar now forming becomes complete. For the daily default
+        (``poll_interval == timedelta(days=1)``) this is the start of the next day,
+        exactly as V5 computed it. For a sub-daily interval it is the next
+        intra-session boundary.
         """
         now = self._clock.now().astimezone(UTC)
-        day_start = datetime(now.year, now.month, now.day, tzinfo=UTC)
-        return day_start + self._poll_interval
+        anchor = datetime(now.year, now.month, now.day, tzinfo=UTC)
+        interval = self._poll_interval
+        if interval <= timedelta(0):  # defensive: never loop on a non-positive step
+            return now
+        steps = (now - anchor) // interval + 1
+        return anchor + steps * interval
 
     def run(
         self,

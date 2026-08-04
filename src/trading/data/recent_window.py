@@ -1,7 +1,7 @@
-"""Recent-window feed for paper mode: only *completed* daily bars. Slice V5.
+"""Recent-window feed for paper mode: only *completed* bars. Slice V5 / ADR-0022.
 
-The core paper-mode risk is acting on a still-forming bar — the latest daily bar
-for today is incomplete until the session closes, and trading on it means
+The core paper-mode risk is acting on a still-forming bar — the latest bar for the
+current period is incomplete until that period closes, and trading on it means
 deciding from unfinished data. This feed defends against that: it fetches recent
 bars from the :class:`~trading.interfaces.DataAdapter`, drops any that are not
 yet complete per the clock, and returns the completed cross-section in ascending
@@ -10,14 +10,16 @@ timestamp order (reusing the engine's :func:`~trading.engine.build_feed` merge).
 Completeness rule (default): a daily bar dated ``D`` is complete once the clock
 has moved into a later session than ``D`` — i.e. once ``now``'s UTC date is past
 ``D``. A bar whose date equals the clock's current, still-forming day is
-excluded until the clock crosses into the next day. The policy is injectable so a
-real market calendar can replace the plain date comparison later.
+excluded until the clock crosses into the next day. For sub-daily bars, use
+:func:`interval_is_complete`: a bar with START ``ts`` covers ``[ts, ts + interval)``
+and is complete once ``now >= ts + interval`` (ADR-0022). The policy is injectable
+so a real market calendar can replace either comparison later.
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from trading.clock import Clock
 from trading.engine import Feed, build_feed
@@ -40,6 +42,23 @@ def default_is_complete(bar: Bar, now: datetime) -> bool:
     complete.
     """
     return now.astimezone(UTC).date() > bar.ts.astimezone(UTC).date()
+
+
+def interval_is_complete(interval: timedelta) -> CompletenessPolicy:
+    """A completeness policy for bars of a fixed ``interval`` (ADR-0022).
+
+    A bar with START ``ts`` covers ``[ts, ts + interval)`` and is complete exactly
+    when ``now >= ts + interval`` — the moment the whole window has elapsed. This
+    is the sub-daily counterpart to :func:`default_is_complete`; the CLI passes
+    ``interval_is_complete(freq.delta)`` to :class:`RecentWindowFeed` for intraday
+    paper trading. Comparisons are done in UTC so a naive-vs-aware mix can't slip
+    through (a ``Bar.ts`` is always tz-aware).
+    """
+
+    def _policy(bar: Bar, now: datetime) -> bool:
+        return now.astimezone(UTC) >= bar.ts.astimezone(UTC) + interval
+
+    return _policy
 
 
 class RecentWindowFeed:

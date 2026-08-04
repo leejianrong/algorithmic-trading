@@ -6,16 +6,20 @@ clock marks its session complete.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 
 from trading.clock import FakeClock
 from trading.data.fake import FakeAdapter
-from trading.data.recent_window import RecentWindowFeed, default_is_complete
+from trading.data.recent_window import (
+    RecentWindowFeed,
+    default_is_complete,
+    interval_is_complete,
+)
 from trading.types import Bar
 
 
-def _ts(day: int, hour: int = 0) -> datetime:
-    return datetime(2024, 1, day, hour, tzinfo=UTC)
+def _ts(day: int, hour: int = 0, minute: int = 0) -> datetime:
+    return datetime(2024, 1, day, hour, minute, tzinfo=UTC)
 
 
 def _bar(symbol: str, day: int, price: float = 100.0) -> Bar:
@@ -115,3 +119,42 @@ class TestDefaultPolicy:
         assert not default_is_complete(bar, _ts(5))  # same day, forming
         assert not default_is_complete(bar, _ts(5, hour=23))  # still same day
         assert default_is_complete(bar, _ts(6))  # next day, complete
+
+
+def _intraday_bar(symbol: str, ts: datetime, price: float = 100.0) -> Bar:
+    return Bar(symbol, ts, price, price, price, price, volume=1_000)
+
+
+class TestIntervalPolicy:
+    """ADR-0022: a bar with START ts covers [ts, ts+interval), complete at ts+interval."""
+
+    def test_forming_bar_excluded_until_the_interval_elapses(self) -> None:
+        interval = timedelta(hours=1)
+        is_complete = interval_is_complete(interval)
+        bar = _intraday_bar("AAA", _ts(2, hour=14, minute=30))  # covers 14:30-15:30
+
+        assert not is_complete(bar, _ts(2, hour=14, minute=30))  # just opened
+        assert not is_complete(bar, _ts(2, hour=15, minute=29))  # still forming
+        assert is_complete(bar, _ts(2, hour=15, minute=30))  # complete exactly at close
+        assert is_complete(bar, _ts(2, hour=16))  # and after
+
+    def test_feed_reveals_the_bar_exactly_at_ts_plus_interval(self) -> None:
+        interval = timedelta(minutes=30)
+        # Two 30-minute bars on 2024-01-02: 14:00 and 14:30.
+        bars = [
+            _intraday_bar("AAA", _ts(2, hour=14, minute=0)),
+            _intraday_bar("AAA", _ts(2, hour=14, minute=30)),
+        ]
+        adapter = FakeAdapter(bars)
+        # Clock sits at 14:45: the 14:00 bar closed (14:30 ≤ 14:45), the 14:30 bar
+        # is still forming (closes 15:00).
+        clock = FakeClock(_ts(2, hour=14, minute=45))
+        feed = RecentWindowFeed(adapter, clock, interval_is_complete(interval))
+
+        present = _timestamps(feed.poll(["AAA"], lookback=10))
+        assert present == [_ts(2, hour=14, minute=0)]
+
+        # Advance to 15:00 — the second bar's close — and it becomes visible.
+        clock.advance(_ts(2, hour=15, minute=0))
+        present = _timestamps(feed.poll(["AAA"], lookback=10))
+        assert present == [_ts(2, hour=14, minute=0), _ts(2, hour=14, minute=30)]
