@@ -278,13 +278,40 @@ bar). Wrong → decisions use unfinished data.
 
 ### Open (sequenced next)
 
-1. **Universe / asset-metadata layer.** Add `get_asset(symbol) -> AssetInfo(tradable,
-   fractionable, ...)` to the `AlpacaClient` seam (Fake + Real), then a universe
-   builder that filters a candidate basket to `tradable & fractionable & liquid` and
-   validates it live at connect-time. `universe.py` (ADR-0024) is the seed candidate
-   set; this closes the honesty gap — the backtest universe mirrors what is actually
-   tradable, not an assumed list.
-2. **Cross-sectional rank-and-hold-top-K strategy.** **Done** —
+1. **Universe / asset-metadata layer.** **Done** — `get_asset(symbol) -> AssetInfo`
+   is on the `AlpacaClient` seam (protocol + Fake + Real, ADR-0028), and
+   `universe.validate_universe` sorts a candidate basket into `usable`
+   (tradable **and** fractionable), `unusable` (the broker said no), and `unverified`
+   (the lookup failed — unknown, not rejected), with nothing filtered silently. CLI:
+   `trading verify-universe --symbols @blue20`. The **liquidity** half landed
+   separately as `--min-adv` (ADR-0029), screened in a formation window that ends
+   before the backtest starts so the universe decision cannot see future volume.
+   `universe.py` keeps zero runtime dependency on `trading.data` (structural typing,
+   enforced by a subprocess test). Verification is opt-in — it needs credentials the
+   offline bench does without — so it must be *run* before live use, not assumed.
+
+   Alongside it, **survivorship bias is now recorded** (ADR-0027) as an accepted,
+   documented, *unfixed* limitation: `blue20` is today's winners and yfinance has no
+   delisted names, so curated-basket backtests are an upper bound. A real fix needs a
+   point-in-time constituent database through `--source csv` — a future slice.
+
+2. **True in-sample → out-of-sample walk-forward.** **Done** —
+   `sweep.run_walk_forward` (ADR-0026) and `trading sweep --folds N [--wf-mode
+   anchored|rolling]`. Each fold tunes the whole grid in-sample, then runs the single
+   winner **exactly once** out-of-sample; the summary leads with mean OOS Sharpe, the
+   IS→OOS degradation, and how many folds were profitable OOS. This closes the gap
+   ADR-0016 left open (`--windows` runs the whole grid on every window and is
+   therefore all in-sample; it is unchanged, and passing both is an error).
+
+   Caveat worth knowing: `SyntheticAdapter` regenerates from the requested start day,
+   so equal-length spans replay near-identical paths and synthetic walk-forward shows
+   ~0 degradation **by construction**. That is an adapter property, not evidence of
+   robustness — judge degradation on real data only.
+
+   Still open here: folds do not compound (each restarts at `cash`, so the result is
+   a distribution of separate experiments, not one stitched OOS equity curve), and
+   parameter-stability / heatmap output is not built.
+3. **Cross-sectional rank-and-hold-top-K strategy.** **Done** —
    `cross_sectional` (`strategies/cross_sectional.py`, ADR-0025). Each rebalance it
    scores every symbol by trailing total return over `lookback` (default 120) from
    `context.history` (past+present only), ranks descending, holds the top `top_k`
@@ -295,7 +322,7 @@ bar). Wrong → decisions use unfinished data.
    the existing `Strategy` seam with no engine change; `@blue20` is the candidate
    universe. Fast tests green (top-K pick, cadence, drop-out exit, no look-ahead,
    plus an offline end-to-end run on `@blue20 --source synthetic`).
-3. **Limit / market-on-open order support.** Honor the already-present `Order.type` /
+4. **Limit / market-on-open order support.** Honor the already-present `Order.type` /
    `Order.limit_price` fields: `SimulatedBroker` fills a limit only when the next
    bar's OHLC reaches it (else a DAY cancel); `AlpacaBroker` maps to a limit or
    at-the-open request; a `--limit-band` execution knob attaches limits at
