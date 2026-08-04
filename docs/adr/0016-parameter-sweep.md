@@ -50,7 +50,10 @@ combination independently on each window (its own fresh broker/guardrails),
 tagging each result with its window index and bounds. This deliberately does
 *not* recombine an in-sample winner into an out-of-sample test — that anchored /
 rolling in-sample -> out-of-sample selection is a later slice. `--windows 1`
-(default) is a plain grid sweep.
+(default) is a plain grid sweep. **Amended by ADR-0026**, which is that later
+slice: `sweep.run_walk_forward` does the IS -> OOS recombination, while the
+per-window grid sweep described here is unchanged and remains the in-sample
+exploration tool.
 
 **CLI surface.** `trading sweep --strategy … --param name=v1,v2,… --symbols … `
 `--from … --to …` mirrors `backtest`'s option style (reusing `_parse_date`,
