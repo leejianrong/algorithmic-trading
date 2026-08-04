@@ -114,3 +114,35 @@ second caveat for survivorship bias (ADR-0027), which this ADR does **not** fix.
 - A future universe *builder* (filter a candidate basket to
   `tradable & fractionable & liquid`) can be written on top of
   `validate_universe` without changing the seam again.
+
+## Amendment (2026-08-04): first real run — the seam works, unchanged
+
+`RealAlpacaClient.get_asset` was written blind and this ADR left it
+"inspection-only (ADR-0018), verified by types rather than by the fast layer".
+It has now been executed against a live Alpaca paper account. Both of its
+guessed-at details held:
+
+- **The 404 → `LookupError` mapping fires.** Two genuinely nonexistent tickers
+  (`ZZZZNOTREAL`, `NOTATICKER9`) each produced a clean `LookupError`. The
+  mechanism is as assumed: alpaca-py raises `APIError` wrapping a
+  `requests.HTTPError`, and `APIError.status_code` reads `404` off the wrapped
+  response, so `getattr(exc, "status_code", None) == 404` matches. This matters
+  because the whole `unverified` vs `unusable` distinction depends on it — a miss
+  would surface an unknown ticker as an opaque `APIError` instead. Now pinned by an
+  integration test that asserts the raw SDK call really carries `status_code ==
+  404`, not merely that *something* raised.
+- **The `AssetExchange.` prefix strip is required.** `str(AssetExchange.NASDAQ)`
+  really is `"AssetExchange.NASDAQ"` (these are `(str, Enum)` members, not
+  `StrEnum`), so `exchange.split(".")[-1]` is doing real work; live `AAPL` returns
+  `exchange="NASDAQ"`.
+
+One finding worth recording against the decision text: this ADR says missing
+`tradable` / `fractionable` "default to `False`: absent permission is not
+permission". In alpaca-py 0.43.5 both fields are **required** on the `Asset` model,
+so that default never fires in practice. It stays as a version-tolerance guard, but
+it is belt-and-braces, not the normal path — and `_require_model` now rejects the
+SDK's raw-dict return arm outright, because reading these flags off a dict with
+`getattr` would silently default *every* asset to untradable (ADR-0033).
+
+The verification itself ran clean on both curated baskets — see the ADR-0024
+amendment for the result and for why one clean run is a snapshot, not a fact.

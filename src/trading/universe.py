@@ -10,16 +10,23 @@ Two baskets ship today: ``blue20`` (20 of today's mega-cap US single stocks) and
 long-horizon runs). The map values are *bucket labels*, not necessarily GICS
 sectors — see caveat 3.
 
-Honesty caveat 1 — tradability is the broker's fact, and now checkable
-----------------------------------------------------------------------
-The ``blue20`` names below are curated as high-confidence fractionable US
-large-caps. That curation is a judgement call, **not an authoritative fact**:
-whether a symbol is actually tradable and fractionable is authoritative only via
-Alpaca's per-asset ``tradable`` / ``fractionable`` flags. Since ADR-0028 the
-:class:`~trading.data.alpaca_client.AlpacaClient` seam exposes ``get_asset``, so
-that check is available — but it is *opt-in and never automatic*, because it
-needs credentials and a network the offline bench deliberately does without.
-Verify before any live use::
+Honesty caveat 1 — tradability is the broker's fact, checked once on 2026-08-04
+------------------------------------------------------------------------------
+The names below are curated as high-confidence fractionable US large-caps and
+ETFs. That curation was a judgement call; on **2026-08-04** it was finally checked
+against a real Alpaca paper account, and both baskets came back **completely
+clean**: ``blue20`` 20/20 and ``core10`` 10/10 usable — every symbol reported
+``tradable`` *and* ``fractionable``, with nothing unusable and nothing unverified.
+
+Read that for exactly what it is: **a snapshot against one account at one
+moment**, not a permanent property of these lists. Tradability and fractionability
+are live broker facts that move — a halt, a delisting, a corporate action, a
+change in Alpaca's fractional-share coverage, or a different account tier can all
+flip a flag tomorrow. Deliberately *not* cached (ADR-0028), because a stale cache
+would restore the false confidence the check exists to remove. So the check is
+still what stands between you and a divergence, and it is *opt-in and never
+automatic*, because it needs credentials and a network the offline bench
+deliberately does without. Re-run it before any live use::
 
     from trading.data.alpaca_client import RealAlpacaClient
     from trading.universe import get_universe, validate_universe
@@ -27,9 +34,10 @@ Verify before any live use::
     result = validate_universe(get_universe("blue20"), RealAlpacaClient())
     print("\\n".join(result.report_lines()))  # usable set + every dropped name
 
-Until you have run that against your own account, treat the list as a starting
-candidate set: a backtest universe should mirror the broker's tradable +
-fractionable set, or paper/live cannot hold what the backtest assumed.
+or just ``trading verify-universe --symbols @blue20``. Until you have run it
+against *your own* account, treat the list as a starting candidate set: a backtest
+universe should mirror the broker's tradable + fractionable set, or paper/live
+cannot hold what the backtest assumed.
 
 Honesty caveat 2 — survivorship bias (ADR-0027)
 -----------------------------------------------
