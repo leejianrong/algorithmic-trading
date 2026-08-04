@@ -7,6 +7,7 @@ backtests don't flatter themselves (Q14).
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 
@@ -34,8 +35,10 @@ class RiskConfig:
     an optional single-bar circuit breaker, off by default. ``target_volatility``
     is an optional annualized volatility target (e.g. 0.10 for 10%) that scales the
     effective gross-exposure cap up or down toward that target (ADR-0015); off by
-    default, so behavior is unchanged unless it is set. Every limit is overridable
-    per run; :meth:`unlimited` returns the permissive opt-out.
+    default, so behavior is unchanged unless it is set. ``max_sector_exposure`` with
+    a ``sector_map`` is an optional per-sector gross cap (ADR-0019) that limits how
+    much of equity may sit in any one sector; off by default. Every limit is
+    overridable per run; :meth:`unlimited` returns the permissive opt-out.
     """
 
     max_position_pct: float = 0.25
@@ -43,6 +46,8 @@ class RiskConfig:
     max_drawdown_pct: float = 0.20
     max_daily_loss_pct: float | None = None
     target_volatility: float | None = None
+    sector_map: Mapping[str, str] | None = None
+    max_sector_exposure: float | None = None
 
     def __post_init__(self) -> None:
         if self.max_position_pct <= 0:
@@ -55,6 +60,8 @@ class RiskConfig:
             raise ValueError("max_daily_loss_pct must be None or in (0, 1]")
         if self.target_volatility is not None and self.target_volatility <= 0:
             raise ValueError("target_volatility must be None or positive")
+        if self.max_sector_exposure is not None and not 0 < self.max_sector_exposure <= 1.0:
+            raise ValueError("max_sector_exposure must be None or in (0, 1]")
 
     @classmethod
     def unlimited(cls) -> RiskConfig:

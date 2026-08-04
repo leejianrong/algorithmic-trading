@@ -72,6 +72,10 @@ class Guardrails:
         # cap would collectively breach it. Reset once per bar by halted().
         self._committed_gross = 0.0
         self._committed_qty: dict[str, float] = {}
+        # Same-bar committed notional per sector, for the per-sector cap (ADR-0019).
+        # Parallel to _committed_gross but keyed by sector so sibling orders in the
+        # same sector see the room a prior one took. Reset per bar by halted().
+        self._committed_sector: dict[str, float] = {}
         # Volatility-target state (ADR-0015): a rolling window of portfolio returns
         # and the resulting multiplier on the gross cap. The scale stays 1.0 (a
         # no-op) until a target is configured and there are enough returns to
@@ -113,6 +117,7 @@ class Guardrails:
         # Begin a new bar: forget last bar's committed exposure.
         self._committed_gross = 0.0
         self._committed_qty = {}
+        self._committed_sector = {}
 
         equity = portfolio.equity(prices)
         peak = equity if self._peak is None else max(self._peak, equity)
@@ -199,18 +204,33 @@ class Guardrails:
         # whenever targeting is off, so this term is unchanged in that case.
         effective_gross = self._config.max_gross_exposure * self._vol_scale
         allowed_gross = (effective_gross * equity - current_gross - self._committed_gross) / price
-        allowed = min(order.qty, allowed_position, allowed_gross)
+
+        # Per-sector gross cap (ADR-0019): scoped to the order symbol's sector, this
+        # is the gross clamp restricted to same-sector holdings. Off unless both a
+        # sector map and a cap are configured, and unconstrained (room = ∞) for a
+        # symbol absent from the map — different sectors never cross-limit.
+        sector, committed_sector = self._sector_of(order.symbol)
+        allowed_sector = float("inf")
+        if sector is not None and self._config.max_sector_exposure is not None:
+            current_sector = sum(
+                abs(p.market_value(prices[s]))
+                for s, p in portfolio.positions.items()
+                if abs(p.qty) > SHARE_EPS and s in prices and self._sector_of(s)[0] == sector
+            )
+            allowed_sector = (
+                self._config.max_sector_exposure * equity - current_sector - committed_sector
+            ) / price
+
+        allowed = min(order.qty, allowed_position, allowed_gross, allowed_sector)
+        binding = self._binding(allowed_position, allowed_gross, allowed_sector, sector)
 
         if allowed <= SHARE_EPS:
-            self.last_reason = f"rejected: {self._binding(allowed_position, allowed_gross)}"
+            self.last_reason = f"rejected: {binding}"
             return None
 
         if allowed < order.qty - SHARE_EPS:
             accepted_qty = round(allowed, SHARE_PRECISION)
-            self.last_reason = (
-                f"clamped {order.qty:.6f}→{accepted_qty:.6f}: "
-                f"{self._binding(allowed_position, allowed_gross)}"
-            )
+            self.last_reason = f"clamped {order.qty:.6f}→{accepted_qty:.6f}: {binding}"
             result = replace(order, qty=accepted_qty)
         else:
             accepted_qty = order.qty
@@ -219,7 +239,23 @@ class Guardrails:
         # Commit the approved notional so later same-bar orders see less room.
         self._committed_gross += accepted_qty * price
         self._committed_qty[order.symbol] = committed_qty + accepted_qty
+        if sector is not None:
+            self._committed_sector[sector] = committed_sector + accepted_qty * price
         return result
+
+    def _sector_of(self, symbol: str) -> tuple[str | None, float]:
+        """The symbol's sector (or ``None`` if unmapped/off) and its committed tally.
+
+        Returns ``(None, 0.0)`` when no sector map is configured or the symbol is
+        absent from it — such a symbol is unconstrained by the per-sector cap.
+        """
+        sector_map = self._config.sector_map
+        if sector_map is None:
+            return None, 0.0
+        sector = sector_map.get(symbol)
+        if sector is None:
+            return None, 0.0
+        return sector, self._committed_sector.get(sector, 0.0)
 
     def _compute_vol_scale(self) -> float:
         """The gross-cap multiplier from realized vs. target volatility (ADR-0015).
@@ -241,8 +277,27 @@ class Guardrails:
         scale = target / max(realized_vol, _VOL_FLOOR)
         return min(scale, _MAX_VOL_SCALE)
 
-    def _binding(self, allowed_position: float, allowed_gross: float) -> str:
-        """Name the cap that bound (the one leaving the least room)."""
+    def _binding(
+        self,
+        allowed_position: float,
+        allowed_gross: float,
+        allowed_sector: float = float("inf"),
+        sector: str | None = None,
+    ) -> str:
+        """Name the cap that bound (the one leaving the least room).
+
+        The per-sector cap (ADR-0019) is reported when it is the tightest; it is
+        ``∞`` (never binding) whenever the feature is off, so the position/gross
+        wording is byte-identical in that case.
+        """
+        sector_is_tightest = (
+            sector is not None
+            and allowed_sector <= allowed_position
+            and allowed_sector <= allowed_gross
+        )
+        if sector_is_tightest:
+            pct = self._config.max_sector_exposure or 0.0
+            return f"sector cap {pct:.0%} ({sector})"
         if allowed_position <= allowed_gross:
             return f"position cap {self._config.max_position_pct:.0%}"
         return f"gross exposure cap {self._config.max_gross_exposure:.0%}"

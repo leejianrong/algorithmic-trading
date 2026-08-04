@@ -39,9 +39,11 @@ def _feed(guard: Guardrails, equities: Sequence[float]) -> None:
 
 class TestHighVolScalesDown:
     def test_effective_gross_cap_is_scaled_down_versus_off(self) -> None:
-        base = dict(max_gross_exposure=1.0, max_position_pct=1.0, max_drawdown_pct=1.0)
-        on = Guardrails(RiskConfig(target_volatility=0.10, **base))
-        off = Guardrails(RiskConfig(**base))
+        base: dict[str, float] = dict(
+            max_gross_exposure=1.0, max_position_pct=1.0, max_drawdown_pct=1.0
+        )
+        on = Guardrails(RiskConfig(target_volatility=0.10, **base))  # type: ignore[arg-type]
+        off = Guardrails(RiskConfig(**base))  # type: ignore[arg-type]
         _feed(on, _VOLATILE)
         _feed(off, _VOLATILE)
 
