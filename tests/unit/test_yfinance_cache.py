@@ -72,3 +72,14 @@ def test_unadjusted_request_is_rejected(tmp_path: Path) -> None:
     start, end = _range()
     with pytest.raises(ValueError, match="adjusted"):
         adapter.get_bars("AAA", start, end, adjusted=False)
+
+
+def test_unadjusted_request_steers_to_alpaca_or_synthetic(tmp_path: Path) -> None:
+    # ADR-0021: yfinance is a backtest-only (adjusted) source; the raw rejection
+    # must point the user at a raw live source and an offline demo source.
+    adapter = YFinanceAdapter(tmp_path, _StubFetcher())
+    start, end = _range()
+    with pytest.raises(ValueError, match="--source alpaca"):
+        adapter.get_bars("AAA", start, end, adjusted=False)
+    with pytest.raises(ValueError, match="--source synthetic"):
+        adapter.get_bars("AAA", start, end, adjusted=False)

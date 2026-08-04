@@ -2,8 +2,14 @@
 
 A thin adapter that turns the :class:`~trading.data.alpaca_client.AlpacaClient`
 seam (ADR-0017) into a :class:`~trading.interfaces.DataAdapter`: ``get_bars``
-simply delegates to :meth:`AlpacaClient.get_daily_bars`. The ``adjusted`` policy
-is fixed at construction and defaults to adjusted prices (ADR-0008).
+delegates to :meth:`AlpacaClient.get_daily_bars`. The ``adjusted`` notion is a
+**per-mode policy carried by the feed**, not the adapter (ADR-0021): the backtest
+feed asks for adjusted total-return prices (ADR-0008), while the paper/live feed
+asks for RAW actual quotes so the strategy decides and marks in the same dollars
+the :class:`~trading.brokers.alpaca.AlpacaBroker` reconciles from the real
+account. So the per-call ``adjusted`` keyword controls each fetch; the constructor
+``adjusted`` param only supplies the default used when a caller omits the keyword.
+The seam already serves raw via ``Adjustment.RAW``.
 
 Following the injectable-dependency pattern (dev-playbook seam), the client is
 constructor-injected -- the fast test layer passes a
@@ -39,16 +45,19 @@ class AlpacaAdapter:
         start: datetime,
         end: datetime,
         *,
-        adjusted: bool = True,
+        adjusted: bool | None = None,
     ) -> list[Bar]:
         """Return ``symbol``'s daily bars in ``[start, end]``, ascending by time.
 
-        Delegates to the seam with the adapter's fixed ``adjusted`` policy; the
-        per-call ``adjusted`` keyword exists only for :class:`DataAdapter`
-        signature parity and is ignored. The seam already returns ascending,
-        range-filtered bars; we re-filter and sort here defensively (both cheap).
+        The per-call ``adjusted`` keyword controls the fetch (ADR-0021): pass
+        ``True`` for split/dividend-adjusted total-return prices (the backtest
+        feed) or ``False`` for RAW actual quotes (the paper/live feed). When it is
+        omitted the constructor default applies. The seam already returns
+        ascending, range-filtered bars; we re-filter and sort here defensively
+        (both cheap).
         """
-        bars = self._client.get_daily_bars(symbol, start, end, adjusted=self._adjusted)
+        effective = self._adjusted if adjusted is None else adjusted
+        bars = self._client.get_daily_bars(symbol, start, end, adjusted=effective)
         filtered = [b for b in bars if start <= b.ts <= end]
         filtered.sort(key=lambda b: b.ts)
         return filtered

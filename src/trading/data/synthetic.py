@@ -3,8 +3,10 @@
 Generates geometric-Brownian-motion daily bars so the engine, strategies, and CLI
 can be exercised end to end without a network or a real provider. Given the same
 seed, symbol, and date range it produces byte-identical bars, so synthetic
-backtests are reproducible (a domain requirement). Prices are treated as already
-adjusted (ADR-0008); there are no corporate actions to model.
+backtests are reproducible (a domain requirement). There are no corporate actions
+to model, so raw == adjusted (ADR-0021): the per-call ``adjusted`` flag does not
+change the numbers, and the same series drives both the adjusted backtest feed
+(ADR-0008) and the raw paper feed.
 """
 
 from __future__ import annotations
@@ -70,6 +72,13 @@ class SyntheticAdapter:
         *,
         adjusted: bool = True,
     ) -> list[Bar]:
+        """Return the deterministic GBM series for ``symbol`` in ``[start, end]``.
+
+        Synthetic GBM has no corporate actions, so raw == adjusted: ``adjusted`` is
+        accepted for :class:`DataAdapter` parity but does not change the numbers,
+        which lets the offline paper feed (raw, ADR-0021) and the backtest feed
+        (adjusted, ADR-0008) drive the identical series.
+        """
         p = self._params
         rng = random.Random(_symbol_seed(symbol, self._seed))
         mu_daily = p.annual_drift / _TRADING_DAYS_PER_YEAR

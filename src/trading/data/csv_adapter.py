@@ -57,8 +57,10 @@ class CsvAdapter:
         """
         if not adjusted:
             raise ValueError(
-                "CsvAdapter serves already-adjusted prices only (ADR-0008); "
-                "pass adjusted data rather than requesting adjusted=False"
+                "CsvAdapter serves already-adjusted prices only (ADR-0008); it is a "
+                "backtest source and cannot supply raw quotes. For RAW live paper "
+                "quotes use --source alpaca; for an offline demo use --source "
+                "synthetic (raw == adjusted there)."
             )
 
         path = self._data_dir / f"{symbol.upper()}.csv"
