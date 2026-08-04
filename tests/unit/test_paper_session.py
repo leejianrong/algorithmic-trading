@@ -393,3 +393,52 @@ class TestIntradayParity:
 
         _assert_parity(backtest, paper)
         assert len(session.session_log) == 4
+
+
+class TestFinalizeAfterInterrupt:
+    """A ``--live`` session's only exit is an interrupt (ADR-0033).
+
+    ``PaperSession.run`` returns the result at each of its stop conditions, but a
+    live session never reaches one -- it polls until someone hits Ctrl-C. So the
+    result has to be buildable from *outside* the loop, or the equity CSV and
+    ``result.json`` are unreachable in the one mode that matters most.
+    """
+
+    def _bars(self) -> list[Bar]:
+        return [_bar("AAA", 2, 100.0, 100.0), _bar("AAA", 3, 100.0, 110.0)]
+
+    def test_finalize_matches_what_run_returned(self) -> None:
+        ran, session = _paper_over(
+            self._bars(),
+            ["AAA"],
+            _ScriptedWeights("AAA", [1.0, None]),
+            RiskConfig.unlimited(),
+            clock=ImmediateClock(_ts(4)),
+        )
+
+        again = session.finalize()
+
+        assert [p.equity for p in again.equity_curve] == [p.equity for p in ran.equity_curve]
+        assert again.fills == ran.fills
+
+    def test_finalize_covers_bars_processed_so_far(self) -> None:
+        _, session = _paper_over(
+            self._bars(),
+            ["AAA"],
+            _ScriptedWeights("AAA", [1.0, None]),
+            RiskConfig.unlimited(),
+            clock=ImmediateClock(_ts(4)),
+            max_new_bars=1,
+        )
+
+        partial = session.finalize()
+
+        # One bar processed -> one equity point: not zero, and not both bars.
+        assert len(session.session_log) == 1
+        assert len(partial.equity_curve) == 1
+
+    def test_finalize_is_safe_before_any_bar(self) -> None:
+        session = _session_with_clock(FakeClock(_ts(2)))
+        result = session.finalize()
+        assert result.equity_curve == []
+        assert result.fills == []

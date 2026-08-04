@@ -583,6 +583,19 @@ class PaperSession:
         steps = (now - anchor) // interval + 1
         return anchor + steps * interval
 
+    def finalize(self) -> BacktestResult:
+        """Assemble a :class:`BacktestResult` from the bars processed *so far*.
+
+        :meth:`run` returns this at every exit, but a ``--live`` session has no
+        natural exit -- it runs until interrupted -- so the caller needs to be able
+        to build the result itself after a ``KeyboardInterrupt``. Without that, the
+        equity CSV and ``result.json`` are unreachable in live mode, since the only
+        way out of the loop skips everything after it (ADR-0033).
+
+        Safe to call at any point, including before the first bar.
+        """
+        return self._engine._finalize(self._symbols, self._state)
+
     def run(
         self,
         *,
@@ -612,7 +625,7 @@ class PaperSession:
                 if call_reporter is not None:
                     call_reporter(outcome)
                 if max_new_bars is not None and len(self.session_log) >= max_new_bars:
-                    return self._engine._finalize(self._symbols, self._state)
+                    return self.finalize()
 
             if fresh:
                 empty_polls = 0
@@ -623,4 +636,4 @@ class PaperSession:
 
             self._clock.sleep_until(self._next_due())
 
-        return self._engine._finalize(self._symbols, self._state)
+        return self.finalize()

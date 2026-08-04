@@ -133,8 +133,17 @@ def _parse_frequency(interval: str) -> Frequency:
 
 
 def _make_adapter(
-    source: str, cache_dir: Path, seed: int, frequency: Frequency = DAILY
+    source: str,
+    cache_dir: Path,
+    seed: int,
+    frequency: Frequency = DAILY,
+    data_feed: str | None = None,
 ) -> DataAdapter:
+    # The market-data tape is an Alpaca-only notion (ADR-0034); silently ignoring
+    # it on another source would let an operator think they chose a feed.
+    if data_feed is not None and source != "alpaca":
+        typer.echo(f"error: --data-feed applies only to --source alpaca, got {source!r}", err=True)
+        raise typer.Exit(2)
     if source == "yfinance":
         if frequency.is_intraday:
             typer.echo(
@@ -158,7 +167,7 @@ def _make_adapter(
         return CsvAdapter(cache_dir)
     if source == "alpaca":
         try:
-            return AlpacaAdapter(interval=frequency.delta)
+            return AlpacaAdapter(interval=frequency.delta, feed=data_feed)
         except (ValueError, ImportError) as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(2) from exc
@@ -561,6 +570,13 @@ def paper(
         help="Live wall-clock paper trading (runs until interrupted) vs. a bounded "
         "offline replay over [from, to] that terminates (default).",
     ),
+    data_feed: str | None = typer.Option(
+        None,
+        "--data-feed",
+        help="Alpaca market-data tape: iex | sip. Defaults to iex under --live "
+        "--source alpaca (a free data plan refuses recent SIP bars), else the "
+        "SDK's consolidated-SIP default.",
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/paper"), "--out", help="Result directory."),
 ) -> None:
@@ -597,7 +613,12 @@ def paper(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
-    adapter = _make_adapter(source, cache_dir, seed, freq)
+    # A live Alpaca feed polls right up to `now`, which a free data plan refuses on
+    # the SIP tape (HTTP 403); IEX is what it does serve in real time, so that is
+    # the live default while historical/replay runs keep the SIP default (ADR-0034).
+    if data_feed is None and live and source == "alpaca":
+        data_feed = "iex"
+    adapter = _make_adapter(source, cache_dir, seed, freq, data_feed)
     broker = _make_paper_broker(broker_name, live, cash)
     engine = Engine(adapter, broker, Guardrails(risk))
 
@@ -640,7 +661,15 @@ def paper(
             log_fh.flush()
             _persist_state(state_path, outcome, broker.portfolio)
 
-        result = session.run(reporter=reporter, **run_kwargs)
+        try:
+            result = session.run(reporter=reporter, **run_kwargs)
+        except KeyboardInterrupt:
+            # A --live session has no natural exit: Ctrl-C *is* how it ends. Letting
+            # the interrupt propagate skipped everything below, so the equity CSV,
+            # result.json, and the summary were unreachable in live mode even though
+            # every bar had been processed and logged (ADR-0033).
+            typer.echo("\nInterrupted — finalizing with the bars processed so far.")
+            result = session.finalize()
 
     csv_path = out / "equity_curve.csv"
     write_equity_csv(result, csv_path)

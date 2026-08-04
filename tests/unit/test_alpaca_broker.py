@@ -170,3 +170,76 @@ def test_reconcile_reads_account_not_local_simulation() -> None:
     broker.on_bar({"AAA": _bar("AAA", 50.0)})
     assert broker.portfolio.position("AAA").qty == pytest.approx(3.0)
     assert broker.portfolio.cash == pytest.approx(10_000.0 - 150.0)
+
+
+class TestTerminalStatuses:
+    """Statuses that end an order's life without filling it (ADR-0033).
+
+    Verified against the installed SDK: alpaca-py's ``OrderStatus`` has 18 members,
+    of which 5 are terminal (``filled``, ``rejected``, ``canceled``, ``expired``,
+    ``replaced``). The poll loop originally settled on only the first two, so the
+    other three left the order id in ``_pending`` forever -- re-polled to the full
+    timeout on every subsequent bar, for the rest of the session.
+    """
+
+    def _pending_broker(self) -> tuple[FakeAlpacaClient, AlpacaBroker, FakeClock]:
+        client = FakeAlpacaClient(
+            {"AAA": _series("AAA", [100.0, 100.0])}, cash=10_000.0, auto_fill=False
+        )
+        clock = _clock()
+        broker = AlpacaBroker(
+            client,
+            clock=clock,
+            poll_timeout=timedelta(seconds=6),
+            poll_interval=timedelta(seconds=2),
+        )
+        return client, broker, clock
+
+    @pytest.mark.parametrize("status", ["canceled", "expired", "replaced"])
+    def test_terminal_unfilled_order_is_dropped_not_retried_forever(self, status: str) -> None:
+        client, broker, clock = self._pending_broker()
+        broker.submit(Order("AAA", Side.BUY, qty=4))
+        client.set_order_status("1", status)
+
+        fills = broker.on_bar({"AAA": _bar("AAA", 100.0)})
+
+        assert fills == []
+        # The order is gone from the pending set, with the reason recorded...
+        assert broker.pending_order_ids == ()
+        assert len(broker.rejections) == 1
+        assert status in broker.rejections[0][1]
+        # ...and it settled immediately rather than burning the poll timeout.
+        assert clock.sleep_calls == []
+
+        # A second bar does no further work on it.
+        assert broker.on_bar({"AAA": _bar("AAA", 100.0)}) == []
+        assert len(broker.rejections) == 1
+
+    def test_partial_fill_then_canceled_still_emits_the_partial_fill(self) -> None:
+        client, broker, _ = self._pending_broker()
+        broker.submit(Order("AAA", Side.BUY, qty=4))
+        # The venue filled 1.5 of 4 shares, then canceled the rest.
+        client.set_order_status("1", "canceled", filled_qty=1.5, filled_avg_price=99.5)
+
+        fills = broker.on_bar({"AAA": _bar("AAA", 100.0)})
+
+        assert len(fills) == 1
+        assert fills[0].qty == pytest.approx(1.5)
+        assert fills[0].price == pytest.approx(99.5)
+        assert broker.pending_order_ids == ()
+        # Still reported: the order did not do what was asked of it.
+        assert len(broker.rejections) == 1
+
+    def test_working_statuses_keep_polling(self) -> None:
+        # Not terminal: the order may still fill, so the poll must wait it out and
+        # leave it pending rather than dropping it.
+        client, broker, clock = self._pending_broker()
+        broker.submit(Order("AAA", Side.BUY, qty=4))
+        client.set_order_status("1", "partially_filled", filled_qty=1.0, filled_avg_price=100.0)
+
+        fills = broker.on_bar({"AAA": _bar("AAA", 100.0)})
+
+        assert fills == []
+        assert broker.pending_order_ids == ("1",)
+        assert broker.rejections == []
+        assert clock.sleep_calls  # it waited out the timeout

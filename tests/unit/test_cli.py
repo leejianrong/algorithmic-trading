@@ -51,3 +51,35 @@ def test_bad_date_is_reported() -> None:
     )
     assert result.exit_code == 2
     assert "yyyy-mm-dd" in result.output.lower()
+
+
+class TestDataFeedOption:
+    """``--data-feed`` is an Alpaca-only notion (ADR-0034)."""
+
+    def test_rejected_for_a_non_alpaca_source(self) -> None:
+        # Silently ignoring it would let an operator believe they picked a tape.
+        result = runner.invoke(
+            app,
+            [
+                "paper",
+                "--strategy",
+                "buy_and_hold",
+                "--symbols",
+                "AAA",
+                "--from",
+                "2024-01-02",
+                "--to",
+                "2024-01-10",
+                "--source",
+                "synthetic",
+                "--data-feed",
+                "iex",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--data-feed applies only to --source alpaca" in result.output
+
+    def test_listed_in_paper_help(self) -> None:
+        result = runner.invoke(app, ["paper", "--help"])
+        assert result.exit_code == 0
+        assert "--data-feed" in result.output

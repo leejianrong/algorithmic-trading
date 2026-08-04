@@ -25,7 +25,7 @@ from datetime import timedelta
 from trading.clock import Clock, WallClock
 from trading.data.alpaca_client import (
     STATUS_FILLED,
-    STATUS_REJECTED,
+    TERMINAL_STATUSES,
     AlpacaClient,
     AlpacaOrder,
     RealAlpacaClient,
@@ -80,6 +80,16 @@ class AlpacaBroker:
         """The last portfolio reconciled from the Alpaca account (authoritative)."""
         return self._portfolio
 
+    @property
+    def pending_order_ids(self) -> tuple[str, ...]:
+        """Ids of orders submitted but not yet settled, in submission order.
+
+        A public read-only view of the retry set, so a test (or an operator
+        inspecting a live session) can see what the broker is still waiting on
+        without reaching into a private attribute.
+        """
+        return tuple(self._pending)
+
     def submit(self, order: Order) -> None:
         """Place ``order`` as a market order and track its id as pending.
 
@@ -93,13 +103,15 @@ class AlpacaBroker:
     def on_bar(self, bars: dict[str, Bar]) -> list[Fill]:
         """Poll pending orders, emit fills for settled ones, then reconcile.
 
-        Each pending order is polled until it reports filled/rejected or the poll
-        timeout elapses. A filled order yields a :class:`~trading.types.Fill` at
-        its ``filled_avg_price`` / ``filled_qty`` (no simulated slippage or
-        commission -- the venue's fill is already real, ADR-0020). A rejected
-        order is dropped with a recorded reason; one still unfilled at timeout
-        stays pending and is retried on the next ``on_bar``. The portfolio is
-        always reconciled from the account afterwards, whether or not anything
+        Each pending order is polled until it reaches a **terminal** status or the
+        poll timeout elapses. A filled order yields a :class:`~trading.types.Fill`
+        at its ``filled_avg_price`` / ``filled_qty`` (no simulated slippage or
+        commission -- the venue's fill is already real, ADR-0020). An order the
+        venue ended without completing -- ``rejected``, and equally ``canceled`` /
+        ``expired`` / ``replaced`` -- is dropped with a recorded reason, after
+        emitting any partial fill it did get (ADR-0033). One still *working* at
+        timeout stays pending and is retried on the next ``on_bar``. The portfolio
+        is always reconciled from the account afterwards, whether or not anything
         filled, since positions can move between bars.
         """
         _ = bars  # Prices come from the venue, not our bars; kept for seam parity.
@@ -109,12 +121,18 @@ class AlpacaBroker:
         for order_id in self._pending:
             settled = self._poll(order_id)
             if settled is None:
-                still_pending.append(order_id)  # timed out; retry next bar.
+                still_pending.append(order_id)  # still working; retry next bar.
                 continue
-            if settled.status == STATUS_REJECTED:
-                self.rejections.append((order_id, f"order {order_id} rejected by venue"))
-                continue
+            # A terminal-but-unfilled order may still carry a partial fill, so
+            # record the fill (if any) *and* the reason it ended early.
             fill = self._to_fill(settled)
+            if settled.status != STATUS_FILLED:
+                if fill is not None:
+                    fills.append(fill)
+                self.rejections.append(
+                    (order_id, f"order {order_id} ended {settled.status} at the venue")
+                )
+                continue
             if fill is None:
                 still_pending.append(order_id)  # filled flag but no price yet.
                 continue
@@ -127,17 +145,20 @@ class AlpacaBroker:
     # -- internals --
 
     def _poll(self, order_id: str) -> AlpacaOrder | None:
-        """Poll one order until it settles or the timeout elapses.
+        """Poll one order until it reaches a terminal status or the timeout elapses.
 
-        Returns the settled (filled or rejected) order, or ``None`` if it is still
-        working when the timeout is reached. Uses the injected clock to measure
-        and to wait, so tests advance time with no real delay and an ``auto_fill``
-        client returns on the first poll without sleeping at all.
+        Returns the settled order, or ``None`` if it is still *working* when the
+        timeout is reached. "Terminal" is the whole set Alpaca can end an order in
+        (ADR-0033), not just filled/rejected: waiting out a ``canceled`` order
+        would burn the full timeout on every bar for the rest of the session and
+        never settle. Uses the injected clock to measure and to wait, so tests
+        advance time with no real delay and an ``auto_fill`` client returns on the
+        first poll without sleeping at all.
         """
         deadline = self._clock.now() + self._poll_timeout
         while True:
             current = self._client.get_order(order_id)
-            if current.status in (STATUS_FILLED, STATUS_REJECTED):
+            if current.status in TERMINAL_STATUSES:
                 return current
             if self._clock.now() >= deadline:
                 return None
