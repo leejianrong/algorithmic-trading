@@ -251,10 +251,22 @@ bar). Wrong → decisions use unfinished data.
   `AlpacaAdapter` and a submit-then-poll `AlpacaBroker` behind the same
   `DataAdapter`/`Broker` interfaces; API keys via env, optional lazy `alpaca-py`
   (ADR-0017/0018/0020). CLI: `--source alpaca`, `paper --broker alpaca --live`.
-- Intraday/tick frequency; other asset classes (each its own ADR).
+- Raw-vs-adjusted quote handling for live/paper. **Done** — the price notion is an
+  explicit per-mode feed policy: backtest adjusted (ADR-0008), paper/live raw actual
+  quotes so a raw account is never marked on adjusted prices (ADR-0021).
+- Intraday / higher-frequency bars. **Done** — a `Frequency` abstraction (interval as
+  an adapter property; protocol and engine step untouched, daily byte-identical),
+  synthetic intraday generation, `ts+interval` completeness, interval paper cadence,
+  and `periods_per_year` annualization; `--interval` on the CLI. Real Alpaca intraday
+  behind an integration test. Tick frequency and other asset classes remain open, each
+  its own ADR (ADR-0022).
+- Web dashboard. **Done** — reads the canonical `result.json` and renders equity
+  curve, metrics, fills, and guardrail actions; a pure-stdlib self-contained static
+  export plus an optional lazily-imported FastAPI server (ADR-0023). CLI:
+  `trading dashboard --static|--serve`; backtest/paper emit `result.json`.
 - Parameter optimization / walk-forward as an outer sweep over runs. **Done** —
   `sweep.py` + `trading sweep` (ADR-0016).
 - Volatility targeting **done** (`RiskConfig.target_volatility` / `--target-vol`,
   ADR-0015) and per-sector risk caps **done** (`--max-sector-exposure` /
   `--sector-map`, ADR-0019); a bring-your-own-data CSV source is **done**
-  (`--source csv`). A web dashboard remains open.
+  (`--source csv`).
