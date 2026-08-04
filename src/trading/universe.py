@@ -5,6 +5,11 @@ by name from the CLI (``--symbols @blue20``, ``--sector-map @blue20``). It seeds
 run with a diversified, liquid candidate set without hard-coding a comma list, and
 gives the sector-cap guardrail (ADR-0019) a matching, hand-checkable map.
 
+Two baskets ship today: ``blue20`` (20 of today's mega-cap US single stocks) and
+``core10`` (10 long-lived, broad ETFs across asset classes, built for
+long-horizon runs). The map values are *bucket labels*, not necessarily GICS
+sectors — see caveat 3.
+
 Honesty caveat 1 — tradability is the broker's fact, and now checkable
 ----------------------------------------------------------------------
 The ``blue20`` names below are curated as high-confidence fractionable US
@@ -39,6 +44,46 @@ read them as an **upper bound** and weight forward paper results — which are
 survivorship-free by construction — far more heavily. A real fix needs a
 point-in-time, survivorship-bias-free constituent database fed in through
 ``--source csv``; that is a future slice, not done.
+
+Honesty caveat 3 — ``core10`` reduces that bias substantially, and does not remove it
+------------------------------------------------------------------------------------
+``core10`` exists because of caveat 2. It holds **broad ETFs**, not single names,
+and that is the best mitigation available on a yfinance-only data path: a broad
+index or Treasury fund does not go bankrupt, get acquired, or get delisted for
+failure the way an individual company does, so the missing-losers hole that makes
+``blue20`` unreadable over 20 years mostly closes. A fund's own holdings turn over
+inside the wrapper — SPY held the 2000 losers and dropped them, and its NAV wore
+the loss — so the ticker's price history is a genuine, point-in-time-honest record
+of that exposure. For a long-horizon backtest (say 2000-2020), ``core10`` is a
+**substantially** more honest universe than ``blue20``, which is the entire reason
+it is here.
+
+It is **not** survivorship-bias-free:
+
+- ETFs do close. Hundreds have been liquidated, and yfinance has no history for
+  them, so the fund graveyard is as invisible here as the stock graveyard.
+- These ten were picked in 2026, with hindsight, *because* they survived and stayed
+  liquid for two decades. A 2000-vintage operator choosing ten funds could have
+  picked ones that closed or bled assets. That selection is still hindsight —
+  it is just applied to wrappers instead of companies, where the survival rate is
+  much higher and the surviving names are much closer to the ones a reasonable
+  person would have picked anyway.
+
+So: bias reduced, not removed. Everything in ADR-0027 still applies — read the
+numbers as an upper bound and weight forward paper results more heavily.
+
+Inception dates: expect a shorter universe in the early years
+------------------------------------------------------------
+Every ``core10`` name traded by 2004, but not by 2000: EEM starts 2003, GLD 2004,
+TLT and IEF 2002, EFA 2001, IWM mid-2000. A run beginning in 2000 therefore has
+**partial history** for several symbols, and the early years effectively trade a
+smaller universe: 2000-2001 is US equity only — SPY, QQQ, IWM from May 2000, plus
+the two sector funds — with no bonds, no gold, and no international exposure
+available at all. That is correct behavior, not a bug: the engine can only trade bars
+that exist. It does mean early-period results are less diversified than the basket
+name suggests, and that a metric such as turnover or average exposure is not
+comparable between the first two years and the last ten. Expect it rather than
+discover it, and each symbol below carries its inception year in a comment.
 """
 
 from __future__ import annotations
@@ -59,6 +104,11 @@ class Basket:
 
     ``symbols`` and the keys of ``sectors`` are kept in sync by construction (see
     :data:`BASKETS`); the module-level registry is the single source of truth.
+
+    ``sectors`` values are **opaque bucket labels**, not a fixed taxonomy: the
+    per-sector exposure cap (ADR-0019) groups by string equality and gives each
+    distinct value its own budget, so a basket may use GICS-style sectors
+    (``blue20``) or asset classes (``core10``: ``"treasuries"``, ``"gold"``).
     """
 
     name: str
@@ -66,12 +116,11 @@ class Basket:
     sectors: Mapping[str, str]
 
 
-# Curated candidate universes. Seeded with one basket, ``blue20`` — 20 mega-cap,
-# highly liquid US names spread across 8 sectors, chosen as high-confidence
-# Alpaca-fractionable large-caps. See the module docstring's two honesty caveats:
-# this curation is not broker-verified until you run `validate_universe` against
-# your own account (ADR-0028), and it is survivorship-biased by construction
-# (ADR-0027).
+# Curated candidate universes. ``blue20`` — 20 mega-cap, highly liquid US names
+# spread across 8 sectors, chosen as high-confidence Alpaca-fractionable
+# large-caps. See the module docstring's honesty caveats: this curation is not
+# broker-verified until you run `validate_universe` against your own account
+# (ADR-0028), and it is survivorship-biased by construction (ADR-0027).
 _BLUE20_SECTORS: dict[str, str] = {
     # Technology
     "AAPL": "tech",
@@ -103,11 +152,48 @@ _BLUE20_SECTORS: dict[str, str] = {
     "HON": "industrials",
 }
 
+# ``core10`` — 10 long-lived, broad ETFs spanning asset classes, for long-horizon
+# runs (the 2000-2020 kind) where `blue20`'s hindsight-winner problem makes the
+# numbers uninterpretable. See the module docstring's caveat 3: broad funds do not
+# fail the way single companies do, so most of the survivorship distortion goes
+# away — but these ten were still chosen in hindsight, so the bias is *reduced,
+# not removed* (ADR-0027).
+#
+# The map values here are **asset-class bucket labels, not GICS sectors**
+# ("treasuries", "gold"). That is deliberate and needs no code change: the
+# per-sector exposure cap (ADR-0019) keys on arbitrary strings and treats each
+# distinct value as one generic budget, so `--sector-map @core10
+# --max-sector-exposure 0.30` caps each bucket at 30% of equity. Two names share
+# the "treasuries" label (TLT + IEF), so they share one budget; every other label
+# has a single member, where the bucket cap is effectively a second position cap.
+#
+# Inception year on every line, because a run starting before it silently yields a
+# short series for that symbol (see the docstring's inception-date note). Sources
+# are the funds' well-known launch dates; anything we were not confident about was
+# left out rather than guessed.
+_CORE10_SECTORS: dict[str, str] = {
+    "SPY": "us_large",  # SPDR S&P 500 — 1993
+    "QQQ": "us_tech",  # Invesco QQQ (Nasdaq-100) — 1999
+    "IWM": "us_small",  # iShares Russell 2000 — 2000 (May)
+    "EFA": "intl_developed",  # iShares MSCI EAFE — 2001
+    "EEM": "intl_emerging",  # iShares MSCI Emerging Markets — 2003
+    "TLT": "treasuries",  # iShares 20+ Year Treasury — 2002
+    "IEF": "treasuries",  # iShares 7-10 Year Treasury — 2002
+    "GLD": "gold",  # SPDR Gold Shares — 2004 (Nov)
+    "XLE": "energy",  # Energy Select Sector SPDR — 1998
+    "XLF": "financials",  # Financial Select Sector SPDR — 1998
+}
+
 BASKETS: dict[str, Basket] = {
     "blue20": Basket(
         name="blue20",
         symbols=tuple(_BLUE20_SECTORS),
         sectors=dict(_BLUE20_SECTORS),
+    ),
+    "core10": Basket(
+        name="core10",
+        symbols=tuple(_CORE10_SECTORS),
+        sectors=dict(_CORE10_SECTORS),
     ),
 }
 
