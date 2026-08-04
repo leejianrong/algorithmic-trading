@@ -13,13 +13,23 @@ function so importing this module never requires it.
 from __future__ import annotations
 
 import csv
+import json
+from dataclasses import asdict
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from trading.metrics import compute
 
 if TYPE_CHECKING:
     from trading.engine import BacktestResult, EquityPoint
+    from trading.metrics import PerformanceMetrics
+
+
+# Schema version of the canonical machine-readable run artifact emitted by
+# ``result_to_dict`` / ``write_result_json``. The web dashboard reads this to
+# decide how to parse the document; bump it whenever the shape changes in a way
+# a consumer must notice.
+RESULT_SCHEMA_VERSION = 1
 
 
 def summarize(result: BacktestResult, benchmark: BacktestResult | None = None) -> str:
@@ -133,3 +143,154 @@ def write_equity_png(
     fig.tight_layout()
     fig.savefig(path)
     plt.close(fig)
+
+
+def _equity_curve_to_list(curve: list[EquityPoint]) -> list[dict[str, Any]]:
+    """Serialize an equity curve to ``{"ts", "equity", "exposure"}`` records."""
+    return [
+        {"ts": point.ts.isoformat(), "equity": point.equity, "exposure": point.exposure}
+        for point in curve
+    ]
+
+
+def result_to_dict(
+    result: BacktestResult,
+    *,
+    mode: str,
+    frequency: str = "1d",
+    metrics: PerformanceMetrics | None = None,
+    benchmark_curve: list[EquityPoint] | None = None,
+) -> dict[str, Any]:
+    """Build the canonical, JSON-serializable dict describing a completed run.
+
+    This is the single machine-readable contract a run emits — the forthcoming
+    web dashboard reads exactly this shape. Fills, guardrail clamps, and
+    rejections (previously only in the human text summary) are surfaced here so
+    downstream consumers never have to parse prose. The returned dict round-trips
+    through :func:`json.dumps` with the stock encoder: every value is a JSON
+    primitive, list, or dict — datetimes are ISO-8601 strings and enums are their
+    ``.value``.
+
+    Schema (top-level keys)::
+
+        {
+          "schema_version": int,      # RESULT_SCHEMA_VERSION constant
+          "mode": str,                # "backtest" | "paper"
+          "frequency": str,           # interval label, e.g. "1d" (free string)
+          "symbols": list[str],
+          "starting_cash": float,
+          "final_equity": float,
+          "total_return": float,      # final/starting - 1
+          "equity_curve": [           # one record per bar
+            {"ts": iso8601 str, "equity": float, "exposure": float}, ...
+          ],
+          "benchmark_curve": same shape as equity_curve, or null,
+          "metrics": dataclasses.asdict(metrics) or null,
+          "fills": [
+            {"ts": iso8601 str, "symbol": str, "side": str,
+             "qty": float, "price": float, "commission": float}, ...
+          ],
+          "clamps": [                 # orders a guardrail cap trimmed down
+            {"symbol": str, "original_qty": float, "clamped_qty": float,
+             "side": str, "reason": str}, ...
+          ],
+          "rejections": [             # orders a guardrail/broker vetoed
+            {"symbol": str, "qty": float, "side": str, "reason": str}, ...
+          ],
+          "halt": {"halted": bool,
+                   "halt_ts": iso8601 str | null,
+                   "halt_reason": str | null}
+        }
+
+    Parameters
+    ----------
+    result:
+        The completed :class:`~trading.engine.BacktestResult`.
+    mode:
+        ``"backtest"`` or ``"paper"`` — which driver produced the run.
+    frequency:
+        A plain interval label (default ``"1d"``). Kept a free string so a later
+        intraday lane forward-fits without a schema change.
+    metrics:
+        An already-computed :class:`~trading.metrics.PerformanceMetrics`, or
+        ``None``. Serialized generically via :func:`dataclasses.asdict` so new
+        metric fields flow through automatically; ``None`` emits ``null``. This
+        function never computes metrics itself.
+    benchmark_curve:
+        An optional aligned benchmark equity curve, or ``None`` (emits ``null``).
+    """
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "mode": mode,
+        "frequency": frequency,
+        "symbols": list(result.symbols),
+        "starting_cash": result.starting_cash,
+        "final_equity": result.final_equity,
+        "total_return": result.total_return,
+        "equity_curve": _equity_curve_to_list(result.equity_curve),
+        "benchmark_curve": (
+            _equity_curve_to_list(benchmark_curve) if benchmark_curve is not None else None
+        ),
+        "metrics": asdict(metrics) if metrics is not None else None,
+        "fills": [
+            {
+                "ts": ts.isoformat(),
+                "symbol": fill.symbol,
+                "side": fill.side.value,
+                "qty": fill.qty,
+                "price": fill.price,
+                "commission": fill.commission,
+            }
+            for ts, fill in result.fills
+        ],
+        "clamps": [
+            {
+                "symbol": original.symbol,
+                "original_qty": original.qty,
+                "clamped_qty": clamped.qty,
+                "side": original.side.value,
+                "reason": reason,
+            }
+            for original, clamped, reason in result.clamps
+        ],
+        "rejections": [
+            {
+                "symbol": order.symbol,
+                "qty": order.qty,
+                "side": order.side.value,
+                "reason": reason,
+            }
+            for order, reason in result.rejections
+        ],
+        "halt": {
+            "halted": result.halted,
+            "halt_ts": result.halt_ts.isoformat() if result.halt_ts is not None else None,
+            "halt_reason": result.halt_reason,
+        },
+    }
+
+
+def write_result_json(
+    result: BacktestResult,
+    path: Path,
+    *,
+    mode: str,
+    frequency: str = "1d",
+    metrics: PerformanceMetrics | None = None,
+    benchmark_curve: list[EquityPoint] | None = None,
+) -> None:
+    """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
+
+    Writes pretty-printed JSON (``indent=2``). Creates parent directories as
+    needed. See :func:`result_to_dict` for the schema and parameter meanings.
+    """
+    payload = result_to_dict(
+        result,
+        mode=mode,
+        frequency=frequency,
+        metrics=metrics,
+        benchmark_curve=benchmark_curve,
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w") as fh:
+        json.dump(payload, fh, indent=2)
