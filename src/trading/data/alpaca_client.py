@@ -59,11 +59,47 @@ class PositionSnapshot:
     avg_price: float
 
 
+@dataclass(frozen=True, slots=True)
+class AssetInfo:
+    """Per-asset metadata the broker owns: can we trade it, and in fractions?
+
+    This is the authoritative answer to the question a curated universe can only
+    guess at (ADR-0024, ADR-0028): ``tradable`` is whether Alpaca will accept an
+    order in the name at all, and ``fractionable`` is whether it accepts the
+    fractional quantities our sizing layer produces (ADR-0011). A backtest
+    universe should mirror ``tradable and fractionable``, or paper/live cannot
+    hold what the backtest assumed.
+
+    ``exchange`` and ``name`` are descriptive only (useful when reporting a drop
+    to a human) and default to empty when the SDK omits them; ``shortable`` is
+    recorded for completeness and is unused by this long-or-flat bench (ADR-0011).
+    Values are reported exactly as the broker gives them — no field is "fixed up"
+    into a more usable-looking combination.
+    """
+
+    symbol: str
+    tradable: bool
+    fractionable: bool
+    exchange: str = ""
+    name: str = ""
+    shortable: bool = False
+
+    def __post_init__(self) -> None:
+        if not self.symbol:
+            raise ValueError("AssetInfo.symbol must be a non-empty ticker")
+        if self.symbol.strip() != self.symbol or " " in self.symbol:
+            raise ValueError(f"AssetInfo.symbol must not contain whitespace, got {self.symbol!r}")
+
+
 # Order lifecycle statuses we use. Kept as strings (not an enum) so a real
 # Alpaca status string round-trips unchanged through :class:`AlpacaOrder`.
 STATUS_NEW = "new"
 STATUS_FILLED = "filled"
 STATUS_REJECTED = "rejected"
+
+# Exchange string :class:`FakeAlpacaClient` stamps on the assets it invents. It is
+# a placeholder, not a claim about where a symbol really lists.
+_FAKE_EXCHANGE = "FAKE"
 
 
 @runtime_checkable
@@ -115,6 +151,16 @@ class AlpacaClient(Protocol):
         """All open positions (empty when flat)."""
         ...
 
+    def get_asset(self, symbol: str) -> AssetInfo:
+        """Broker-authoritative metadata for ``symbol`` (ADR-0028).
+
+        This is how a curated universe (ADR-0024) gets verified against what the
+        venue will actually trade. An unknown ticker raises :class:`LookupError`;
+        a transport/API failure surfaces as whatever the underlying client raises,
+        so a network hiccup is never mistaken for a delisted stock.
+        """
+        ...
+
 
 # --- Fake: the offline workhorse ----------------------------------------------
 
@@ -140,6 +186,11 @@ class FakeAlpacaClient:
     the order ``"new"`` and untouched until :meth:`fill_order` advances it, which
     is what lets a broker lane test submit-then-poll (and timeout) behaviour.
     There is no wall clock and no RNG; order ids are a monotonic counter.
+
+    :meth:`get_asset` answers "tradable + fractionable" for every symbol by
+    default; :meth:`set_asset` scripts a specific answer (e.g. a non-fractionable
+    or halted name) and :meth:`set_asset_failure` scripts a lookup that blows up,
+    which is what lets the universe validator (ADR-0028) be tested offline.
     """
 
     def __init__(
@@ -148,6 +199,7 @@ class FakeAlpacaClient:
         *,
         cash: float = 100_000.0,
         auto_fill: bool = True,
+        assets: dict[str, AssetInfo] | None = None,
     ) -> None:
         self._bars: dict[str, list[Bar]] = {
             symbol: sorted(series, key=lambda b: b.ts) for symbol, series in (bars or {}).items()
@@ -155,6 +207,8 @@ class FakeAlpacaClient:
         self._state = _FakeState(cash=cash)
         self._auto_fill = auto_fill
         self._prices: dict[str, float] = {}
+        self._assets: dict[str, AssetInfo] = dict(assets or {})
+        self._asset_failures: dict[str, str] = {}
         self._next_id = 1
 
     # -- test/setup helpers (not part of the protocol) --
@@ -162,6 +216,38 @@ class FakeAlpacaClient:
     def set_price(self, symbol: str, price: float) -> None:
         """Set the price ``submit_order`` (and :meth:`fill_order`) will fill at."""
         self._prices[symbol] = price
+
+    def set_asset(
+        self,
+        symbol: str,
+        *,
+        tradable: bool = True,
+        fractionable: bool = True,
+        shortable: bool = True,
+        exchange: str = _FAKE_EXCHANGE,
+        name: str = "",
+    ) -> AssetInfo:
+        """Script the :meth:`get_asset` answer for ``symbol`` and return it.
+
+        Defaults to a fully usable asset, so a test only names the flag it cares
+        about (``set_asset("BRK.A", fractionable=False)``).
+        """
+        asset = AssetInfo(
+            symbol=symbol,
+            tradable=tradable,
+            fractionable=fractionable,
+            exchange=exchange,
+            name=name,
+            shortable=shortable,
+        )
+        self._assets[symbol] = asset
+        self._asset_failures.pop(symbol, None)
+        return asset
+
+    def set_asset_failure(self, symbol: str, message: str = "asset lookup failed") -> None:
+        """Make :meth:`get_asset` raise for ``symbol`` (an unknown ticker or API error)."""
+        self._asset_failures[symbol] = message
+        self._assets.pop(symbol, None)
 
     def _fill_price(self, symbol: str, override: float | None) -> float:
         """Resolve a fill price: explicit override, set price, else last bar close."""
@@ -236,6 +322,25 @@ class FakeAlpacaClient:
 
     def list_positions(self) -> list[PositionSnapshot]:
         return [pos for pos in self._state.positions.values() if abs(pos.qty) > SHARE_EPS]
+
+    def get_asset(self, symbol: str) -> AssetInfo:
+        """Return the scripted asset for ``symbol``, else a fully usable default.
+
+        A symbol registered via :meth:`set_asset_failure` raises
+        :class:`LookupError`, which is how the "unverified" path gets exercised.
+        """
+        if symbol in self._asset_failures:
+            raise LookupError(f"{self._asset_failures[symbol]}: {symbol!r}")
+        existing = self._assets.get(symbol)
+        if existing is not None:
+            return existing
+        return AssetInfo(
+            symbol=symbol,
+            tradable=True,
+            fractionable=True,
+            exchange=_FAKE_EXCHANGE,
+            shortable=True,
+        )
 
     # -- internal accounting (mirrors Portfolio.apply_fill semantics) --
 
@@ -428,6 +533,45 @@ class RealAlpacaClient:
             )
             for position in self._trading.get_all_positions()
         ]
+
+    def get_asset(self, symbol: str) -> AssetInfo:  # pragma: no cover - needs the SDK
+        """Look up broker-authoritative asset metadata for ``symbol`` (ADR-0028).
+
+        An unknown ticker (the SDK's 404) is re-raised as a clear
+        :class:`LookupError`; any other failure (auth, rate limit, transport)
+        propagates unchanged, so the universe validator can tell "the broker says
+        no" apart from "we could not ask" (see
+        :func:`trading.universe.validate_universe`).
+        """
+        try:
+            raw = self._trading.get_asset(symbol)
+        except Exception as exc:  # narrowed below: only a 404 becomes LookupError
+            if getattr(exc, "status_code", None) == 404:
+                raise LookupError(f"unknown Alpaca asset {symbol!r}") from exc
+            raise
+        if raw is None:
+            raise LookupError(f"unknown Alpaca asset {symbol!r}")
+        return self._to_asset(symbol, raw)
+
+    @staticmethod
+    def _to_asset(symbol: str, raw: Any) -> AssetInfo:  # pragma: no cover - SDK only
+        """Convert an SDK ``Asset`` model into our :class:`AssetInfo`.
+
+        ``raw`` is untyped (alpaca-py ships no stubs), field presence varies by
+        SDK version, and its enums render as e.g. ``"AssetExchange.NASDAQ"`` or
+        ``"NASDAQ"``, so every field is read defensively and the exchange enum
+        prefix is stripped. Missing ``tradable`` / ``fractionable`` default to
+        ``False``: absent permission is not permission.
+        """
+        exchange = str(getattr(raw, "exchange", "") or "")
+        return AssetInfo(
+            symbol=str(getattr(raw, "symbol", "") or symbol),
+            tradable=bool(getattr(raw, "tradable", False)),
+            fractionable=bool(getattr(raw, "fractionable", False)),
+            exchange=exchange.split(".")[-1] if exchange else "",
+            name=str(getattr(raw, "name", "") or ""),
+            shortable=bool(getattr(raw, "shortable", False)),
+        )
 
     @staticmethod
     def _to_order(raw: Any) -> AlpacaOrder:
