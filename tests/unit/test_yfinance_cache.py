@@ -83,3 +83,46 @@ def test_unadjusted_request_steers_to_alpaca_or_synthetic(tmp_path: Path) -> Non
         adapter.get_bars("AAA", start, end, adjusted=False)
     with pytest.raises(ValueError, match="--source synthetic"):
         adapter.get_bars("AAA", start, end, adjusted=False)
+
+
+class TestAbsenceIsDataNotFailure:
+    """An empty provider response is cached and returned as [] (ADR-0032)."""
+
+    def test_empty_response_returns_no_bars_instead_of_raising(self, tmp_path: Path) -> None:
+        calls: list[str] = []
+
+        def empty_fetch(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+            calls.append(symbol)
+            frame = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+            frame.index.name = "ts"
+            return frame
+
+        adapter = YFinanceAdapter(tmp_path, fetcher=empty_fetch)
+        assert adapter.get_bars("NOTLISTED", *_range()) == []
+        assert calls == ["NOTLISTED"]
+
+    def test_absence_is_cached_so_later_folds_skip_the_network(self, tmp_path: Path) -> None:
+        """The wart this fixes: the raise happened before the cache write, so every
+        walk-forward fold re-hit the network to fail again."""
+        calls: list[str] = []
+
+        def empty_fetch(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+            calls.append(symbol)
+            frame = pd.DataFrame(columns=["open", "high", "low", "close", "volume"])
+            frame.index.name = "ts"
+            return frame
+
+        adapter = YFinanceAdapter(tmp_path, fetcher=empty_fetch)
+        assert adapter.get_bars("NOTLISTED", *_range()) == []
+        assert adapter.get_bars("NOTLISTED", *_range()) == []
+        assert calls == ["NOTLISTED"]  # exactly one fetch, not two
+
+    def test_a_raising_fetcher_still_propagates(self, tmp_path: Path) -> None:
+        """Absence is tolerated; a genuine lookup failure is still an exception."""
+
+        def broken_fetch(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
+            raise ConnectionError("upstream reset the connection")
+
+        adapter = YFinanceAdapter(tmp_path, fetcher=broken_fetch)
+        with pytest.raises(ConnectionError):
+            adapter.get_bars("AAPL", *_range())

@@ -543,9 +543,15 @@ def test_walk_forward_all_combos_rejected_is_reported_per_fold() -> None:
     assert any("no runnable parameter combination" in w for w in summary.warnings)
 
 
-def test_walk_forward_warns_when_a_span_has_too_few_bars() -> None:
-    # An adapter with nothing to serve: the folds still form, but their metrics are
-    # structurally zero and must not read as a result.
+def test_walk_forward_records_a_span_with_no_data_as_an_unusable_fold() -> None:
+    """An adapter with nothing to serve produces no fold at all (ADR-0032).
+
+    A span in which *no* symbol has data raises ``EmptyUniverseError`` inside the
+    engine. The sweep catches it per span and records the fold as unusable rather
+    than fabricating one whose metrics are structurally zero — and rather than
+    letting one dataless span abort the whole sweep, which is the case that matters
+    for a real universe whose members list at different times.
+    """
     summary = run_walk_forward(
         "sma_crossover",
         {"fast": [5], "slow": [30]},
@@ -555,11 +561,38 @@ def test_walk_forward_warns_when_a_span_has_too_few_bars() -> None:
         _END,
         folds=1,
     )
+    assert summary.folds == []
+    assert [index for index, _reason in summary.unusable_folds] == [0]
+    (_index, reason) = summary.unusable_folds[0]
+    assert "no data for any symbol" in reason
+
+
+def test_walk_forward_warns_when_a_span_has_too_few_bars() -> None:
+    """A span with data but almost none still warns: 1 bar is not a result.
+
+    Distinct from the no-data case above — here the universe is non-empty, so the
+    fold forms and the ``_MIN_USABLE_POINTS`` guard is what must speak up.
+    """
+    # One bar in each half of [_START, _END], so both the IS and the OOS span of a
+    # single fold see exactly one bar.
+    bars = [
+        Bar("AAA", ts, 10.0, 10.0, 10.0, 10.0, 1_000)
+        for ts in (datetime(2021, 6, 1, tzinfo=UTC), datetime(2022, 6, 1, tzinfo=UTC))
+    ]
+    summary = run_walk_forward(
+        "sma_crossover",
+        {"fast": [5], "slow": [30]},
+        FakeAdapter(bars),
+        ["AAA"],
+        _START,
+        _END,
+        folds=1,
+    )
     (fold,) = summary.folds
-    assert fold.in_sample_points == 0
-    assert fold.out_of_sample_points == 0
-    assert any("in-sample span produced 0 bar(s)" in w for w in summary.warnings)
-    assert any("out-of-sample span produced 0 bar(s)" in w for w in summary.warnings)
+    assert fold.in_sample_points == 1
+    assert fold.out_of_sample_points == 1
+    assert any("in-sample span produced 1 bar(s)" in w for w in summary.warnings)
+    assert any("out-of-sample span produced 1 bar(s)" in w for w in summary.warnings)
 
 
 def test_walk_forward_unknown_strategy_and_rank_key_raise() -> None:

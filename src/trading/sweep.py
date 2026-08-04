@@ -40,7 +40,7 @@ from typing import TYPE_CHECKING, cast
 
 from trading.broker import SimulatedBroker
 from trading.config import RiskConfig
-from trading.engine import Engine
+from trading.engine import EmptyUniverseError, Engine
 from trading.metrics import PerformanceMetrics, compute
 from trading.risk import Guardrails
 from trading.strategies import STRATEGIES
@@ -216,6 +216,9 @@ class SweepSummary:
     # Combos skipped because the strategy rejected them (e.g. sma fast >= slow),
     # paired with the constructor's error message — surfaced, never silent.
     skipped: list[tuple[ParamCombo, str]] = field(default_factory=list)
+    # Windows dropped because no symbol had data in them (ADR-0032) — e.g. an early
+    # window predating a whole universe's listings. Reported, never silent.
+    empty_windows: list[str] = field(default_factory=list)
 
     def ranked(self, by: str = "sharpe") -> list[SweepRun]:
         """Runs sorted best-first by ``by`` ('sharpe' or 'total_return').
@@ -255,6 +258,12 @@ def _run_combo(
     :class:`~trading.risk.Guardrails` per call, so no portfolio or kill-switch
     state ever leaks between runs (ADR-0016). The curve length is returned so
     callers can tell a real result from a span that produced (almost) no bars.
+
+    A span in which *no* symbol has data raises
+    :class:`~trading.engine.EmptyUniverseError` from the engine (ADR-0032). That is
+    fatal to one run but not to a sweep: an early walk-forward fold can legitimately
+    predate a whole universe's listings. Callers catch it and record the span as
+    unusable, which is why this does not swallow it here.
     """
     broker = SimulatedBroker(Portfolio(cash=cash))
     engine = Engine(adapter, broker, Guardrails(risk))
@@ -329,18 +338,27 @@ def run_sweep(
     runnable, skipped = _partition_grid(strategy, grid)
 
     runs: list[SweepRun] = []
+    empty_windows: list[str] = []
     for combo in runnable:
         for window_index, (win_start, win_end) in enumerate(spans):
-            metrics, _points = _run_combo(
-                strategy,
-                combo,
-                adapter,
-                tickers,
-                win_start,
-                win_end,
-                cash=cash,
-                risk=risk_config,
-            )
+            try:
+                metrics, _points = _run_combo(
+                    strategy,
+                    combo,
+                    adapter,
+                    tickers,
+                    win_start,
+                    win_end,
+                    cash=cash,
+                    risk=risk_config,
+                )
+            except EmptyUniverseError as exc:
+                # A window predating the universe's listings is not a sweep failure
+                # (ADR-0032); drop that window's run and report it once.
+                note = f"window {window_index} has no data for any symbol: {exc}"
+                if note not in empty_windows:
+                    empty_windows.append(note)
+                continue
             runs.append(
                 SweepRun(
                     params=dict(combo),
@@ -351,7 +369,13 @@ def run_sweep(
                 )
             )
 
-    return SweepSummary(strategy=strategy, symbols=tickers, runs=runs, skipped=skipped)
+    return SweepSummary(
+        strategy=strategy,
+        symbols=tickers,
+        runs=runs,
+        skipped=skipped,
+        empty_windows=empty_windows,
+    )
 
 
 # A span needs at least two equity points for a return (hence any ratio) to exist;
@@ -566,34 +590,45 @@ def run_walk_forward(
             continue
 
         # --- in-sample: score the whole grid, then pick exactly one winner -----
+        # A span predating the whole universe's listings raises EmptyUniverseError
+        # (ADR-0032). That kills one fold, not the sweep: an early anchored fold over
+        # a real universe can legitimately sit before every symbol existed.
         scored: list[_Scored] = []
-        for combo in runnable:
-            metrics, points = _run_combo(
-                strategy,
-                combo,
-                adapter,
-                tickers,
-                span.is_start,
-                span.is_end,
-                cash=cash,
-                risk=risk_config,
-            )
-            scored.append(_Scored(combo=combo, metrics=metrics, points=points))
+        try:
+            for combo in runnable:
+                metrics, points = _run_combo(
+                    strategy,
+                    combo,
+                    adapter,
+                    tickers,
+                    span.is_start,
+                    span.is_end,
+                    cash=cash,
+                    risk=risk_config,
+                )
+                scored.append(_Scored(combo=combo, metrics=metrics, points=points))
+        except EmptyUniverseError as exc:
+            unusable.append((span.index, f"in-sample span has no data for any symbol: {exc}"))
+            continue
         # A stable argmax: ``max`` keeps the first maximal element, so ties resolve
         # to grid-expansion order and the choice is fully deterministic.
         winner = max(scored, key=lambda candidate: key(candidate.metrics))
 
         # --- out-of-sample: the winner, ONCE, on data selection never saw ------
-        oos_metrics, oos_points = _run_combo(
-            strategy,
-            winner.combo,
-            adapter,
-            tickers,
-            span.oos_start,
-            span.oos_end,
-            cash=cash,
-            risk=risk_config,
-        )
+        try:
+            oos_metrics, oos_points = _run_combo(
+                strategy,
+                winner.combo,
+                adapter,
+                tickers,
+                span.oos_start,
+                span.oos_end,
+                cash=cash,
+                risk=risk_config,
+            )
+        except EmptyUniverseError as exc:
+            unusable.append((span.index, f"out-of-sample span has no data for any symbol: {exc}"))
+            continue
 
         if winner.points < _MIN_USABLE_POINTS:
             warnings.append(

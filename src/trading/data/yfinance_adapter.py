@@ -9,6 +9,11 @@ Two design choices from the ADRs and the dev-playbook:
   tested with a stub and never hits yfinance. On a miss we fetch, write the CSV,
   then *always* rebuild bars from that CSV — so a re-run parses the same bytes and
   is deterministic.
+- **Absence is cached too** (ADR-0032): a symbol with no rows in the window caches
+  an empty CSV and returns ``[]``. Previously this raised *before* the cache write,
+  so every walk-forward fold re-hit the network to fail again — with each fold
+  keying its own ``(symbol, start, end)`` cache file, a 6-fold sweep over a
+  universe with four late-listing names paid two dozen doomed network round trips.
 """
 
 from __future__ import annotations
@@ -31,12 +36,23 @@ def cache_filename(symbol: str, start: datetime, end: datetime) -> str:
     return f"{symbol}_{start:%Y%m%d}_{end:%Y%m%d}_adj.csv"
 
 
-class DataUnavailableError(Exception):
-    """The provider returned no data for a symbol/range."""
+def _empty_frame() -> pd.DataFrame:
+    """An empty, correctly-shaped OHLCV frame — "the provider had no rows"."""
+    empty = pd.DataFrame(columns=_COLUMNS)
+    empty.index.name = "ts"
+    return empty
 
 
 def _default_fetch(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
-    """Fetch adjusted daily bars from yfinance (the network path)."""
+    """Fetch adjusted daily bars from yfinance (the network path).
+
+    An empty response is returned as an **empty frame, not an exception**
+    (ADR-0032): ``yf.download`` signals a genuine failure (transport, auth) by
+    raising, so an empty-but-successful response means only that the provider has
+    no rows for this symbol in this window — a stock that had not listed yet, or a
+    fold whose span predates the listing. That is data, and the engine reports it;
+    raising here aborted whole multi-decade sweeps over one late-listing symbol.
+    """
     import yfinance as yf
 
     raw = yf.download(
@@ -49,7 +65,7 @@ def _default_fetch(symbol: str, start: datetime, end: datetime) -> pd.DataFrame:
         progress=False,
     )
     if raw is None or raw.empty:
-        raise DataUnavailableError(f"yfinance returned no data for {symbol!r}")
+        return _empty_frame()
 
     df = raw.copy()
     if isinstance(df.columns, pd.MultiIndex):

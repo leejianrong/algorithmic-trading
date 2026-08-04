@@ -34,6 +34,8 @@ from trading.sizing import size
 from trading.types import SHARE_EPS, Bar, Fill, Order, Portfolio, TargetWeight
 
 if TYPE_CHECKING:
+    from collections.abc import Sequence
+
     from trading.clock import Clock
 
 # A single timestamp's bars across the universe, and the whole ordered feed.
@@ -53,6 +55,115 @@ def build_feed(series: dict[str, list[Bar]]) -> Feed:
         for bar in bars:
             by_ts[bar.ts][symbol] = bar
     return [(ts, by_ts[ts]) for ts in sorted(by_ts)]
+
+
+# Why a requested symbol contributed nothing to a run (ADR-0032). Plain strings so
+# they survive a round trip through a CSV/JSON report unchanged, matching the
+# reason codes in ``trading.universe``.
+REASON_NO_BARS = "no_bars_in_range"
+REASON_FETCH_FAILED = "fetch_failed"
+
+ABSENT_REASONS: frozenset[str] = frozenset({REASON_NO_BARS, REASON_FETCH_FAILED})
+
+
+class EmptyUniverseError(Exception):
+    """Not one requested symbol yielded a bar, so there is nothing to backtest.
+
+    Raised instead of returning a vacuous zero-return result. A universe where
+    *every* symbol is absent is a mistyped ticker list, a wrong date range, or a
+    broken data source — never a legitimate run (ADR-0032). Partial absence is
+    tolerated and reported; total absence is an error.
+    """
+
+
+@dataclass(frozen=True, slots=True)
+class AbsentSymbol:
+    """A requested symbol that contributed no bars, and why (ADR-0032).
+
+    ``reason`` is one of :data:`ABSENT_REASONS` (machine-readable); ``detail`` is
+    the human sentence a report prints. Every excluded symbol produces one of
+    these — a universe is never silently shrunk, because a silently shrunk
+    universe is indistinguishable from a typo in ``--symbols``.
+
+    :data:`REASON_NO_BARS` and :data:`REASON_FETCH_FAILED` are kept apart on
+    purpose: "this symbol had not listed yet" and "we could not ask" are different
+    facts, and only the second suggests something is broken.
+    """
+
+    symbol: str
+    reason: str
+    detail: str
+
+    def __post_init__(self) -> None:
+        if not self.symbol:
+            raise ValueError("AbsentSymbol.symbol must be a non-empty ticker")
+        if self.reason not in ABSENT_REASONS:
+            known = ", ".join(sorted(ABSENT_REASONS))
+            raise ValueError(f"unknown absent reason {self.reason!r}; known reasons: {known}")
+        if not self.detail:
+            raise ValueError(f"AbsentSymbol.detail must explain why {self.symbol} was absent")
+
+
+def load_series(
+    adapter: DataAdapter,
+    symbols: Sequence[str],
+    start: datetime,
+    end: datetime,
+) -> tuple[dict[str, list[Bar]], list[AbsentSymbol]]:
+    """Fetch each symbol's bars, tolerating and *reporting* the ones with none.
+
+    Returns ``(series, absent)`` where ``series`` holds only the symbols that
+    actually produced bars, and ``absent`` records every one that did not. A
+    symbol whose lookup raises is caught per symbol, so one bad ticker never
+    aborts a whole universe — the same treatment
+    :func:`trading.liquidity.screen_by_adv` and
+    :func:`trading.universe.validate_universe` already give their inputs.
+
+    This exists because a multi-decade backtest over a real universe *must*
+    tolerate members that do not span the whole range (ADR-0032): a 2000-2020 run
+    of today's mega-caps has no META before 2012, and a fetch for an earlier
+    walk-forward fold legitimately returns nothing. Before this, one such symbol
+    raised and killed the entire sweep.
+
+    Duplicate symbols are collapsed to their first occurrence (one fetch each) and
+    input order is preserved, so the result is deterministic.
+
+    ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``) is never caught.
+    """
+    series: dict[str, list[Bar]] = {}
+    absent: list[AbsentSymbol] = []
+    seen: set[str] = set()
+
+    for symbol in symbols:
+        if symbol in seen:
+            continue
+        seen.add(symbol)
+        try:
+            bars = adapter.get_bars(symbol, start, end)
+        except Exception as exc:  # one bad symbol must never abort the whole universe
+            absent.append(
+                AbsentSymbol(
+                    symbol=symbol,
+                    reason=REASON_FETCH_FAILED,
+                    detail=f"data lookup failed ({type(exc).__name__}: {exc})",
+                )
+            )
+            continue
+        if not bars:
+            absent.append(
+                AbsentSymbol(
+                    symbol=symbol,
+                    reason=REASON_NO_BARS,
+                    detail=(
+                        f"no bars in {start.date()}..{end.date()} — "
+                        "not listed in this window, or the source has no history"
+                    ),
+                )
+            )
+            continue
+        series[symbol] = bars
+
+    return series, absent
 
 
 @runtime_checkable
@@ -122,6 +233,21 @@ class BacktestResult:
     halted: bool = False
     halt_ts: datetime | None = None
     halt_reason: str | None = None
+    # Requested symbols that contributed no bars, with the reason each (ADR-0032).
+    # ``symbols`` stays the *requested* universe so existing reports are unchanged;
+    # :attr:`traded_symbols` is the set that actually had data.
+    absent: list[AbsentSymbol] = field(default_factory=list)
+
+    @property
+    def traded_symbols(self) -> list[str]:
+        """Requested symbols that actually contributed bars, in request order.
+
+        ``symbols`` is what the caller asked for; this is what the run could
+        actually see. They differ whenever :attr:`absent` is non-empty, and a
+        report that quotes only the former overstates the universe.
+        """
+        missing = {a.symbol for a in self.absent}
+        return [s for s in self.symbols if s not in missing]
 
     @property
     def final_equity(self) -> float:
@@ -189,14 +315,26 @@ class Engine:
         start: datetime,
         end: datetime,
     ) -> BacktestResult:
-        """Backtest ``strategy`` over ``[start, end]`` — build the feed and iterate."""
-        series = {s: self._adapter.get_bars(s, start, end) for s in symbols}
+        """Backtest ``strategy`` over ``[start, end]`` — build the feed and iterate.
+
+        Symbols with no bars in the range are excluded and reported on
+        :attr:`BacktestResult.absent` rather than aborting the run (ADR-0032); if
+        *every* symbol is absent, :class:`EmptyUniverseError` is raised instead of
+        returning a vacuous result.
+        """
+        series, absent = load_series(self._adapter, symbols, start, end)
+        if not series:
+            detail = "; ".join(f"{a.symbol}: {a.detail}" for a in absent)
+            raise EmptyUniverseError(
+                f"no bars for any of {len(absent)} requested symbol(s) in "
+                f"{start.date()}..{end.date()} — {detail}"
+            )
         feed = build_feed(series)
 
         state = _RunState(starting_cash=self._broker.portfolio.cash)
         for ts, bars in feed:
             self._step(strategy, ts, bars, state)
-        return self._finalize(symbols, state)
+        return self._finalize(symbols, state, absent=absent)
 
     def _step(
         self,
@@ -279,12 +417,22 @@ class Engine:
             exposure=exposure,
         )
 
-    def _finalize(self, symbols: list[str], state: _RunState) -> BacktestResult:
+    def _finalize(
+        self,
+        symbols: list[str],
+        state: _RunState,
+        *,
+        absent: list[AbsentSymbol] | None = None,
+    ) -> BacktestResult:
         """Assemble a :class:`BacktestResult` from the accumulated run state.
 
         The broker's own rejections (underfunded buys, oversells) are merged in
         here, after the guardrail rejections gathered per bar — exactly the order
         the pre-refactor ``run`` produced, so results stay byte-identical.
+
+        ``absent`` carries the symbols that yielded no bars (ADR-0032); it defaults
+        to empty so the paper driver, which resolves its own universe from a live
+        feed, is unaffected.
         """
         rejections = list(state.rejections)
         rejections.extend(getattr(self._broker, "rejections", []))
@@ -299,6 +447,7 @@ class Engine:
             halted=state.halt_ts is not None,
             halt_ts=state.halt_ts,
             halt_reason=getattr(self._guardrails, "halt_reason", None),
+            absent=list(absent) if absent else [],
         )
 
 
