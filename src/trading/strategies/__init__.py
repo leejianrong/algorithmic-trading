@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 from trading.interfaces import Strategy
 from trading.strategies.buy_and_hold import BuyAndHold
+from trading.strategies.cross_sectional import CrossSectional
 from trading.strategies.equal_weight import EqualWeight
 from trading.strategies.mean_reversion import MeanReversion
 from trading.strategies.momentum import Momentum
@@ -23,6 +24,7 @@ STRATEGIES: dict[str, Callable[[], Strategy]] = {
     "equal_weight": EqualWeight,
     "momentum": Momentum,
     "mean_reversion": MeanReversion,
+    "cross_sectional": CrossSectional,
 }
 
 
