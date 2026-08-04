@@ -198,6 +198,44 @@ class TestExposureHelpers:
         assert peak_exposure([]) == 0.0
 
 
+class TestPeriodsPerYear:
+    """ADR-0022: annualization scales with periods_per_year; 252.0 is the default."""
+
+    curve: ClassVar[list[EquityPoint]] = _curve([100.0, 110.0, 104.5, 125.4])
+
+    def test_default_matches_252(self) -> None:
+        # The explicit daily basis reproduces the default exactly (no behaviour drift).
+        assert sharpe(self.curve) == pytest.approx(sharpe(self.curve, 252.0))
+        assert annualized_return(self.curve) == pytest.approx(annualized_return(self.curve, 252.0))
+
+    def test_sharpe_scales_by_sqrt_of_periods(self) -> None:
+        # Sharpe annualizes by √periods_per_year, so the ratio of two bases is the
+        # ratio of their square roots — independent of the return series.
+        daily = sharpe(self.curve, 252.0)
+        hourly_ppy = 252.0 * 6.5  # a 1-hour bar
+        assert sharpe(self.curve, hourly_ppy) == pytest.approx(daily * sqrt(hourly_ppy / 252.0))
+
+    def test_intraday_sharpe_differs_from_daily(self) -> None:
+        assert sharpe(self.curve, 252.0 * 6.5) != pytest.approx(sharpe(self.curve, 252.0))
+
+    def test_compute_threads_periods_per_year(self) -> None:
+        from trading.engine import BacktestResult
+        from trading.types import Portfolio
+
+        result = BacktestResult(
+            symbols=["A"],
+            starting_cash=100.0,
+            equity_curve=self.curve,
+            final_portfolio=Portfolio(cash=125.4),
+        )
+        hourly_ppy = 252.0 * 6.5
+        metrics = compute(result, periods_per_year=hourly_ppy)
+        assert metrics.sharpe == pytest.approx(sharpe(self.curve, hourly_ppy))
+        assert metrics.annualized_return == pytest.approx(annualized_return(self.curve, hourly_ppy))
+        # The default still reproduces the daily numbers.
+        assert compute(result).sharpe == pytest.approx(sharpe(self.curve, 252.0))
+
+
 class TestCompute:
     def test_assembles_metrics_from_result(self) -> None:
         from trading.engine import BacktestResult

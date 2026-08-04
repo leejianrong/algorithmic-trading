@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 from trading.types import SHARE_EPS, Bar, Side
@@ -81,6 +81,17 @@ class AlpacaClient(Protocol):
         """Daily bars for ``symbol`` in ``[start, end]``, ascending by time.
 
         ``adjusted`` selects split/dividend-adjusted vs raw prices (ADR-0008).
+        """
+        ...
+
+    def get_bars(
+        self, symbol: str, start: datetime, end: datetime, *, adjusted: bool, interval: timedelta
+    ) -> list[Bar]:
+        """Bars for ``symbol`` in ``[start, end]`` at the given ``interval`` (ADR-0022).
+
+        The interval selects the bar cadence (daily or intraday); ``get_daily_bars``
+        is the ``interval == 1 day`` special case. Bars are ascending by time with
+        START timestamps, ``adjusted`` selecting adjusted vs raw prices (ADR-0008).
         """
         ...
 
@@ -172,6 +183,23 @@ class FakeAlpacaClient:
 
         The fake stores whatever bars it was given, so ``adjusted`` is accepted
         for signature parity but does not re-derive prices.
+        """
+        return [b for b in self._bars.get(symbol, []) if start <= b.ts <= end]
+
+    def get_bars(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        adjusted: bool = True,
+        interval: timedelta = timedelta(days=1),
+    ) -> list[Bar]:
+        """Return supplied bars for ``symbol`` within ``[start, end]`` inclusive.
+
+        The fake serves back exactly the bars it was constructed with (their own
+        timestamps carry the real cadence), so ``interval`` and ``adjusted`` are
+        accepted for signature parity but do not re-derive or re-bucket prices.
         """
         return [b for b in self._bars.get(symbol, []) if start <= b.ts <= end]
 
@@ -312,6 +340,51 @@ class RealAlpacaClient:
         )
         response = self._data.get_stock_bars(request)
         rows: list[Any] = response.data.get(symbol, [])
+        return self._rows_to_bars(symbol, rows)
+
+    def get_bars(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        adjusted: bool = True,
+        interval: timedelta = timedelta(days=1),
+    ) -> list[Bar]:  # pragma: no cover - needs the alpaca-py SDK and the network
+        from alpaca.data.enums import Adjustment
+        from alpaca.data.requests import StockBarsRequest
+
+        request = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=self._to_timeframe(interval),
+            start=start,
+            end=end,
+            adjustment=Adjustment.ALL if adjusted else Adjustment.RAW,
+        )
+        response = self._data.get_stock_bars(request)
+        rows: list[Any] = response.data.get(symbol, [])
+        return self._rows_to_bars(symbol, rows)
+
+    @staticmethod
+    def _to_timeframe(interval: timedelta) -> Any:  # pragma: no cover - needs the SDK
+        """Map a bar ``interval`` to an alpaca-py ``TimeFrame`` (ADR-0022).
+
+        A day-or-longer interval is ``TimeFrame.Day``; an hour-multiple maps to
+        ``TimeFrameUnit.Hour``; anything finer maps to whole-minute
+        ``TimeFrameUnit.Minute`` bars.
+        """
+        from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
+
+        if interval >= timedelta(days=1):
+            return TimeFrame.Day
+        total_minutes = int(interval.total_seconds() // 60)
+        if total_minutes >= 60 and total_minutes % 60 == 0:
+            return TimeFrame(total_minutes // 60, TimeFrameUnit.Hour)
+        return TimeFrame(total_minutes, TimeFrameUnit.Minute)
+
+    @staticmethod
+    def _rows_to_bars(symbol: str, rows: list[Any]) -> list[Bar]:  # pragma: no cover - SDK only
+        """Convert SDK bar rows into our :class:`~trading.types.Bar`, ascending by time."""
         bars = [
             Bar(
                 symbol=symbol,

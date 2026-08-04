@@ -21,8 +21,9 @@ from trading.broker import SimulatedBroker
 from trading.clock import FakeClock, ImmediateClock
 from trading.config import CostConfig, RiskConfig
 from trading.data.fake import FakeAdapter
-from trading.data.recent_window import RecentWindowFeed
+from trading.data.recent_window import RecentWindowFeed, interval_is_complete
 from trading.engine import BacktestResult, Engine, PaperSession
+from trading.frequency import DAILY, Frequency
 from trading.interfaces import Strategy, StrategyContext
 from trading.risk import Guardrails
 from trading.types import Bar, Order, Portfolio, Side, TargetWeight
@@ -30,8 +31,8 @@ from trading.types import Bar, Order, Portfolio, Side, TargetWeight
 _ZERO_COST = CostConfig(commission_per_share=0.0, slippage_bps=0.0)
 
 
-def _ts(day: int, hour: int = 0) -> datetime:
-    return datetime(2024, 1, day, hour, tzinfo=UTC)
+def _ts(day: int, hour: int = 0, minute: int = 0) -> datetime:
+    return datetime(2024, 1, day, hour, minute, tzinfo=UTC)
 
 
 def _bar(symbol: str, day: int, o: float, c: float) -> Bar:
@@ -297,3 +298,98 @@ class TestSleepAndPolling:
         session.run(max_new_bars=3)
 
         assert len(session.session_log) == 3
+
+
+def _session_with_clock(
+    clock: FakeClock,
+    *,
+    poll_interval: timedelta | None = None,
+    frequency: Frequency | None = None,
+) -> PaperSession:
+    broker = SimulatedBroker(Portfolio(cash=1_000.0), _ZERO_COST)
+    engine = Engine(FakeAdapter([]), broker, Guardrails(RiskConfig.unlimited()))
+    feed = RecentWindowFeed(FakeAdapter([]), clock)
+    return PaperSession(
+        engine,
+        _ScriptedWeights("AAA", []),
+        ["AAA"],
+        feed,
+        clock,
+        poll_interval=poll_interval,
+        frequency=frequency,
+    )
+
+
+class TestCadence:
+    """ADR-0022: _next_due generalizes to interval boundaries; daily is unchanged."""
+
+    def test_daily_default_is_start_of_next_day(self) -> None:
+        # Byte-compatible with V5: mid-session on D=5 → next due is D=6 00:00 UTC.
+        clock = FakeClock(_ts(5, hour=15))
+        session = _session_with_clock(clock)  # default poll_interval → 1 day
+        assert session._next_due() == _ts(6)
+
+    def test_daily_at_midnight_advances_a_full_day(self) -> None:
+        # Strictly-after: standing exactly on a boundary rolls to the next one.
+        clock = FakeClock(_ts(5))
+        session = _session_with_clock(clock)
+        assert session._next_due() == _ts(6)
+
+    def test_frequency_sets_the_poll_interval(self) -> None:
+        # An hourly frequency (no explicit poll_interval) → next hour boundary.
+        clock = FakeClock(_ts(5, hour=13, minute=45))
+        session = _session_with_clock(clock, frequency=Frequency.parse("1h"))
+        assert session._next_due() == _ts(5, hour=14)
+
+    def test_sub_daily_boundary_is_strictly_after_now(self) -> None:
+        clock = FakeClock(_ts(5, hour=14, minute=30))  # exactly on a 30m boundary
+        session = _session_with_clock(clock, poll_interval=timedelta(minutes=30))
+        assert session._next_due() == _ts(5, hour=15)  # the next one, not this one
+
+    def test_explicit_poll_interval_beats_frequency(self) -> None:
+        clock = FakeClock(_ts(5, hour=13, minute=10))
+        session = _session_with_clock(clock, poll_interval=timedelta(minutes=5), frequency=DAILY)
+        assert session._next_due() == _ts(5, hour=13, minute=15)
+
+
+class TestIntradayParity:
+    """Backtest and paper stay identical on intraday bars under the interval gate."""
+
+    def test_paper_matches_backtest_on_intraday_bars(self) -> None:
+        # Four 1-hour bars on one day; START timestamps 13:30..16:30.
+        def _hbar(hour: int, o: float, c: float) -> Bar:
+            ts = datetime(2024, 1, 2, hour, 30, tzinfo=UTC)
+            return Bar("AAA", ts, o, max(o, c), min(o, c), c, 1_000)
+
+        bars = [_hbar(13, 100, 101), _hbar(14, 101, 102), _hbar(15, 102, 100), _hbar(16, 100, 103)]
+        weights: list[float | None] = [0.2, None, 0.1, None]
+        risk = RiskConfig(max_position_pct=0.25, max_gross_exposure=1.0, max_drawdown_pct=1.0)
+        interval = timedelta(hours=1)
+
+        bt_broker = SimulatedBroker(Portfolio(cash=1_000.0), _ZERO_COST)
+        bt_engine = Engine(FakeAdapter(bars), bt_broker, Guardrails(risk))
+        backtest = bt_engine.run(
+            _ScriptedWeights("AAA", weights),
+            ["AAA"],
+            datetime(2024, 1, 2, tzinfo=UTC),
+            datetime(2024, 1, 3, tzinfo=UTC),
+        )
+
+        # Clock parked after the last bar's close → all four read complete at once.
+        clock = FakeClock(datetime(2024, 1, 2, 18, tzinfo=UTC))
+        broker = SimulatedBroker(Portfolio(cash=1_000.0), _ZERO_COST)
+        engine = Engine(FakeAdapter(bars), broker, Guardrails(risk))
+        feed = RecentWindowFeed(FakeAdapter(bars), clock, interval_is_complete(interval))
+        session = PaperSession(
+            engine,
+            _ScriptedWeights("AAA", weights),
+            ["AAA"],
+            feed,
+            clock,
+            frequency=Frequency.parse("1h"),
+            lookback=1_000,
+        )
+        paper = session.run(max_empty_polls=1)
+
+        _assert_parity(backtest, paper)
+        assert len(session.session_log) == 4

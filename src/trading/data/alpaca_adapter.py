@@ -22,22 +22,38 @@ import is deferred, so importing this module never requires credentials or
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 
 from trading.data.alpaca_client import AlpacaClient
 from trading.types import Bar
 
 
 class AlpacaAdapter:
-    """Serves adjusted daily bars from Alpaca through the client seam."""
+    """Serves adjusted bars from Alpaca through the client seam.
 
-    def __init__(self, client: AlpacaClient | None = None, *, adjusted: bool = True) -> None:
+    The bar cadence is fixed at construction by ``interval`` (default one day, the
+    original daily behaviour). A daily interval routes to
+    :meth:`AlpacaClient.get_daily_bars` so the daily path is byte-identical to
+    before; a sub-daily interval routes to the interval-aware
+    :meth:`AlpacaClient.get_bars` (ADR-0022). Either way the returned bars satisfy
+    the daily-shaped :class:`~trading.interfaces.DataAdapter` protocol — the
+    interval is an adapter property, never a ``get_bars`` argument.
+    """
+
+    def __init__(
+        self,
+        client: AlpacaClient | None = None,
+        *,
+        adjusted: bool = True,
+        interval: timedelta = timedelta(days=1),
+    ) -> None:
         if client is None:
             from trading.data.alpaca_client import RealAlpacaClient
 
             client = RealAlpacaClient()
         self._client = client
         self._adjusted = adjusted
+        self._interval = interval
 
     def get_bars(
         self,
@@ -47,17 +63,24 @@ class AlpacaAdapter:
         *,
         adjusted: bool | None = None,
     ) -> list[Bar]:
-        """Return ``symbol``'s daily bars in ``[start, end]``, ascending by time.
+        """Return ``symbol``'s bars in ``[start, end]``, ascending by time.
 
         The per-call ``adjusted`` keyword controls the fetch (ADR-0021): pass
         ``True`` for split/dividend-adjusted total-return prices (the backtest
-        feed) or ``False`` for RAW actual quotes (the paper/live feed). When it is
-        omitted the constructor default applies. The seam already returns
-        ascending, range-filtered bars; we re-filter and sort here defensively
-        (both cheap).
+        feed) or ``False`` for RAW actual quotes (the paper/live feed); when it is
+        omitted the constructor default applies. The construction-time ``interval``
+        selects the cadence (ADR-0022): a daily interval uses ``get_daily_bars``
+        (byte-identical to before); a sub-daily one uses the interval-aware
+        ``get_bars``. Either seam already returns ascending, range-filtered bars;
+        we re-filter and sort here defensively (both cheap).
         """
         effective = self._adjusted if adjusted is None else adjusted
-        bars = self._client.get_daily_bars(symbol, start, end, adjusted=effective)
+        if self._interval >= timedelta(days=1):
+            bars = self._client.get_daily_bars(symbol, start, end, adjusted=effective)
+        else:
+            bars = self._client.get_bars(
+                symbol, start, end, adjusted=effective, interval=self._interval
+            )
         filtered = [b for b in bars if start <= b.ts <= end]
         filtered.sort(key=lambda b: b.ts)
         return filtered

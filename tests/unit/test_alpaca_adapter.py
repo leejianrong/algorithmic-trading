@@ -118,3 +118,66 @@ def test_per_call_flag_overrides_the_constructor_default() -> None:
     assert [b.close for b in adapter.get_bars("AAPL", _WIDE_START, _WIDE_END, adjusted=True)] == [
         10.0
     ]
+
+
+class _IntervalRecordingClient(FakeAlpacaClient):
+    """Records which seam method served the last call and the interval it saw."""
+
+    last_method: str | None = None
+    last_interval: timedelta | None = None
+
+    def get_daily_bars(
+        self, symbol: str, start: datetime, end: datetime, *, adjusted: bool = True
+    ) -> list[Bar]:
+        self.last_method = "get_daily_bars"
+        self.last_interval = None
+        return super().get_daily_bars(symbol, start, end, adjusted=adjusted)
+
+    def get_bars(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        *,
+        adjusted: bool = True,
+        interval: timedelta = timedelta(days=1),
+    ) -> list[Bar]:
+        self.last_method = "get_bars"
+        self.last_interval = interval
+        return super().get_bars(symbol, start, end, adjusted=adjusted, interval=interval)
+
+
+def _intraday_series(symbol: str, closes: list[float]) -> list[Bar]:
+    """Hourly bars on 2026-01-02, START timestamps 13:30, 14:30, ..."""
+    base = datetime(2026, 1, 2, 13, 30, tzinfo=UTC)
+    return [
+        Bar(symbol, base + timedelta(hours=i), c, c, c, c, volume=1_000)
+        for i, c in enumerate(closes)
+    ]
+
+
+def test_default_interval_routes_through_get_daily_bars() -> None:
+    client = _IntervalRecordingClient({"AAPL": _series("AAPL", [100.0, 101.0])})
+    AlpacaAdapter(client).get_bars("AAPL", _WIDE_START, _WIDE_END)
+    assert client.last_method == "get_daily_bars"
+
+
+def test_intraday_interval_routes_through_get_bars_with_the_interval() -> None:
+    bars = _intraday_series("AAPL", [100.0, 101.0, 102.0])
+    client = _IntervalRecordingClient({"AAPL": bars})
+    adapter = AlpacaAdapter(client, interval=timedelta(hours=1))
+
+    got = adapter.get_bars("AAPL", _WIDE_START, _WIDE_END)
+
+    assert client.last_method == "get_bars"
+    assert client.last_interval == timedelta(hours=1)
+    assert got == bars  # the fake serves the intraday bars it was given, ascending
+
+
+def test_fake_get_bars_serves_intraday_bars_in_range() -> None:
+    bars = _intraday_series("AAPL", [100.0, 101.0, 102.0, 103.0])
+    client = FakeAlpacaClient({"AAPL": bars})
+    start = datetime(2026, 1, 2, 14, 30, tzinfo=UTC)
+    end = datetime(2026, 1, 2, 15, 30, tzinfo=UTC)
+    got = client.get_bars("AAPL", start, end, adjusted=True, interval=timedelta(hours=1))
+    assert [b.close for b in got] == [101.0, 102.0]

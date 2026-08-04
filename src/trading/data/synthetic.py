@@ -1,12 +1,20 @@
 """Deterministic synthetic price data — an offline :class:`DataAdapter` (ADR-0012).
 
-Generates geometric-Brownian-motion daily bars so the engine, strategies, and CLI
-can be exercised end to end without a network or a real provider. Given the same
-seed, symbol, and date range it produces byte-identical bars, so synthetic
-backtests are reproducible (a domain requirement). There are no corporate actions
-to model, so raw == adjusted (ADR-0021): the per-call ``adjusted`` flag does not
-change the numbers, and the same series drives both the adjusted backtest feed
-(ADR-0008) and the raw paper feed.
+Generates geometric-Brownian-motion bars so the engine, strategies, and CLI can be
+exercised end to end without a network or a real provider. Given the same seed,
+symbol, and date range it produces byte-identical bars, so synthetic backtests are
+reproducible (a domain requirement). There are no corporate actions to model, so
+raw == adjusted (ADR-0021): the per-call ``adjusted`` flag does not change the
+numbers, and the same series drives both the adjusted backtest feed (ADR-0008) and
+the raw paper feed.
+
+The bar cadence is a construction-time :class:`~trading.frequency.Frequency`
+(default :data:`~trading.frequency.DAILY`, so existing behaviour and numbers are
+unchanged, ADR-0022). Daily bars are stamped at midnight UTC, one per weekday.
+Intraday bars are stamped at their START time (ADR-0022 convention) and spaced by
+the interval across a nominal regular session — 13:30-20:00 UTC (9:30-16:00 ET) —
+for each trading weekday in the range. GBM drift and vol are scaled to the bar via
+the frequency's ``periods_per_year``, so the annualized shape is frequency-stable.
 """
 
 from __future__ import annotations
@@ -16,11 +24,16 @@ import math
 import random
 from collections.abc import Iterator
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, time, timedelta
 
+from trading.frequency import DAILY, Frequency
 from trading.types import Bar
 
-_TRADING_DAYS_PER_YEAR = 252
+# Nominal regular US-equity cash session in UTC: 13:30-20:00 = 9:30-16:00 ET.
+# Intraday bars start at SESSION_OPEN and step by the interval while strictly
+# before SESSION_CLOSE (a bar whose start reaches the close is not emitted).
+_SESSION_OPEN = time(13, 30, tzinfo=UTC)
+_SESSION_CLOSE = time(20, 0, tzinfo=UTC)
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,12 +70,47 @@ def _trading_days(start: datetime, end: datetime) -> Iterator[datetime]:
         day += timedelta(days=1)
 
 
-class SyntheticAdapter:
-    """A :class:`~trading.interfaces.DataAdapter` that fabricates GBM bars."""
+def _intraday_starts(start: datetime, end: datetime, interval: timedelta) -> Iterator[datetime]:
+    """Bar START times spaced by ``interval`` within each trading day's session.
 
-    def __init__(self, seed: int = 0, params: SyntheticParams | None = None) -> None:
+    For every weekday in ``[start, end]`` (via :func:`_trading_days`), step from
+    the session open by ``interval`` while the start is strictly before the
+    session close, so a bar's whole ``[ts, ts + interval)`` window is not required
+    to fit — only its start must land inside the session (ADR-0022).
+    """
+    for day in _trading_days(start, end):
+        session_open = datetime.combine(day.date(), _SESSION_OPEN)
+        session_close = datetime.combine(day.date(), _SESSION_CLOSE)
+        ts = session_open
+        while ts < session_close:
+            yield ts
+            ts += interval
+
+
+class SyntheticAdapter:
+    """A :class:`~trading.interfaces.DataAdapter` that fabricates GBM bars.
+
+    The bar cadence is fixed at construction by ``frequency`` (default
+    :data:`~trading.frequency.DAILY`); daily construction is byte-identical to the
+    original generator (ADR-0022).
+    """
+
+    def __init__(
+        self,
+        seed: int = 0,
+        params: SyntheticParams | None = None,
+        *,
+        frequency: Frequency = DAILY,
+    ) -> None:
         self._seed = seed
         self._params = params or SyntheticParams()
+        self._frequency = frequency
+
+    def _bar_starts(self, start: datetime, end: datetime) -> Iterator[datetime]:
+        """Bar START timestamps for this adapter's frequency over ``[start, end]``."""
+        if self._frequency.is_intraday:
+            return _intraday_starts(start, end, self._frequency.delta)
+        return _trading_days(start, end)
 
     def get_bars(
         self,
@@ -81,17 +129,20 @@ class SyntheticAdapter:
         """
         p = self._params
         rng = random.Random(_symbol_seed(symbol, self._seed))
-        mu_daily = p.annual_drift / _TRADING_DAYS_PER_YEAR
-        sigma_daily = p.annual_vol / math.sqrt(_TRADING_DAYS_PER_YEAR)
+        # Scale drift/vol to one bar via the frequency's annualization factor; for
+        # DAILY this is 252.0, reproducing the original per-day step exactly.
+        periods = self._frequency.periods_per_year
+        mu_bar = p.annual_drift / periods
+        sigma_bar = p.annual_vol / math.sqrt(periods)
 
         # A per-symbol starting price so a multi-symbol universe isn't identical.
         prev_close = p.base_price * (0.5 + rng.random())
         bars: list[Bar] = []
-        for ts in _trading_days(start, end):
-            close = prev_close * math.exp(rng.normalvariate(mu_daily, sigma_daily))
-            open_ = prev_close * math.exp(rng.normalvariate(0.0, sigma_daily * 0.5))
-            high = max(open_, close) * (1.0 + abs(rng.normalvariate(0.0, sigma_daily * 0.5)))
-            low = min(open_, close) * (1.0 - abs(rng.normalvariate(0.0, sigma_daily * 0.5)))
+        for ts in self._bar_starts(start, end):
+            close = prev_close * math.exp(rng.normalvariate(mu_bar, sigma_bar))
+            open_ = prev_close * math.exp(rng.normalvariate(0.0, sigma_bar * 0.5))
+            high = max(open_, close) * (1.0 + abs(rng.normalvariate(0.0, sigma_bar * 0.5)))
+            low = min(open_, close) * (1.0 - abs(rng.normalvariate(0.0, sigma_bar * 0.5)))
             volume = int(p.base_volume * (0.5 + rng.random()))
             bars.append(
                 Bar(
