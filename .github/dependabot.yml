@@ -1,0 +1,56 @@
+# Dependency update cadence (dev-playbook principle 14). Lockfiles are committed
+# and CI installs frozen, so nothing updates unless a PR lands — this is what
+# opens those PRs. Weekly, grouped, and capped so the queue stays reviewable.
+version: 2
+
+updates:
+  # Python deps resolved through uv.lock. Dependabot updates the lockfile itself,
+  # so a merged PR keeps `uv sync --frozen` reproducible.
+  - package-ecosystem: "uv"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 5
+    groups:
+      # Dev tooling moves fast and is low-risk: one PR for the whole group.
+      dev-tooling:
+        patterns:
+          - "ruff"
+          - "mypy"
+          - "pytest*"
+          - "pip-audit"
+          - "pandas-stubs"
+      # Runtime deps carry real behavioural risk (yfinance especially — a
+      # changed adjustment or schema can silently corrupt backtest numbers), so
+      # patch/minor group together and majors stay separate for review.
+      runtime-minor:
+        patterns:
+          - "*"
+        exclude-patterns:
+          - "ruff"
+          - "mypy"
+          - "pytest*"
+          - "pip-audit"
+          - "pandas-stubs"
+        update-types:
+          - "minor"
+          - "patch"
+    labels:
+      - "dependencies"
+
+  # Keep pinned CI actions current so a runner runtime deprecation surfaces as a
+  # PR rather than as a warning nobody acts on.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 3
+    groups:
+      actions:
+        patterns:
+          - "*"
+    labels:
+      - "dependencies"
+      - "ci"
