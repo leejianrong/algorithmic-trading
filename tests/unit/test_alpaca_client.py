@@ -17,6 +17,7 @@ from trading.data.alpaca_client import (
     AccountSnapshot,
     AlpacaClient,
     AlpacaOrder,
+    AssetInfo,
     FakeAlpacaClient,
     PositionSnapshot,
 )
@@ -180,3 +181,74 @@ class TestDtos:
         assert (order.id, order.symbol, order.side) == ("1", "AAPL", Side.BUY)
         assert AccountSnapshot(cash=1.0, equity=2.0).equity == 2.0
         assert PositionSnapshot("AAPL", 3.0, 4.0).avg_price == 4.0
+
+
+class TestAssetInfo:
+    """The asset-metadata DTO (ADR-0028) — our own type, never an SDK model."""
+
+    def test_fields_and_descriptive_defaults(self) -> None:
+        asset = AssetInfo(symbol="AAPL", tradable=True, fractionable=True)
+        assert (asset.symbol, asset.tradable, asset.fractionable) == ("AAPL", True, True)
+        # Descriptive fields are optional; absent means empty/False, not unknown-truthy.
+        assert (asset.exchange, asset.name, asset.shortable) == ("", "", False)
+
+    def test_reports_broker_flags_verbatim(self) -> None:
+        # An untradable-but-fractionable answer is preserved, not "fixed up" into
+        # a tidier combination — the broker's answer is the fact.
+        asset = AssetInfo(symbol="XYZ", tradable=False, fractionable=True)
+        assert asset.tradable is False
+        assert asset.fractionable is True
+
+    def test_empty_symbol_rejected(self) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            AssetInfo(symbol="", tradable=True, fractionable=True)
+
+    def test_whitespace_symbol_rejected(self) -> None:
+        with pytest.raises(ValueError, match="whitespace"):
+            AssetInfo(symbol="AA PL", tradable=True, fractionable=True)
+        with pytest.raises(ValueError, match="whitespace"):
+            AssetInfo(symbol=" AAPL", tradable=True, fractionable=True)
+
+    def test_frozen(self) -> None:
+        asset = AssetInfo(symbol="AAPL", tradable=True, fractionable=True)
+        with pytest.raises(AttributeError):
+            asset.tradable = False  # type: ignore[misc]
+
+
+class TestGetAsset:
+    """``get_asset`` is part of the seam and the fake scripts every answer."""
+
+    def test_protocol_includes_get_asset(self) -> None:
+        client = FakeAlpacaClient()
+        assert isinstance(client, AlpacaClient)
+        assert hasattr(AlpacaClient, "get_asset")
+
+    def test_default_asset_is_tradable_and_fractionable(self) -> None:
+        asset = FakeAlpacaClient().get_asset("AAPL")
+        assert (asset.symbol, asset.tradable, asset.fractionable) == ("AAPL", True, True)
+
+    def test_set_asset_scripts_flags(self) -> None:
+        client = FakeAlpacaClient()
+        client.set_asset("BRK.A", fractionable=False)
+        client.set_asset("HALT", tradable=False)
+
+        assert client.get_asset("BRK.A").fractionable is False
+        assert client.get_asset("BRK.A").tradable is True  # only the named flag moves
+        assert client.get_asset("HALT").tradable is False
+
+    def test_assets_can_be_supplied_at_construction(self) -> None:
+        supplied = AssetInfo(symbol="AAPL", tradable=True, fractionable=False, name="Apple Inc.")
+        client = FakeAlpacaClient(assets={"AAPL": supplied})
+        assert client.get_asset("AAPL") == supplied
+
+    def test_set_asset_failure_raises_lookup_error(self) -> None:
+        client = FakeAlpacaClient()
+        client.set_asset_failure("BOGUS", "asset not found")
+        with pytest.raises(LookupError, match="asset not found"):
+            client.get_asset("BOGUS")
+
+    def test_set_asset_clears_a_previous_failure(self) -> None:
+        client = FakeAlpacaClient()
+        client.set_asset_failure("AAPL")
+        client.set_asset("AAPL")
+        assert client.get_asset("AAPL").tradable is True
