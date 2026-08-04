@@ -17,14 +17,17 @@ from pathlib import Path
 import typer
 
 from trading.broker import SimulatedBroker
+from trading.brokers.alpaca import AlpacaBroker
 from trading.clock import FakeClock, WallClock
 from trading.config import RiskConfig
+from trading.data.alpaca_adapter import AlpacaAdapter
+from trading.data.csv_adapter import CsvAdapter
 from trading.data.fake import FakeAdapter
 from trading.data.recent_window import RecentWindowFeed
 from trading.data.synthetic import SyntheticAdapter
 from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
 from trading.engine import DEFAULT_PAPER_LOOKBACK, BacktestResult, BarOutcome, Engine, PaperSession
-from trading.interfaces import DataAdapter
+from trading.interfaces import Broker, DataAdapter
 from trading.report import summarize, write_equity_csv, write_equity_png
 from trading.risk import Guardrails
 from trading.strategies import get_strategy
@@ -62,7 +65,82 @@ def _make_adapter(source: str, cache_dir: Path, seed: int) -> DataAdapter:
         return YFinanceAdapter(cache_dir)
     if source == "synthetic":
         return SyntheticAdapter(seed=seed)
-    typer.echo(f"error: --source must be 'yfinance' or 'synthetic', got {source!r}", err=True)
+    if source == "csv":
+        # Bring-your-own-data: reads <cache_dir>/<SYMBOL>.csv in the standard schema.
+        return CsvAdapter(cache_dir)
+    if source == "alpaca":
+        try:
+            return AlpacaAdapter()
+        except (ValueError, ImportError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(2) from exc
+    typer.echo(
+        f"error: --source must be 'yfinance', 'synthetic', 'csv', or 'alpaca', got {source!r}",
+        err=True,
+    )
+    raise typer.Exit(2)
+
+
+def _parse_sector_map(spec: str) -> dict[str, str] | None:
+    """Parse ``SYM:sector,SYM:sector`` into a symbol->sector map (None if empty)."""
+    spec = spec.strip()
+    if not spec:
+        return None
+    result: dict[str, str] = {}
+    for pair in spec.split(","):
+        symbol, sep, sector = pair.partition(":")
+        symbol, sector = symbol.strip().upper(), sector.strip()
+        if not sep or not symbol or not sector:
+            raise ValueError(f"--sector-map entry {pair!r} must look like SYMBOL:sector")
+        result[symbol] = sector
+    return result
+
+
+def _build_risk(
+    *,
+    no_guardrails: bool,
+    max_position: float,
+    max_gross: float,
+    max_drawdown: float,
+    target_vol: float | None,
+    sector_map: str,
+    max_sector_exposure: float | None,
+) -> RiskConfig:
+    """Assemble the run's RiskConfig, or the permissive opt-out when disabled.
+
+    Raises ValueError (surfaced as a clean CLI error by the caller) on an invalid
+    limit or a malformed --sector-map.
+    """
+    if no_guardrails:
+        return RiskConfig.unlimited()
+    return RiskConfig(
+        max_position_pct=max_position,
+        max_gross_exposure=max_gross,
+        max_drawdown_pct=max_drawdown,
+        target_volatility=target_vol,
+        sector_map=_parse_sector_map(sector_map),
+        max_sector_exposure=max_sector_exposure,
+    )
+
+
+def _make_paper_broker(name: str, live: bool, cash: float) -> Broker:
+    """Select the paper execution venue: the simulator, or the live Alpaca broker.
+
+    Alpaca is real paper trading, so it requires --live and valid credentials; a
+    missing key or the absent SDK surfaces as a clean CLI error, not a traceback.
+    """
+    if name == "simulated":
+        return SimulatedBroker(Portfolio(cash=cash))
+    if name == "alpaca":
+        if not live:
+            typer.echo("error: --broker alpaca requires --live (real paper trading).", err=True)
+            raise typer.Exit(2)
+        try:
+            return AlpacaBroker(clock=WallClock())
+        except (ValueError, ImportError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(2) from exc
+    typer.echo(f"error: --broker must be 'simulated' or 'alpaca', got {name!r}", err=True)
     raise typer.Exit(2)
 
 
@@ -72,7 +150,9 @@ def backtest(
     symbols: str = typer.Option(..., "--symbols", help="Comma-separated tickers, e.g. AAPL,MSFT."),
     from_: str = typer.Option(..., "--from", help="Start date, YYYY-MM-DD."),
     to: str = typer.Option(..., "--to", help="End date, YYYY-MM-DD."),
-    source: str = typer.Option("yfinance", "--source", help="Data source: yfinance | synthetic."),
+    source: str = typer.Option(
+        "yfinance", "--source", help="Data source: yfinance | synthetic | csv | alpaca."
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash."),
     max_position: float = typer.Option(
@@ -91,6 +171,16 @@ def backtest(
         None,
         "--target-vol",
         help="Annualized volatility target (e.g. 0.10) that scales gross exposure; off by default.",
+    ),
+    max_sector_exposure: float | None = typer.Option(
+        None,
+        "--max-sector-exposure",
+        help="Per-sector gross cap as a fraction of equity (needs --sector-map); off by default.",
+    ),
+    sector_map: str = typer.Option(
+        "",
+        "--sector-map",
+        help="Symbol->sector map as SYM:sector,SYM:sector (used with --max-sector-exposure).",
     ),
     benchmark: str = typer.Option(
         "", "--benchmark", help="Benchmark symbol for a buy-and-hold comparison, e.g. SPY."
@@ -113,15 +203,14 @@ def backtest(
         raise typer.Exit(2) from exc
 
     try:
-        risk = (
-            RiskConfig.unlimited()
-            if no_guardrails
-            else RiskConfig(
-                max_position_pct=max_position,
-                max_gross_exposure=max_gross,
-                max_drawdown_pct=max_drawdown,
-                target_volatility=target_vol,
-            )
+        risk = _build_risk(
+            no_guardrails=no_guardrails,
+            max_position=max_position,
+            max_gross=max_gross,
+            max_drawdown=max_drawdown,
+            target_vol=target_vol,
+            sector_map=sector_map,
+            max_sector_exposure=max_sector_exposure,
         )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -239,7 +328,9 @@ def paper(
     symbols: str = typer.Option(..., "--symbols", help="Comma-separated tickers, e.g. AAPL,MSFT."),
     from_: str = typer.Option(..., "--from", help="Start date, YYYY-MM-DD."),
     to: str = typer.Option(..., "--to", help="End date, YYYY-MM-DD."),
-    source: str = typer.Option("yfinance", "--source", help="Data source: yfinance | synthetic."),
+    source: str = typer.Option(
+        "yfinance", "--source", help="Data source: yfinance | synthetic | csv | alpaca."
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash."),
     max_position: float = typer.Option(
@@ -258,6 +349,21 @@ def paper(
         None,
         "--target-vol",
         help="Annualized volatility target (e.g. 0.10) that scales gross exposure; off by default.",
+    ),
+    max_sector_exposure: float | None = typer.Option(
+        None,
+        "--max-sector-exposure",
+        help="Per-sector gross cap as a fraction of equity (needs --sector-map); off by default.",
+    ),
+    sector_map: str = typer.Option(
+        "",
+        "--sector-map",
+        help="Symbol->sector map as SYM:sector,SYM:sector (used with --max-sector-exposure).",
+    ),
+    broker_name: str = typer.Option(
+        "simulated",
+        "--broker",
+        help="Execution venue: simulated | alpaca (alpaca is real paper trading, needs --live).",
     ),
     live: bool = typer.Option(
         False,
@@ -285,22 +391,21 @@ def paper(
         raise typer.Exit(2) from exc
 
     try:
-        risk = (
-            RiskConfig.unlimited()
-            if no_guardrails
-            else RiskConfig(
-                max_position_pct=max_position,
-                max_gross_exposure=max_gross,
-                max_drawdown_pct=max_drawdown,
-                target_volatility=target_vol,
-            )
+        risk = _build_risk(
+            no_guardrails=no_guardrails,
+            max_position=max_position,
+            max_gross=max_gross,
+            max_drawdown=max_drawdown,
+            target_vol=target_vol,
+            sector_map=sector_map,
+            max_sector_exposure=max_sector_exposure,
         )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
     adapter = _make_adapter(source, cache_dir, seed)
-    broker = SimulatedBroker(Portfolio(cash=cash))
+    broker = _make_paper_broker(broker_name, live, cash)
     engine = Engine(adapter, broker, Guardrails(risk))
 
     # The clock and feed are the *only* difference between backtest and paper
@@ -470,7 +575,9 @@ def sweep(
     windows: int = typer.Option(
         1, "--windows", help="Walk-forward: split [from, to] into N consecutive windows (1 = off)."
     ),
-    source: str = typer.Option("yfinance", "--source", help="Data source: yfinance | synthetic."),
+    source: str = typer.Option(
+        "yfinance", "--source", help="Data source: yfinance | synthetic | csv | alpaca."
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash per run."),
     max_position: float = typer.Option(
@@ -489,6 +596,16 @@ def sweep(
         None,
         "--target-vol",
         help="Annualized volatility target (e.g. 0.10) that scales gross exposure; off by default.",
+    ),
+    max_sector_exposure: float | None = typer.Option(
+        None,
+        "--max-sector-exposure",
+        help="Per-sector gross cap as a fraction of equity (needs --sector-map); off by default.",
+    ),
+    sector_map: str = typer.Option(
+        "",
+        "--sector-map",
+        help="Symbol->sector map as SYM:sector,SYM:sector (used with --max-sector-exposure).",
     ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/sweep.csv"), "--out", help="Results CSV path."),
@@ -518,15 +635,14 @@ def sweep(
         raise typer.Exit(2)
 
     try:
-        risk = (
-            RiskConfig.unlimited()
-            if no_guardrails
-            else RiskConfig(
-                max_position_pct=max_position,
-                max_gross_exposure=max_gross,
-                max_drawdown_pct=max_drawdown,
-                target_volatility=target_vol,
-            )
+        risk = _build_risk(
+            no_guardrails=no_guardrails,
+            max_position=max_position,
+            max_gross=max_gross,
+            max_drawdown=max_drawdown,
+            target_vol=target_vol,
+            sector_map=sector_map,
+            max_sector_exposure=max_sector_exposure,
         )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)

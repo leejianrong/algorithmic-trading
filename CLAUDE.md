@@ -59,8 +59,24 @@ As of this writing:
   the effective gross-exposure cap by realized-vs-target vol inside `Guardrails`, off
   by default (ADR-0015); `metrics.py` adds Sortino, Calmar, and turnover to the report.
   Fast tests green.
-- **NOT yet built:** the **Alpaca** data/broker adapters (next milestone). **That
-  Alpaca milestone (see the roadmap at the end of `SLICES.md`) is the next work.**
+- **Alpaca milestone — live paper trading + real data (offline-verified):** an
+  `AlpacaClient` seam (`data/alpaca_client.py`, ADR-0017/0018) with our-own-types
+  DTOs, a `FakeAlpacaClient` for the fast layer, and a lazy `RealAlpacaClient` over
+  the optional `alpaca-py` SDK (kept out of the locked deps; a mypy override only).
+  On it: `AlpacaAdapter` (`data/alpaca_adapter.py`, adjusted daily bars) and
+  `AlpacaBroker` (`brokers/alpaca.py`, ADR-0020) — a submit-then-poll paper broker
+  that reconciles its `Portfolio` from the Alpaca account (authoritative, not
+  byte-identical to backtest). Wired into the CLI: `--source alpaca`,
+  `trading paper --broker alpaca --live`. Shipped alongside a **CSV**
+  bring-your-own-data source (`data/csv_adapter.py`, `--source csv`) and **per-sector
+  exposure caps** (`RiskConfig.sector_map` + `max_sector_exposure`, CLI
+  `--max-sector-exposure`/`--sector-map`, ADR-0019). Integration also fixed a
+  pre-existing guardrail-clamp bug (a sub-precision positive allowance rounding to a
+  zero-qty order now rejects; regression-tested). Fast tests green.
+- **NOT yet built:** intraday/tick frequency and other asset classes; a web
+  dashboard; and locking `alpaca-py` into the dependency set (deferred while the
+  build sandbox is offline). Real Alpaca paper runs need `pip install alpaca-py` plus
+  `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment.
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -116,13 +132,17 @@ src/trading/
   config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps)
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5)
   broker.py                # SimulatedBroker + CostModel
+  brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020)
   report.py                # text summary + equity_curve.csv
-  cli.py                   # `trading backtest / paper / gen-data / sweep`
+  cli.py                   # `trading backtest / paper / gen-data / sweep` (+ --source csv|alpaca, --broker alpaca)
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
   data/fake.py             # in-memory adapter for the fast test layer
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
   data/synthetic.py        # deterministic GBM adapter — offline backtests (ADR-0012)
+  data/csv_adapter.py      # bring-your-own-data OHLCV CSV DataAdapter (--source csv)
+  data/alpaca_client.py    # AlpacaClient seam + Fake/Real clients (ADR-0017/0018)
+  data/alpaca_adapter.py   # DataAdapter over Alpaca adjusted daily bars
   data/recent_window.py    # completed-bars feed for paper mode (V5)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion + registry
   metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure

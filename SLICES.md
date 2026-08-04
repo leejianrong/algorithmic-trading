@@ -247,11 +247,14 @@ bar). Wrong → decisions use unfinished data.
 
 ## Roadmap (out of this milestone)
 
-- **Next milestone:** `AlpacaBroker` (real paper API) + an Alpaca data adapter —
-  same interfaces (ADR-0004, ADR-0003); introduces a raw-quote price notion
-  alongside adjusted (ADR-0008) and API-key handling via env/.env.
+- Alpaca live paper trading + data adapter. **Done** — an `AlpacaClient` seam plus
+  `AlpacaAdapter` and a submit-then-poll `AlpacaBroker` behind the same
+  `DataAdapter`/`Broker` interfaces; API keys via env, optional lazy `alpaca-py`
+  (ADR-0017/0018/0020). CLI: `--source alpaca`, `paper --broker alpaca --live`.
 - Intraday/tick frequency; other asset classes (each its own ADR).
 - Parameter optimization / walk-forward as an outer sweep over runs. **Done** —
   `sweep.py` + `trading sweep` (ADR-0016).
 - Volatility targeting **done** (`RiskConfig.target_volatility` / `--target-vol`,
-  ADR-0015); per-sector risk caps and a web dashboard still open.
+  ADR-0015) and per-sector risk caps **done** (`--max-sector-exposure` /
+  `--sector-map`, ADR-0019); a bring-your-own-data CSV source is **done**
+  (`--source csv`). A web dashboard remains open.
