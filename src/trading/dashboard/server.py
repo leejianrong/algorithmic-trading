@@ -28,7 +28,7 @@ from trading.dashboard.static_export import render_html
 
 _INSTALL_HINT = (
     "FastAPI is required for the dashboard server but is not installed. Install "
-    "the optional dashboard extra (e.g. `pip install 'trading[dashboard]'`) or, "
+    "the optional dashboard extra (e.g. `pip install 'algo-trading-bench[dashboard]'`) or, "
     "for an ad-hoc run, `uv pip install fastapi uvicorn`. The static HTML export "
     "needs none of this."
 )
@@ -43,11 +43,8 @@ def create_app(result_path: str | Path) -> Any:
     re-read per request so the page reflects the file's current contents.
     """
     try:
-        from fastapi import FastAPI  # type: ignore[import-not-found]
-        from fastapi.responses import (  # type: ignore[import-not-found]
-            HTMLResponse,
-            JSONResponse,
-        )
+        from fastapi import FastAPI
+        from fastapi.responses import HTMLResponse, JSONResponse
     except ImportError as exc:  # pragma: no cover - exercised only without FastAPI
         raise ImportError(_INSTALL_HINT) from exc
 
@@ -81,7 +78,7 @@ def serve(
     :class:`ImportError` naming the ``dashboard`` extra.
     """
     try:
-        import uvicorn  # type: ignore[import-not-found]
+        import uvicorn
     except ImportError as exc:  # pragma: no cover - exercised only without uvicorn
         raise ImportError(_INSTALL_HINT) from exc
 

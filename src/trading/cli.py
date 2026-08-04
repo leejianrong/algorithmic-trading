@@ -23,12 +23,18 @@ from trading.config import RiskConfig
 from trading.data.alpaca_adapter import AlpacaAdapter
 from trading.data.csv_adapter import CsvAdapter
 from trading.data.fake import FakeAdapter
-from trading.data.recent_window import RecentWindowFeed
+from trading.data.recent_window import (
+    RecentWindowFeed,
+    default_is_complete,
+    interval_is_complete,
+)
 from trading.data.synthetic import SyntheticAdapter
 from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
 from trading.engine import DEFAULT_PAPER_LOOKBACK, BacktestResult, BarOutcome, Engine, PaperSession
+from trading.frequency import DAILY, Frequency
 from trading.interfaces import Broker, DataAdapter
-from trading.report import summarize, write_equity_csv, write_equity_png
+from trading.metrics import compute as compute_metrics
+from trading.report import summarize, write_equity_csv, write_equity_png, write_result_json
 from trading.risk import Guardrails
 from trading.strategies import get_strategy
 from trading.sweep import SweepSummary, run_sweep
@@ -60,17 +66,42 @@ def _parse_symbols(symbols: str) -> list[str]:
     return tickers
 
 
-def _make_adapter(source: str, cache_dir: Path, seed: int) -> DataAdapter:
+def _parse_frequency(interval: str) -> Frequency:
+    """Resolve ``--interval`` (e.g. ``1d``/``1h``/``30m``) or exit 2 on a bad label."""
+    try:
+        return Frequency.parse(interval)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+
+def _make_adapter(
+    source: str, cache_dir: Path, seed: int, frequency: Frequency = DAILY
+) -> DataAdapter:
     if source == "yfinance":
+        if frequency.is_intraday:
+            typer.echo(
+                f"error: --source yfinance is daily-only; the {frequency.label!r} interval "
+                "needs --source alpaca or synthetic (raw intraday bars).",
+                err=True,
+            )
+            raise typer.Exit(2)
         return YFinanceAdapter(cache_dir)
     if source == "synthetic":
-        return SyntheticAdapter(seed=seed)
+        return SyntheticAdapter(seed=seed, frequency=frequency)
     if source == "csv":
+        if frequency.is_intraday:
+            typer.echo(
+                f"error: --source csv is daily-only; the {frequency.label!r} interval "
+                "needs --source alpaca or synthetic (raw intraday bars).",
+                err=True,
+            )
+            raise typer.Exit(2)
         # Bring-your-own-data: reads <cache_dir>/<SYMBOL>.csv in the standard schema.
         return CsvAdapter(cache_dir)
     if source == "alpaca":
         try:
-            return AlpacaAdapter()
+            return AlpacaAdapter(interval=frequency.delta)
         except (ValueError, ImportError) as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(2) from exc
@@ -153,6 +184,11 @@ def backtest(
     source: str = typer.Option(
         "yfinance", "--source", help="Data source: yfinance | synthetic | csv | alpaca."
     ),
+    interval: str = typer.Option(
+        "1d",
+        "--interval",
+        help="Bar frequency: 1d | 1h | 30m | 5m | 1m. Sub-daily needs --source alpaca|synthetic.",
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash."),
     max_position: float = typer.Option(
@@ -195,6 +231,7 @@ def backtest(
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
     tickers = _parse_symbols(symbols)
+    freq = _parse_frequency(interval)
 
     try:
         strat = get_strategy(strategy)
@@ -216,7 +253,7 @@ def backtest(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
-    adapter = _make_adapter(source, cache_dir, seed)
+    adapter = _make_adapter(source, cache_dir, seed, freq)
     broker = SimulatedBroker(Portfolio(cash=cash))
     result = Engine(adapter, broker, Guardrails(risk)).run(strat, tickers, start, end)
 
@@ -230,9 +267,24 @@ def backtest(
             get_strategy("buy_and_hold"), [bench_symbol], start, end
         )
 
-    typer.echo(summarize(result, bench_result))
+    typer.echo(summarize(result, bench_result, periods_per_year=freq.periods_per_year))
     write_equity_csv(result, out, bench_result)
     typer.echo(f"\nWrote equity curve to {out}")
+
+    # The canonical machine-readable artifact the dashboard consumes, alongside
+    # the CSV. Metrics are computed once here at the run's frequency (default
+    # 252/yr for daily keeps the numbers identical).
+    metrics = compute_metrics(result, freq.periods_per_year)
+    result_json = out.parent / "result.json"
+    write_result_json(
+        result,
+        result_json,
+        mode="backtest",
+        frequency=freq.label,
+        metrics=metrics,
+        benchmark_curve=bench_result.equity_curve if bench_result is not None else None,
+    )
+    typer.echo(f"Wrote result JSON to {result_json}")
     if plot:
         png = out.with_suffix(".png")
         write_equity_png(result, png, bench_result)
@@ -331,6 +383,11 @@ def paper(
     source: str = typer.Option(
         "yfinance", "--source", help="Data source: yfinance | synthetic | csv | alpaca."
     ),
+    interval: str = typer.Option(
+        "1d",
+        "--interval",
+        help="Bar frequency: 1d | 1h | 30m | 5m | 1m. Sub-daily needs --source alpaca|synthetic.",
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash."),
     max_position: float = typer.Option(
@@ -383,6 +440,7 @@ def paper(
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
     tickers = _parse_symbols(symbols)
+    freq = _parse_frequency(interval)
 
     try:
         strat = get_strategy(strategy)
@@ -404,7 +462,7 @@ def paper(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
-    adapter = _make_adapter(source, cache_dir, seed)
+    adapter = _make_adapter(source, cache_dir, seed, freq)
     broker = _make_paper_broker(broker_name, live, cash)
     engine = Engine(adapter, broker, Guardrails(risk))
 
@@ -413,21 +471,24 @@ def paper(
     # interrupted. Once: materialize the [from, to] bars into an in-memory adapter
     # and a fake clock parked just past the range so every bar reads as complete —
     # the loop drains them one _step at a time and stops, offline and deterministic.
+    # Sub-daily bars need the interval-aware completeness policy (ADR-0022); daily
+    # keeps the default policy so the daily path stays byte-identical to V5.
+    is_complete = interval_is_complete(freq.delta) if freq.is_intraday else default_is_complete
     lookback = DEFAULT_PAPER_LOOKBACK
     run_kwargs: dict[str, int] = {}
     if live:
         clock: WallClock | FakeClock = WallClock()
-        feed = RecentWindowFeed(adapter, clock)
+        feed = RecentWindowFeed(adapter, clock, is_complete)
     else:
         series = {s: adapter.get_bars(s, start, end) for s in tickers}
         all_bars = [bar for bars in series.values() for bar in bars]
         total = len({bar.ts for bar in all_bars})
         lookback = max(DEFAULT_PAPER_LOOKBACK, total + 1)
         clock = FakeClock(end + timedelta(days=1))
-        feed = RecentWindowFeed(FakeAdapter(all_bars), clock)
+        feed = RecentWindowFeed(FakeAdapter(all_bars), clock, is_complete)
         run_kwargs = {"max_empty_polls": 1}
 
-    session = PaperSession(engine, strat, tickers, feed, clock, lookback=lookback)
+    session = PaperSession(engine, strat, tickers, feed, clock, lookback=lookback, frequency=freq)
 
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "paper_session.log"
@@ -448,9 +509,19 @@ def paper(
 
     csv_path = out / "equity_curve.csv"
     write_equity_csv(result, csv_path)
-    typer.echo("\n" + summarize(result))
+
+    # The canonical machine-readable artifact the dashboard consumes, alongside the
+    # CSV. Metrics are computed at the run's frequency (default 252/yr for daily).
+    metrics = compute_metrics(result, freq.periods_per_year)
+    result_json = out / "result.json"
+    write_result_json(result, result_json, mode="paper", frequency=freq.label, metrics=metrics)
+
+    typer.echo("\n" + summarize(result, periods_per_year=freq.periods_per_year))
     typer.echo(f"\nProcessed {len(session.session_log)} completed bar(s).")
-    typer.echo(f"Session log: {log_path}\nRunning state: {state_path}\nEquity curve: {csv_path}")
+    typer.echo(
+        f"Session log: {log_path}\nRunning state: {state_path}\n"
+        f"Equity curve: {csv_path}\nResult JSON: {result_json}"
+    )
 
 
 def _coerce_param_value(token: str) -> object:
@@ -578,6 +649,11 @@ def sweep(
     source: str = typer.Option(
         "yfinance", "--source", help="Data source: yfinance | synthetic | csv | alpaca."
     ),
+    interval: str = typer.Option(
+        "1d",
+        "--interval",
+        help="Bar frequency: 1d | 1h | 30m | 5m | 1m. Sub-daily needs --source alpaca|synthetic.",
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash per run."),
     max_position: float = typer.Option(
@@ -620,6 +696,7 @@ def sweep(
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
     tickers = _parse_symbols(symbols)
+    freq = _parse_frequency(interval)
     grid = _parse_grid(param)
     if rank_by not in {"sharpe", "total_return"}:
         typer.echo(
@@ -648,7 +725,7 @@ def sweep(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
-    adapter = _make_adapter(source, cache_dir, seed)
+    adapter = _make_adapter(source, cache_dir, seed, freq)
     summary = run_sweep(
         strategy, grid, adapter, tickers, start, end, cash=cash, risk=risk, windows=windows
     )
@@ -675,6 +752,64 @@ def _known_strategy_names() -> list[str]:
     from trading.strategies import STRATEGIES
 
     return sorted(STRATEGIES)
+
+
+@app.command()
+def dashboard(
+    result: Path = typer.Option(
+        Path("results/result.json"),
+        "--result",
+        help="Path to the run's result.json (written by `backtest`/`paper`).",
+    ),
+    static: Path | None = typer.Option(
+        None,
+        "--static",
+        help="Render a self-contained HTML dashboard to this path (pure offline, no deps).",
+    ),
+    serve: bool = typer.Option(
+        False,
+        "--serve",
+        help="Serve the dashboard over HTTP (needs the optional 'dashboard' extra).",
+    ),
+    host: str = typer.Option("127.0.0.1", "--host", help="Bind host for --serve."),
+    port: int = typer.Option(8000, "--port", help="Bind port for --serve."),
+) -> None:
+    """Visualize a run's result.json: a static HTML export or a live server.
+
+    Exactly one of ``--static`` / ``--serve`` per invocation. ``--static`` writes a
+    single self-contained HTML file (no external references, no extra dependencies).
+    ``--serve`` runs the FastAPI dashboard server — install it with
+    ``pip install 'algo-trading-bench[dashboard]'``.
+    """
+    from trading.dashboard import server as dashboard_server
+    from trading.dashboard.payload import load_payload
+    from trading.dashboard.static_export import write_html
+
+    if (static is not None) == serve:
+        typer.echo("error: pass exactly one of --static or --serve", err=True)
+        raise typer.Exit(2)
+
+    if static is not None:
+        try:
+            payload = load_payload(result)
+        except FileNotFoundError as exc:
+            typer.echo(f"error: result.json not found at {result}", err=True)
+            raise typer.Exit(2) from exc
+        except (ValueError, KeyError) as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(2) from exc
+        written = write_html(payload, static)
+        typer.echo(f"Wrote dashboard HTML to {written}")
+        return
+
+    # --serve: hand off to the (lazy-FastAPI) server; a missing extra raises a clear
+    # ImportError naming the install, which we surface as a clean CLI error.
+    try:
+        typer.echo(f"Serving dashboard for {result} at http://{host}:{port} (Ctrl-C to stop)")
+        dashboard_server.serve(result, host=host, port=port)
+    except ImportError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(1) from exc
 
 
 if __name__ == "__main__":
