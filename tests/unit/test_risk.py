@@ -182,3 +182,24 @@ class TestKillSwitch:
         # ...but the position can still be exited.
         exit_order = Order("AAA", Side.SELL, 5.0)
         assert guard.check(exit_order, pf, prices) is exit_order
+
+
+def test_clamp_rounding_to_zero_rejects_instead_of_crashing() -> None:
+    """A clamp leaving positive room below share precision rejects, never crashes.
+
+    Regression: a positive ``allowed`` that rounds to 0.0 at SHARE_PRECISION passed
+    the ``> SHARE_EPS`` reject check and then blew up building a zero-qty Order.
+    """
+    from trading.config import RiskConfig
+    from trading.risk import Guardrails
+    from trading.types import Order, Portfolio, Position, Side
+
+    guardrails = Guardrails(
+        RiskConfig(max_position_pct=1.0, max_gross_exposure=1.0, max_drawdown_pct=1.0)
+    )
+    # equity 100, gross already 99.9999996 -> ~4e-7 shares of room at price 1.0:
+    # above SHARE_EPS (1e-9) but rounds to 0.0 at 6 dp.
+    portfolio = Portfolio(cash=0.0000004, positions={"AAA": Position("AAA", 99.9999996, 1.0)})
+    prices = {"AAA": 1.0, "BBB": 1.0}
+    result = guardrails.check(Order("BBB", Side.BUY, 1.0), portfolio, prices)
+    assert result is None  # rejected cleanly, no exception

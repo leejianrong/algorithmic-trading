@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner
 
 from trading.cli import app
@@ -153,3 +154,140 @@ def test_gen_data_writes_cache_compatible_files_backtestable_offline(tmp_path: P
     )
     assert bt.exit_code == 0, bt.output
     assert "Final equity" in bt.output
+
+
+def test_backtest_source_csv_runs(tmp_path: Path) -> None:
+    (tmp_path / "AAA.csv").write_text(
+        "ts,open,high,low,close,volume\n"
+        "2021-01-04,100,101,99,100,1000\n"
+        "2021-01-05,100,102,100,101,1000\n"
+        "2021-01-06,101,103,100,102,1000\n"
+    )
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "buy_and_hold",
+            "--symbols",
+            "AAA",
+            "--source",
+            "csv",
+            "--cache-dir",
+            str(tmp_path),
+            "--from",
+            "2021-01-01",
+            "--to",
+            "2021-01-31",
+            "--out",
+            str(tmp_path / "e.csv"),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Final equity" in result.output
+
+
+def test_source_alpaca_without_credentials_errors(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ALPACA_API_KEY", raising=False)
+    monkeypatch.delenv("ALPACA_SECRET_KEY", raising=False)
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "buy_and_hold",
+            "--source",
+            "alpaca",
+            "--out",
+            str(tmp_path / "e.csv"),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "error" in result.output.lower()
+
+
+def test_backtest_sector_caps_run(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--source",
+            "synthetic",
+            "--max-sector-exposure",
+            "0.3",
+            "--sector-map",
+            "AAA:tech,BBB:energy",
+            "--out",
+            str(tmp_path / "e.csv"),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Final equity" in result.output
+
+
+def test_sector_map_malformed_errors(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--source",
+            "synthetic",
+            "--max-sector-exposure",
+            "0.3",
+            "--sector-map",
+            "nope",
+            "--out",
+            str(tmp_path / "e.csv"),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "sector-map" in result.output
+
+
+def test_paper_broker_alpaca_requires_live(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "paper",
+            "--strategy",
+            "buy_and_hold",
+            "--source",
+            "synthetic",
+            "--broker",
+            "alpaca",
+            "--out",
+            str(tmp_path / "p"),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "live" in result.output.lower()
+
+
+def test_paper_broker_unknown_errors(tmp_path: Path) -> None:
+    result = runner.invoke(
+        app,
+        [
+            "paper",
+            "--strategy",
+            "buy_and_hold",
+            "--source",
+            "synthetic",
+            "--broker",
+            "bogus",
+            "--out",
+            str(tmp_path / "p"),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "broker" in result.output.lower()

@@ -224,16 +224,18 @@ class Guardrails:
         allowed = min(order.qty, allowed_position, allowed_gross, allowed_sector)
         binding = self._binding(allowed_position, allowed_gross, allowed_sector, sector)
 
-        if allowed <= SHARE_EPS:
+        # Round to a placeable share count first: a positive `allowed` that rounds
+        # to zero (a clamp finer than share precision) is a rejection, not a
+        # zero-qty Order, which the type forbids.
+        accepted_qty = round(allowed, SHARE_PRECISION)
+        if accepted_qty <= SHARE_EPS:
             self.last_reason = f"rejected: {binding}"
             return None
 
-        if allowed < order.qty - SHARE_EPS:
-            accepted_qty = round(allowed, SHARE_PRECISION)
+        if accepted_qty < order.qty - SHARE_EPS:
             self.last_reason = f"clamped {order.qty:.6f}→{accepted_qty:.6f}: {binding}"
             result = replace(order, qty=accepted_qty)
         else:
-            accepted_qty = order.qty
             result = order
 
         # Commit the approved notional so later same-bar orders see less room.
