@@ -6,10 +6,14 @@ ADR-0016 requires. The walk-forward tests (ADR-0026) additionally pin the
 selection *discipline*: the winner comes from in-sample only and is run over
 out-of-sample exactly once.
 
-One quirk worth knowing when reading these tests: ``SyntheticAdapter`` reseeds per
-call and generates from the requested start day, so two spans of equal length
-replay the *same* price path. That makes it useless for rigging IS and OOS against
-each other, which is why the rigged fixture below is a hand-built ``FakeAdapter``.
+``SyntheticAdapter`` used to reseed per call and generate from the requested start
+day, so two spans of equal length replayed the *same* price path — which quietly made
+the per-window sweep a null test (two windows of equal length returned identical
+metrics) and any degradation measurement on synthetic data meaningless. ADR-0030 fixed
+that: a range is now a slice of one canonical series, so different spans really are
+different data. The rigged IS-vs-OOS fixture below is still a hand-built
+``FakeAdapter``, for the better reason — rigging a *deliberate* in-sample win and
+out-of-sample loss needs authored prices, not whatever a GBM draw happens to do.
 """
 
 from __future__ import annotations
@@ -160,6 +164,20 @@ def test_run_sweep_walk_forward_runs_each_combo_per_window() -> None:
     # 4 combos x 2 windows = 8 runs, tagged 0 and 1.
     assert len(summary.runs) == 8
     assert {run.window for run in summary.runs} == {0, 1}
+
+
+def test_run_sweep_windows_are_distinct_data_not_one_replayed_path() -> None:
+    # The consequence of ADR-0030 at this level: before it, the adapter reseeded per
+    # call and every window replayed the same path, so windows of equal bar count
+    # returned *identical* metrics and the per-window sweep measured nothing.
+    summary = run_sweep(
+        "sma_crossover", {"fast": [5], "slow": [30]}, _adapter(), _SYMBOLS, _START, _END, windows=3
+    )
+    assert len(summary.runs) == 3
+    scored = {
+        (round(run.metrics.total_return, 12), round(run.metrics.sharpe, 12)) for run in summary.runs
+    }
+    assert len(scored) == 3, f"windows replayed one identical price path: {scored}"
 
 
 def test_run_sweep_empty_grid_runs_strategy_defaults_once() -> None:

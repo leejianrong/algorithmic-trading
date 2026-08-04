@@ -1,8 +1,20 @@
 # ADR-0012: Synthetic data generator for offline backtesting
 
-- Status: Accepted
+- Status: Accepted (amended by [ADR-0030](0030-synthetic-range-consistency.md))
 - Date: 2026-08-03
 - Deciders: strategy developer (project owner)
+
+> **Amendment (2026-08-05, ADR-0030).** The reproducibility promise below — "same
+> seed + symbol + range → byte-identical bars" — was too weak, and the generator
+> satisfied it while still being wrong: it reseeded per call and walked from the
+> requested `start`, so a bar's value depended on the *range asked for* rather than on
+> the bar's position in time. Two different spans came back byte-identical and a
+> sub-range disagreed with its parent on every shared bar. ADR-0030 replaces the
+> promise with "same seed + symbol + **timestamp** → identical bar, whatever range you
+> ask for", and replaces the per-call `random.Random` with a counter-based positional
+> draw over one canonical series anchored at a fixed epoch. Everything else here —
+> including the GBM-toy caveat under Consequences, which is the more important half —
+> stands.
 
 ## Context
 
