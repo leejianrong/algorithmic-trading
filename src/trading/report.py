@@ -31,7 +31,10 @@ if TYPE_CHECKING:
 # Schema version of the canonical machine-readable run artifact emitted by
 # ``result_to_dict`` / ``write_result_json``. The web dashboard reads this to
 # decide how to parse the document; bump it whenever the shape changes in a way
-# a consumer must notice.
+# a consumer must notice. Purely *additive* keys are not such a change — a v1
+# reader keeps working untouched — and the dashboard's check is exact equality
+# (``payload._check_schema``), so a gratuitous bump would reject every result.json
+# already on disk. ADR-0031's halt episodes are additive and left it at 1.
 RESULT_SCHEMA_VERSION = 1
 
 
@@ -98,7 +101,31 @@ def summarize(
     if result.halted and result.halt_ts is not None:
         reason = result.halt_reason or "new entries halted"
         lines.append(f"Halt:          fired at {result.halt_ts.isoformat()} ({reason})")
+        lines.extend(_halt_episode_lines(result))
     return "\n".join(lines)
+
+
+def _halt_episode_lines(result: BacktestResult) -> list[str]:
+    """The halt-episode count line, when opt-in recovery actually did something.
+
+    A run under the default permanent latch has exactly one open-ended episode, so
+    the count adds nothing the ``Halt:`` line above does not already say and the
+    summary stays byte-identical (ADR-0031). Once a halt has re-armed — or tripped
+    more than once — the single boolean is misleading on its own, so the episode
+    count and each stretch's span are spelled out.
+    """
+    episodes = result.halt_episodes
+    resumed = [e for e in episodes if e.resume_ts is not None]
+    if len(episodes) <= 1 and not resumed:
+        return []
+    lines = [
+        f"Halt episodes: {len(episodes)} ({len(resumed)} re-armed, "
+        f"{len(episodes) - len(resumed)} still in force at the end)"
+    ]
+    for index, episode in enumerate(episodes, start=1):
+        until = episode.resume_ts.isoformat() if episode.resume_ts is not None else "(in force)"
+        lines.append(f"  #{index} {episode.halt_ts.isoformat()} → {until}  ({episode.reason})")
+    return lines
 
 
 def write_equity_csv(
@@ -225,10 +252,21 @@ def result_to_dict(
           "rejections": [             # orders a guardrail/broker vetoed
             {"symbol": str, "qty": float, "side": str, "reason": str}, ...
           ],
-          "halt": {"halted": bool,
-                   "halt_ts": iso8601 str | null,
-                   "halt_reason": str | null}
+          "halt": {"halted": bool,          # a halt occurred during the run
+                   "halt_ts": iso8601 str | null,     # the FIRST halt
+                   "halt_reason": str | null,
+                   # ADR-0031, additive: every halt stretch, in order. Exactly one
+                   # open-ended entry under the default permanent latch.
+                   "episode_count": int,
+                   "episodes": [
+                     {"halt_ts": iso8601 str, "resume_ts": iso8601 str | null,
+                      "reason": str}, ...
+                   ]}
         }
+
+    The ``episode_count``/``episodes`` keys are purely additive: every pre-existing
+    key keeps its exact meaning and value, so ``RESULT_SCHEMA_VERSION`` does **not**
+    move (see the constant's note, and ADR-0031).
 
     Parameters
     ----------
@@ -294,6 +332,17 @@ def result_to_dict(
             "halted": result.halted,
             "halt_ts": result.halt_ts.isoformat() if result.halt_ts is not None else None,
             "halt_reason": result.halt_reason,
+            "episode_count": len(result.halt_episodes),
+            "episodes": [
+                {
+                    "halt_ts": episode.halt_ts.isoformat(),
+                    "resume_ts": (
+                        episode.resume_ts.isoformat() if episode.resume_ts is not None else None
+                    ),
+                    "reason": episode.reason,
+                }
+                for episode in result.halt_episodes
+            ],
         },
     }
 

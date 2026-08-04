@@ -9,6 +9,8 @@ not just before it, and latches once tripped.
 
 from __future__ import annotations
 
+from itertools import pairwise
+
 import pytest
 
 from trading.config import RiskConfig
@@ -27,6 +29,10 @@ class TestRiskConfig:
         assert cfg.max_gross_exposure == 1.0
         assert cfg.max_drawdown_pct == 0.20
         assert cfg.max_daily_loss_pct is None
+        # Halt recovery (ADR-0031) is opt-in: unset means the ADR-0013 permanent latch.
+        assert cfg.halt_recovery_drawdown_pct is None
+        assert cfg.halt_cooldown_bars is None
+        assert cfg.halt_recovery_enabled is False
 
     def test_unlimited_is_fully_permissive(self) -> None:
         cfg = RiskConfig.unlimited()
@@ -44,11 +50,32 @@ class TestRiskConfig:
             {"max_drawdown_pct": 1.5},
             {"max_daily_loss_pct": 0.0},
             {"max_daily_loss_pct": 2.0},
+            {"halt_recovery_drawdown_pct": -0.1},
+            {"halt_recovery_drawdown_pct": 1.0},
+            {"halt_cooldown_bars": 0},
+            {"halt_cooldown_bars": -3},
         ],
     )
     def test_out_of_range_limits_are_rejected(self, kwargs: dict[str, float]) -> None:
         with pytest.raises(ValueError):
             RiskConfig(**kwargs)  # type: ignore[arg-type]
+
+    @pytest.mark.parametrize("recovery", [0.20, 0.25])
+    def test_recovery_threshold_at_or_above_the_trip_level_is_rejected(
+        self, recovery: float
+    ) -> None:
+        """The hysteresis band must be non-empty — anti-flap guarantee 1 (ADR-0031).
+
+        Re-arming at (or below) the same drawdown that trips the switch would let it
+        halt and re-arm on adjacent bars forever, so the config refuses it outright
+        rather than leaving the oscillation to be discovered in a run.
+        """
+        with pytest.raises(ValueError, match="strictly below max_drawdown_pct"):
+            RiskConfig(max_drawdown_pct=0.20, halt_recovery_drawdown_pct=recovery)
+
+    def test_a_recovery_knob_turns_recovery_on(self) -> None:
+        assert RiskConfig(halt_cooldown_bars=5).halt_recovery_enabled is True
+        assert RiskConfig(halt_recovery_drawdown_pct=0.10).halt_recovery_enabled is True
 
 
 class TestPreTradeCheck:
@@ -182,6 +209,203 @@ class TestKillSwitch:
         # ...but the position can still be exited.
         exit_order = Order("AAA", Side.SELL, 5.0)
         assert guard.check(exit_order, pf, prices) is exit_order
+
+
+class TestHaltRecovery:
+    """Opt-in re-arming of the drawdown kill switch (ADR-0031).
+
+    Every case drives :meth:`Guardrails.halted` directly with hand-written equity
+    paths (flat books, so equity is just cash), one call per bar, and asserts the
+    latch state bar by bar. The first test is the load-bearing one: with no recovery
+    configured the switch must behave exactly as it did before this feature existed.
+    """
+
+    @staticmethod
+    def _walk(guard: Guardrails, equities: list[float]) -> list[bool]:
+        """Feed one bar per equity value; return the latch state after each bar."""
+        return [guard.halted(_portfolio(equity), {}) for equity in equities]
+
+    def test_default_config_latches_for_the_whole_run(self) -> None:
+        # Backward compatibility, non-negotiable: no recovery configured means the
+        # ADR-0013 permanent latch, no matter how far equity recovers afterwards.
+        guard = Guardrails(RiskConfig(max_drawdown_pct=0.20))
+        states = self._walk(guard, [1_000.0, 700.0, 900.0, 1_000.0, 1_500.0, 2_000.0])
+        assert states == [False, True, True, True, True, True]
+        assert guard.halt_count == 1
+        assert guard.resume_count == 0
+        assert guard.is_halted is True
+
+    def test_cooldown_re_arms_on_exactly_the_nth_bar(self) -> None:
+        # Cooldown 3: the halt is in force for exactly 3 bars — the bar it fired on
+        # plus two more — and the 4th bar trades again, even though equity is still
+        # deeply underwater relative to the original peak.
+        guard = Guardrails(RiskConfig(max_drawdown_pct=0.20, halt_cooldown_bars=3))
+        states = self._walk(guard, [1_000.0, 700.0, 700.0, 700.0, 700.0, 700.0])
+        assert states == [False, True, True, True, False, False]
+        assert guard.halt_count == 1
+        assert guard.resume_count == 1
+
+    def test_cooldown_off_by_one_neither_early_nor_late(self) -> None:
+        # Cooldown 1 re-arms on the very next bar; cooldown 2 holds one bar longer.
+        one = Guardrails(RiskConfig(max_drawdown_pct=0.20, halt_cooldown_bars=1))
+        assert self._walk(one, [1_000.0, 700.0, 700.0]) == [False, True, False]
+        two = Guardrails(RiskConfig(max_drawdown_pct=0.20, halt_cooldown_bars=2))
+        assert self._walk(two, [1_000.0, 700.0, 700.0, 700.0]) == [False, True, True, False]
+
+    def test_bars_halted_counts_the_firing_bar(self) -> None:
+        guard = Guardrails(RiskConfig(max_drawdown_pct=0.20, halt_cooldown_bars=5))
+        assert guard.bars_halted == 0
+        guard.halted(_portfolio(1_000.0), {})
+        assert guard.bars_halted == 0
+        guard.halted(_portfolio(700.0), {})  # the bar it fires on is bar 1 of the halt
+        assert guard.bars_halted == 1
+        guard.halted(_portfolio(700.0), {})
+        assert guard.bars_halted == 2
+
+    def test_drawdown_recovery_waits_until_the_threshold_is_regained(self) -> None:
+        # Trip at 20% down, re-arm only once drawdown is back to 10% or better.
+        guard = Guardrails(RiskConfig(max_drawdown_pct=0.20, halt_recovery_drawdown_pct=0.10))
+        states = self._walk(
+            guard,
+            [
+                1_000.0,  # peak
+                750.0,  # 25% down -> halt
+                820.0,  # 18% down -> still underwater, still halted
+                899.0,  # 10.1% down -> a hair short, still halted
+                900.0,  # exactly 10% down -> re-arms
+            ],
+        )
+        assert states == [False, True, True, True, False]
+        assert guard.halt_count == 1 and guard.resume_count == 1
+
+    def test_re_arming_restarts_the_drawdown_reference_at_the_resume_level(self) -> None:
+        # Anti-flap guarantee 2: after re-arming at 900 the peak *is* 900, so a fall
+        # to 800 is an 11% drawdown and passes. Measured from the original 1,000 peak
+        # it would be exactly 20% and would trip the switch straight back on.
+        guard = Guardrails(RiskConfig(max_drawdown_pct=0.20, halt_recovery_drawdown_pct=0.10))
+        states = self._walk(guard, [1_000.0, 750.0, 900.0, 800.0])
+        assert states == [False, True, False, False]
+        assert guard.halt_count == 1
+        # A fresh, full 20% decline from the resume level (900 -> 720) does trip it.
+        assert guard.halted(_portfolio(720.0), {}) is True
+        assert guard.halt_count == 2
+
+    @staticmethod
+    def _both() -> Guardrails:
+        return Guardrails(
+            RiskConfig(
+                max_drawdown_pct=0.20,
+                halt_recovery_drawdown_pct=0.10,
+                halt_cooldown_bars=3,
+            )
+        )
+
+    def test_both_knobs_re_arm_on_whichever_triggers_first(self) -> None:
+        # Recovery first: equity is back to a 5% drawdown on the very next bar, so the
+        # switch re-arms there rather than serving out the 3-bar cooldown.
+        recovery_first = self._both()
+        assert self._walk(recovery_first, [1_000.0, 750.0, 950.0, 950.0]) == [
+            False,
+            True,
+            False,
+            False,
+        ]
+        assert recovery_first.resume_count == 1
+
+        # Cooldown first: equity stays 25% underwater, so the drawdown condition never
+        # fires and the 3-bar cooldown is what re-arms the switch.
+        cooldown_first = self._both()
+        assert self._walk(cooldown_first, [1_000.0, 750.0, 750.0, 750.0, 750.0]) == [
+            False,
+            True,
+            True,
+            True,
+            False,
+        ]
+        assert cooldown_first.resume_count == 1
+
+    def test_a_book_that_froze_flat_still_re_arms(self) -> None:
+        """Regression for the deadlock that ruled out AND (ADR-0031).
+
+        A halted long-or-flat strategy may exit but not enter, so it drains to cash
+        and equity stops moving. Drawdown then freezes above the recovery threshold
+        and can *never* be regained. Requiring both conditions would reinstate the
+        permanent latch here; because the cooldown is an independent trigger, the
+        frozen book still resumes. Measured on a 2005-2020 synthetic run, where an
+        AND build left the second episode in force for the final eleven years.
+        """
+        guard = self._both()
+        frozen = [1_000.0, 750.0] + [750.0] * 30
+        states = self._walk(guard, frozen)
+        assert states[1] is True  # halted on the crash bar
+        assert guard.resume_count == 1
+        assert guard.is_halted is False, "a frozen equity curve must not deadlock the switch"
+
+    def test_sawtooth_inside_the_resume_band_never_re_halts(self) -> None:
+        """Anti-flap: an oscillation whose legs stay inside the threshold halts once.
+
+        Crash to 750 (halt), recover to 900 (re-arm, peak reset to 900), then swing
+        900 <-> 760 for twenty cycles. Each dip is 15.6% from the resume level — under
+        the 20% trigger — so the bound is **exactly one** halt episode. Without the
+        peak reset every dip would read 24% from the old 1,000 peak and the switch
+        would halt and re-arm on every cycle.
+        """
+        guard = Guardrails(RiskConfig(max_drawdown_pct=0.20, halt_recovery_drawdown_pct=0.10))
+        path = [1_000.0, 750.0, 900.0]
+        for _ in range(20):
+            path.extend([760.0, 900.0])
+        self._walk(guard, path)
+        assert guard.halt_count == 1
+        assert guard.resume_count == 1
+        assert guard.is_halted is False
+
+    def test_hostile_per_bar_sawtooth_stays_bounded_by_the_cooldown(self) -> None:
+        """Anti-flap: a curve engineered to flap cannot halt more than once per N+1 bars.
+
+        Equity alternates 1,000 / 800 every bar, so every down bar is a fresh 20%
+        drawdown from a fresh peak — the worst case for a re-arming switch. With a
+        3-bar cooldown each episode occupies 3 bars and guarantee 3 grants at least
+        one trading bar before the next trip, so the period is at least 4 bars.
+        """
+        cooldown = 3
+        guard = Guardrails(RiskConfig(max_drawdown_pct=0.20, halt_cooldown_bars=cooldown))
+        path = [1_000.0]
+        for _ in range(20):
+            path.extend([800.0, 1_000.0])
+        states = self._walk(guard, path)
+
+        bars = len(path)
+        bound = bars // (cooldown + 1) + 1
+        assert guard.halt_count <= bound, f"{guard.halt_count} halts in {bars} bars exceeds {bound}"
+        assert guard.halt_count > 1, "the hostile path should re-halt; this is not a latch"
+        # Strict alternation: a re-arm bar never re-halts, so transitions can't stack.
+        assert guard.resume_count in (guard.halt_count - 1, guard.halt_count)
+        transitions = sum(1 for prev, cur in pairwise(states) if prev != cur)
+        assert transitions == guard.halt_count + guard.resume_count
+
+    def test_entries_blocked_and_exits_allowed_while_halted_then_entries_resume(self) -> None:
+        # ADR-0013's invariant is untouched by recovery: while halted, only exits
+        # pass. Once re-armed, a new entry is accepted again — the whole point.
+        guard = Guardrails(
+            RiskConfig(
+                max_position_pct=1.0,
+                max_gross_exposure=1.0,
+                max_drawdown_pct=0.20,
+                halt_cooldown_bars=1,
+            )
+        )
+        pf = _portfolio(500.0, [Position("AAA", qty=5.0, avg_price=100.0)])
+        prices = {"AAA": 100.0}
+
+        guard.halted(_portfolio(1_000.0), {})
+        assert guard.halted(_portfolio(700.0), {}) is True
+        assert guard.check(Order("AAA", Side.BUY, 1.0), pf, prices) is None
+        exit_order = Order("AAA", Side.SELL, 5.0)
+        assert guard.check(exit_order, pf, prices) is exit_order
+
+        assert guard.halted(_portfolio(700.0), {}) is False  # cooldown served → re-armed
+        entry = Order("AAA", Side.BUY, 1.0)
+        assert guard.check(entry, pf, prices) is entry
 
 
 def test_clamp_rounding_to_zero_rejects_instead_of_crashing() -> None:

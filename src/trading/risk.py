@@ -11,10 +11,21 @@ Two layers sit on the shared execution path so every mode is protected equally
    broker — the caps only keep buys within equity (ADR-0013).
 2. **Portfolio monitor** (:meth:`Guardrails.halted`) each bar — a stateful
    drawdown-from-peak and optional single-bar-loss kill switch. Once tripped it
-   *latches* for the session: new entries are blocked, exits still allowed.
+   *latches*: new entries are blocked, exits still allowed. By default the latch
+   holds for the whole run; opt-in recovery (ADR-0031) can re-arm it.
 
 The implementation-level choices (latching, exits-allowed-while-halted,
 clamp-not-reject, cash left with the broker) are recorded in ADR-0013.
+
+**Halt recovery (ADR-0031), off by default.** A permanent latch is right for a
+live session a human will look at, and wrong for a 20-year backtest — measured on
+real 2000-2020 data every strategy halted (usually in 2001) and then rejected
+every entry for 19 years. So ``RiskConfig`` grows two optional knobs,
+``halt_recovery_drawdown_pct`` (re-arm once drawdown has recovered to at most this)
+and ``halt_cooldown_bars`` (re-arm only after this many bars in force). Both unset
+— the default — is the ADR-0013 permanent latch, unchanged. Both set means the
+*earlier* trigger re-arms. See :meth:`Guardrails.halted` for the anti-flap
+guarantees and :meth:`Guardrails._rearm_due` for why the combination is OR.
 
 A third, opt-in layer (ADR-0015) sits on the same per-bar equity the drawdown
 monitor already observes: when ``RiskConfig.target_volatility`` is set, the
@@ -55,6 +66,10 @@ class Guardrails:
     each sized order. After every :meth:`check` the caller may read
     :attr:`last_reason` for the clamp/rejection explanation, and :attr:`halt_reason`
     once the switch has tripped.
+
+    With recovery configured (ADR-0031) the switch may trip more than once per run;
+    :attr:`halt_count` and :attr:`resume_count` are the counters, and the engine
+    turns the transitions into the timestamped episodes on ``BacktestResult``.
     """
 
     def __init__(self, config: RiskConfig | None = None) -> None:
@@ -82,6 +97,14 @@ class Guardrails:
         # estimate realized volatility, so the unset path is byte-identical.
         self._returns: deque[float] = deque(maxlen=_VOL_WINDOW)
         self._vol_scale = 1.0
+        # Halt-recovery state (ADR-0031). ``_bar_index`` counts bars seen by
+        # halted(); ``_halt_bar`` is the index the current halt fired on, so the
+        # cooldown is a plain index difference. The counters are the observability
+        # the report/result.json surface. All inert while recovery is unconfigured.
+        self._bar_index = 0
+        self._halt_bar: int | None = None
+        self._halt_count = 0
+        self._resume_count = 0
 
     @property
     def config(self) -> RiskConfig:
@@ -99,15 +122,82 @@ class Guardrails:
 
     @property
     def is_halted(self) -> bool:
-        """Whether the kill switch has latched (without re-marking the book)."""
+        """Whether the kill switch is currently latched (without re-marking the book)."""
         return self._halted
+
+    @property
+    def halt_count(self) -> int:
+        """How many times the kill switch has tripped this run (ADR-0031).
+
+        ``0`` or ``1`` without recovery configured (the latch can only fire once);
+        with recovery it is the number of halt *episodes* opened.
+        """
+        return self._halt_count
+
+    @property
+    def resume_count(self) -> int:
+        """How many times a halt has re-armed this run (ADR-0031). Always 0 by default."""
+        return self._resume_count
+
+    @property
+    def bars_halted(self) -> int:
+        """Bars the current halt has been in force, counting the bar it fired on.
+
+        ``0`` when not halted. Used by the cooldown rule and useful in tests.
+        """
+        if not self._halted or self._halt_bar is None:
+            return 0
+        return self._bar_index - self._halt_bar + 1
 
     def halted(self, portfolio: Portfolio, prices: dict[str, float]) -> bool:
         """Update the running peak / previous-bar marks and (latch and) report halt.
 
         Drawdown is measured from the highest equity seen so far; the daily-loss
         breaker, when configured, compares against the previous bar. The halt
-        latches: once ``True`` it stays ``True`` for the rest of the session.
+        latches: once ``True`` it stays ``True`` until — and only if — a configured
+        recovery mechanism re-arms it. With neither configured (the default) it
+        latches for the whole run, exactly as ADR-0013 decided.
+
+        **Recovery (ADR-0031, opt-in).** While halted, the re-arm test runs at the
+        top of the bar, before the trip tests. Each configured condition is an
+        independent trigger and the *earlier* one wins (OR — see :meth:`_rearm_due`
+        for the measured deadlock that rules out AND):
+
+        * ``halt_cooldown_bars = N``: re-arm once the halt has been in force for N
+          bars, i.e. on the Nth bar after the one it fired on. Alone, the halt is
+          therefore in force for exactly N bars.
+        * ``halt_recovery_drawdown_pct = r``: re-arm once drawdown ``<= r``, measured
+          against the **live running peak**. That is the same number as "the peak at
+          halt time" in every case that matters: the peak is monotone, so it can only
+          move while halted by equity exceeding it — which is a full recovery
+          (drawdown 0) that re-arms under any threshold. Choosing the live peak
+          therefore avoids a second stored reference without changing an outcome.
+
+        **Anti-flapping.** Three guarantees, so halt/re-arm cycles are bounded and
+        countable rather than per-bar chatter:
+
+        1. A non-empty hysteresis band: ``RiskConfig`` rejects
+           ``halt_recovery_drawdown_pct >= max_drawdown_pct``, so the re-arm level is
+           always strictly above (less underwater than) the trip level.
+        2. **Re-arming resets the peak to the current equity.** A later halt then
+           needs a *fresh, full* ``max_drawdown_pct`` decline measured from the level
+           trading resumed at — not a sliver more of the original crash. So the
+           number of episodes in a run is bounded by the number of distinct
+           ``max_drawdown_pct`` declines in the equity curve; a sawtooth whose legs
+           stay inside the threshold yields exactly one episode, not one per bar.
+           This peak is a *control* reference, not a reporting one — the honest
+           account high-water mark and peak-to-trough drawdown still come from
+           :func:`trading.metrics.compute` over the equity curve, which this never
+           touches.
+        3. A re-arm bar never re-halts: the switch grants at least one bar of live
+           trading before it can trip again. This also makes the halt/resume sequence
+           a strict alternation, which is what lets the engine record it as clean
+           ``(halt_ts, resume_ts)`` episodes.
+
+        With a cooldown and no recovery threshold, guarantees 2 and 3 tighten into a
+        hard bars-based bound: an episode occupies N bars and the next trip needs at
+        least one trading bar first, so halts cannot recur more often than every
+        ``N + 1`` bars however hostile the equity path.
 
         The engine calls this exactly once per bar, immediately before the check
         loop, so it also **begins a new bar for the pre-trade tally**: the
@@ -118,6 +208,7 @@ class Guardrails:
         self._committed_gross = 0.0
         self._committed_qty = {}
         self._committed_sector = {}
+        self._bar_index += 1
 
         equity = portfolio.equity(prices)
         peak = equity if self._peak is None else max(self._peak, equity)
@@ -130,26 +221,83 @@ class Guardrails:
             self._returns.append(equity / self._prev_equity - 1.0)
         self._vol_scale = self._compute_vol_scale()
 
-        if not self._halted:
-            drawdown = (peak - equity) / peak if peak > 0 else 0.0
-            if drawdown >= self._config.max_drawdown_pct:
-                self._halted = True
-                self.halt_reason = (
-                    f"drawdown {drawdown:.1%} ≥ max {self._config.max_drawdown_pct:.1%}"
-                )
+        # Recovery (ADR-0031): a re-arm consumes the bar — the trip tests below are
+        # skipped, guarantee 3 above. Inert unless a recovery knob is configured.
+        rearmed_this_bar = False
+        if self._halted and self._rearm_due(equity, peak):
+            self._rearm(equity)
+            peak = equity
+            rearmed_this_bar = True
 
-        if not self._halted and self._config.max_daily_loss_pct is not None:
-            prev = self._prev_equity
-            if prev is not None and prev > 0:
-                loss = (prev - equity) / prev
-                if loss >= self._config.max_daily_loss_pct:
-                    self._halted = True
-                    self.halt_reason = (
-                        f"daily loss {loss:.1%} ≥ max {self._config.max_daily_loss_pct:.1%}"
-                    )
+        if not rearmed_this_bar:
+            if not self._halted:
+                drawdown = (peak - equity) / peak if peak > 0 else 0.0
+                if drawdown >= self._config.max_drawdown_pct:
+                    self._trip(f"drawdown {drawdown:.1%} ≥ max {self._config.max_drawdown_pct:.1%}")
+
+            if not self._halted and self._config.max_daily_loss_pct is not None:
+                prev = self._prev_equity
+                if prev is not None and prev > 0:
+                    loss = (prev - equity) / prev
+                    if loss >= self._config.max_daily_loss_pct:
+                        self._trip(
+                            f"daily loss {loss:.1%} ≥ max {self._config.max_daily_loss_pct:.1%}"
+                        )
 
         self._prev_equity = equity
         return self._halted
+
+    def _trip(self, reason: str) -> None:
+        """Latch the kill switch, recording the bar it fired on and the episode count."""
+        self._halted = True
+        self.halt_reason = reason
+        self._halt_bar = self._bar_index
+        self._halt_count += 1
+
+    def _rearm_due(self, equity: float, peak: float) -> bool:
+        """Whether *any* configured recovery condition is satisfied (ADR-0031).
+
+        ``False`` immediately when no recovery is configured — the default latch.
+        Otherwise the cooldown (bars in force) and the drawdown-recovery threshold
+        are independent triggers and the **earlier** one re-arms the switch (OR, not
+        AND). ADR-0031 records the measurement behind that choice: while halted, a
+        long-or-flat strategy is allowed to exit but not to enter, so it drains to
+        cash and its equity — and with it the drawdown — *freezes*. A drawdown
+        condition that was not already met when the book went flat can then never be
+        met, so requiring both would silently restore the permanent latch this whole
+        feature exists to remove. The cooldown is therefore the liveness guarantee
+        and the drawdown threshold an early re-arm for a book that heals on its own.
+        """
+        config = self._config
+        if not config.halt_recovery_enabled:
+            return False
+        cooldown = config.halt_cooldown_bars
+        if (
+            cooldown is not None
+            and self._halt_bar is not None
+            and self._bar_index - self._halt_bar >= cooldown
+        ):
+            return True
+        recovery = config.halt_recovery_drawdown_pct
+        if recovery is not None:
+            drawdown = (peak - equity) / peak if peak > 0 else 0.0
+            if drawdown <= recovery:
+                return True
+        return False
+
+    def _rearm(self, equity: float) -> None:
+        """Un-latch the switch and restart the drawdown reference at ``equity``.
+
+        Resetting the peak is anti-flap guarantee 2 in :meth:`halted`: the next halt
+        must be earned by a fresh, full ``max_drawdown_pct`` decline from the level
+        trading resumed at. ``halt_reason`` is deliberately *left set* — it is the
+        reason of the halt that just ended, and the run-level record keeps reporting
+        that a halt happened.
+        """
+        self._halted = False
+        self._halt_bar = None
+        self._peak = equity
+        self._resume_count += 1
 
     def check(
         self,

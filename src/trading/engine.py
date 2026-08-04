@@ -22,7 +22,7 @@ the two modes cannot drift.
 from __future__ import annotations
 
 from collections import defaultdict
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import TYPE_CHECKING, Protocol, runtime_checkable
 
@@ -86,11 +86,31 @@ class EquityPoint:
 
 
 @dataclass(frozen=True, slots=True)
+class HaltEpisode:
+    """One stretch of the kill switch being in force (ADR-0031).
+
+    ``halt_ts`` is the bar the switch tripped on; ``resume_ts`` is the bar it
+    re-armed on, or ``None`` when the halt was still in force at the end of the run
+    (always the case with the default, permanently-latching config). ``reason`` is
+    the guardrails' explanation captured when the episode opened, so a run with two
+    halts keeps both reasons instead of only the last.
+    """
+
+    halt_ts: datetime
+    reason: str
+    resume_ts: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class BarOutcome:
     """What one :meth:`Engine._step` did — the paper driver's per-bar record.
 
     A backtest ignores this (it reads the accumulated result); paper mode logs and
-    prints it. It carries only *this bar's* events, not the running totals.
+    prints it. It carries only *this bar's* events, not the running totals — so
+    ``halted`` is the kill switch's state *as of this bar*, ``halted_now`` marks the
+    bar it tripped on, and ``resumed_now`` the bar an opt-in recovery re-armed it
+    (ADR-0031). Under the default permanent latch, ``halted`` is ``True`` from the
+    trip onward and ``resumed_now`` never fires.
     """
 
     ts: datetime
@@ -104,6 +124,9 @@ class BarOutcome:
     halted: bool
     equity: float
     exposure: float
+    # True on the bar an opt-in recovery re-armed the kill switch (ADR-0031);
+    # always False with the default permanently-latching config.
+    resumed_now: bool = False
 
 
 @dataclass(slots=True)
@@ -119,9 +142,20 @@ class BacktestResult:
     rejections: list[tuple[Order, str]] = field(default_factory=list)
     # (original, clamped, reason) for each order a guardrail cap trimmed down.
     clamps: list[tuple[Order, Order, str]] = field(default_factory=list)
+    # ``halted`` means "a halt occurred during this run" (not "is halted now"), and
+    # halt_ts/halt_reason describe the *first* one — unchanged from V3, so the
+    # report, result.json, and dashboard read exactly what they always did.
     halted: bool = False
     halt_ts: datetime | None = None
     halt_reason: str | None = None
+    # Every halt stretch, in order (ADR-0031). Empty when the switch never tripped;
+    # exactly one open-ended episode under the default permanent latch.
+    halt_episodes: list[HaltEpisode] = field(default_factory=list)
+
+    @property
+    def halt_episode_count(self) -> int:
+        """How many times the kill switch tripped during the run (ADR-0031)."""
+        return len(self.halt_episodes)
 
     @property
     def final_equity(self) -> float:
@@ -149,6 +183,10 @@ class _RunState:
     rejections: list[tuple[Order, str]] = field(default_factory=list)
     clamps: list[tuple[Order, Order, str]] = field(default_factory=list)
     halt_ts: datetime | None = None
+    # Previous bar's latch state, so a step can spot the transitions that open and
+    # close halt episodes (ADR-0031).
+    halted: bool = False
+    halt_episodes: list[HaltEpisode] = field(default_factory=list)
 
 
 class _Context:
@@ -226,11 +264,22 @@ class Engine:
             state.last_close[symbol] = bar.close
 
         # 3. Portfolio monitor: update/latch the kill switch on the marked book.
-        halted_now = False
+        #    The latch transitions are the halt *episodes* (ADR-0031): the guardrails
+        #    own the state machine, the engine owns the timestamps. Under the default
+        #    permanent latch there is exactly one False->True transition, so
+        #    halt_ts/halted are what V3 recorded.
+        was_halted = state.halted
         halted = self._guardrails.halted(self._broker.portfolio, state.last_close)
-        if halted and state.halt_ts is None:
-            state.halt_ts = ts
-            halted_now = True
+        halted_now = halted and not was_halted
+        resumed_now = was_halted and not halted
+        if halted_now:
+            if state.halt_ts is None:
+                state.halt_ts = ts
+            reason = getattr(self._guardrails, "halt_reason", None)
+            state.halt_episodes.append(HaltEpisode(halt_ts=ts, reason=reason or "halted"))
+        elif resumed_now and state.halt_episodes:
+            state.halt_episodes[-1] = replace(state.halt_episodes[-1], resume_ts=ts)
+        state.halted = halted
 
         context = _Context(self._broker.portfolio, state.history)
         intents = strategy.on_bar(ts, bars, context)
@@ -274,9 +323,10 @@ class Engine:
             guardrail_rejections=bar_rejections,
             broker_rejections=broker_rejections,
             halted_now=halted_now,
-            halted=state.halt_ts is not None,
+            halted=halted,
             equity=equity,
             exposure=exposure,
+            resumed_now=resumed_now,
         )
 
     def _finalize(self, symbols: list[str], state: _RunState) -> BacktestResult:
@@ -288,6 +338,13 @@ class Engine:
         """
         rejections = list(state.rejections)
         rejections.extend(getattr(self._broker, "rejections", []))
+        # halt_ts/halt_reason describe the FIRST halt, so read the reason off the
+        # first episode: the guardrails' own attribute holds the *latest* reason,
+        # which would pair a later cause with the first timestamp once recovery lets
+        # the switch trip twice (ADR-0031). Identical for a single halt.
+        halt_reason = getattr(self._guardrails, "halt_reason", None)
+        if state.halt_episodes:
+            halt_reason = state.halt_episodes[0].reason
         return BacktestResult(
             symbols=list(symbols),
             starting_cash=state.starting_cash,
@@ -298,7 +355,8 @@ class Engine:
             clamps=state.clamps,
             halted=state.halt_ts is not None,
             halt_ts=state.halt_ts,
-            halt_reason=getattr(self._guardrails, "halt_reason", None),
+            halt_reason=halt_reason,
+            halt_episodes=list(state.halt_episodes),
         )
 
 

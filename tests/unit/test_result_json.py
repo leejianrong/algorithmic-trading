@@ -13,7 +13,7 @@ from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
 
-from trading.engine import BacktestResult, EquityPoint
+from trading.engine import BacktestResult, EquityPoint, HaltEpisode
 from trading.metrics import PerformanceMetrics
 from trading.report import (
     RESULT_SCHEMA_VERSION,
@@ -145,7 +145,44 @@ def test_result_to_dict_shape_and_values() -> None:
         "halted": True,
         "halt_ts": _ts(2).isoformat(),
         "halt_reason": "max drawdown breached",
+        # Additive under ADR-0031; the three keys above keep their exact meaning.
+        "episode_count": 0,
+        "episodes": [],
     }
+
+
+def test_halt_episodes_are_serialized_in_order() -> None:
+    """Each halt stretch reaches result.json with its span and its own reason (ADR-0031).
+
+    A recovered episode carries a ``resume_ts``; one still in force at the end of the
+    run carries ``null``. The legacy ``halt_ts``/``halt_reason`` keys keep describing
+    the *first* halt, which is why the schema version does not move.
+    """
+    result = _result()
+    result.halt_episodes = [
+        HaltEpisode(halt_ts=_ts(2), reason="drawdown 25.0% ≥ max 20.0%", resume_ts=_ts(4)),
+        HaltEpisode(halt_ts=_ts(7), reason="drawdown 22.0% ≥ max 20.0%"),
+    ]
+
+    doc = result_to_dict(result, mode="backtest")
+
+    assert doc["schema_version"] == 1
+    assert doc["halt"]["halted"] is True
+    assert doc["halt"]["halt_ts"] == _ts(2).isoformat()
+    assert doc["halt"]["episode_count"] == 2
+    assert doc["halt"]["episodes"] == [
+        {
+            "halt_ts": _ts(2).isoformat(),
+            "resume_ts": _ts(4).isoformat(),
+            "reason": "drawdown 25.0% ≥ max 20.0%",
+        },
+        {
+            "halt_ts": _ts(7).isoformat(),
+            "resume_ts": None,
+            "reason": "drawdown 22.0% ≥ max 20.0%",
+        },
+    ]
+    assert json.loads(json.dumps(doc)) == doc
 
 
 def test_result_to_dict_round_trips_through_json() -> None:
