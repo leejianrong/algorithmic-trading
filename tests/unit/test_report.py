@@ -156,3 +156,48 @@ class TestPngWriter:
         path = tmp_path / "plot.png"
         write_equity_png(_result([100.0, 101.0, 102.0], exposures=[0.0, 0.5, 0.9]), path)
         assert path.exists() and path.stat().st_size > 0
+
+
+class TestSignificanceLines:
+    """Trades-per-parameter reporting and the underpowered warning (ADR-0029)."""
+
+    def _fills(self, entries: int) -> list[tuple[datetime, Fill]]:
+        """``entries`` distinct symbols each bought once → ``entries`` entries."""
+        return [
+            (_ts(1), Fill(symbol=f"S{i}", side=Side.BUY, qty=1.0, price=10.0))
+            for i in range(entries)
+        ]
+
+    def test_trade_count_always_shown(self) -> None:
+        text = summarize(_result([100.0, 101.0], fills=self._fills(3)))
+        assert "Trades:        3 entry/entries" in text
+
+    def test_no_ratio_line_without_a_parameter_count(self) -> None:
+        text = summarize(_result([100.0, 101.0], fills=self._fills(3)))
+        assert "Trades/param" not in text
+
+    def test_ratio_line_appears_with_a_parameter_count(self) -> None:
+        text = summarize(_result([100.0, 101.0], fills=self._fills(60)), free_parameters=2)
+        assert "Trades/param:  30.0" in text
+        assert "60 entries / 2 free parameter(s)" in text
+
+    def test_thin_sample_warns_explicitly(self) -> None:
+        text = summarize(_result([100.0, 101.0], fills=self._fills(8)), free_parameters=4)
+        assert "Trades/param:  2.0" in text
+        assert "too small a sample to distinguish edge from noise" in text
+
+    def test_ample_sample_does_not_warn(self) -> None:
+        text = summarize(_result([100.0, 101.0], fills=self._fills(120)), free_parameters=2)
+        assert "too small a sample" not in text
+
+    def test_zero_parameter_strategy_gets_no_ratio_line(self) -> None:
+        """buy_and_hold cannot be overfit by parameter search — no ratio, no warning."""
+        text = summarize(_result([100.0, 101.0], fills=self._fills(3)), free_parameters=0)
+        assert "Trades/param" not in text
+        assert "too small a sample" not in text
+
+    def test_existing_metric_block_is_unchanged_by_default(self) -> None:
+        """Every prior line still renders when the new argument is omitted."""
+        text = summarize(_result([100.0, 110.0]))
+        for label in ("Total return:", "Sharpe:", "Max drawdown:", "Turnover:", "Bars:"):
+            assert label in text
