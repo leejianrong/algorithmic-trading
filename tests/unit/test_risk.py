@@ -48,7 +48,7 @@ class TestRiskConfig:
     )
     def test_out_of_range_limits_are_rejected(self, kwargs: dict[str, float]) -> None:
         with pytest.raises(ValueError):
-            RiskConfig(**kwargs)
+            RiskConfig(**kwargs)  # type: ignore[arg-type]
 
 
 class TestPreTradeCheck:
