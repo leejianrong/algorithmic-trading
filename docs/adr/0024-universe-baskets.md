@@ -54,6 +54,36 @@ seam extension and a universe builder that filters a candidate basket to
 `tradable & fractionable & liquid` are **deferred** (planned as a follow-on
 slice); `universe.py` is the seed for it.
 
+## Amendment (2026-08-05): a second basket, `core10`
+
+Registered `core10` — 10 long-lived, broad ETFs across asset classes (US large
+SPY, US tech QQQ, US small IWM, developed-international EFA, emerging EEM, long
+Treasuries TLT, intermediate Treasuries IEF, gold GLD, plus the energy and
+financial sector SPDRs XLE/XLF). Every constituent traded by 2004 at the latest,
+and its inception year is stated in a comment beside it.
+
+**Why:** a 20-year real-data backtest (2000-2020) over `blue20` is close to a
+worst-case survivorship setup (ADR-0027) — the basket *is* today's winners, so the
+result answers a hindsight question rather than a strategy question. Broad ETFs are
+the best mitigation available on a yfinance-only path: an index or Treasury fund
+does not go bankrupt or get delisted for failure, and its NAV actually wore the
+losses of the constituents it dropped, so its price history is a point-in-time
+honest record of that exposure. It is a reduction, not a fix — ETFs do close, and
+these ten were picked in hindsight *because* they survived — and `universe.py`'s
+third honesty caveat says exactly that, with the inception-date consequence
+(a 2000 start trades a smaller universe until 2004) stated concretely.
+
+**No mechanism change.** `core10` is a plain `BASKETS` entry behind the same
+`get_universe` / `get_sector_map` / `@name` CLI expansion, exactly as this ADR
+anticipated ("more baskets are additive registry entries"). One thing is new in
+*intent* only: its map values are **asset-class bucket labels** (`"treasuries"`,
+`"gold"`), not GICS sectors. The sector cap (ADR-0019) groups by string equality
+and gives each distinct value its own budget, so this works unchanged; the `Basket`
+docstring and the registry comment now say the field is a generic bucket label so
+no reader mistakes it for a fixed taxonomy. The basket-consistency test is
+generalized to iterate `BASKETS`, so a future basket cannot be registered with a
+drifting map, duplicate tickers, or a single bucket.
+
 ## Alternatives considered
 
 | Option | Why not |

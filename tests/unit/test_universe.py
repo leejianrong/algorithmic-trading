@@ -32,6 +32,22 @@ def test_blue20_has_exactly_twenty_symbols() -> None:
     assert len(set(symbols)) == 20
 
 
+@pytest.mark.parametrize("name", sorted(BASKETS))
+def test_every_basket_is_internally_consistent(name: str) -> None:
+    # Generalized over the registry on purpose: a basket added later cannot be
+    # registered with a sector map that drifts from its symbol list, duplicate
+    # tickers, or an unlabelled name.
+    symbols = get_universe(name)
+    sectors = get_sector_map(name)
+    assert symbols, f"{name} is empty"
+    assert len(set(symbols)) == len(symbols), f"{name} has duplicate symbols"
+    assert set(sectors) == set(symbols), f"{name} sector map drifts from its symbols"
+    assert all(sectors[s] for s in symbols), f"{name} has a symbol with an empty label"
+    # A basket exists to diversify, so one bucket for everything is a mistake.
+    assert len(set(sectors.values())) > 1, f"{name} labels a single bucket"
+    assert BASKETS[name].name == name
+
+
 def test_blue20_sector_map_covers_all_and_only_the_symbols() -> None:
     symbols = get_universe("blue20")
     sectors = get_sector_map("blue20")
@@ -47,6 +63,41 @@ def test_blue20_sector_map_covers_all_and_only_the_symbols() -> None:
         "energy",
         "industrials",
     }
+
+
+class TestCore10:
+    """The broad-ETF, long-horizon basket (ADR-0024 amendment; ADR-0027 caveat 3)."""
+
+    def test_resolves_to_ten_unique_symbols(self) -> None:
+        symbols = get_universe("core10")
+        assert len(symbols) == 10
+        assert len(set(symbols)) == 10
+        assert symbols == list(BASKETS["core10"].symbols)
+
+    def test_sector_map_covers_all_and_only_the_symbols(self) -> None:
+        symbols = get_universe("core10")
+        sectors = get_sector_map("core10")
+        assert set(sectors) == set(symbols)
+        assert sectors == dict(BASKETS["core10"].sectors)
+
+    def test_every_symbol_has_an_asset_class_label(self) -> None:
+        sectors = get_sector_map("core10")
+        assert all(label for label in sectors.values())
+        # Spread across asset classes, not one bucket: multiple equity sleeves plus
+        # bonds and gold. The labels are generic bucket names, which is exactly what
+        # the sector-cap guardrail (ADR-0019) keys on.
+        labels = set(sectors.values())
+        assert len(labels) > 1
+        assert {"treasuries", "gold"} <= labels, labels
+
+    def test_both_treasury_funds_share_one_bucket(self) -> None:
+        # A shared label means a shared budget under --max-sector-exposure.
+        sectors = get_sector_map("core10")
+        assert sectors["TLT"] == sectors["IEF"] == "treasuries"
+
+    def test_holds_no_single_stocks_from_blue20(self) -> None:
+        # The point of the basket: broad funds, not hindsight-picked mega-caps.
+        assert not set(get_universe("core10")) & set(get_universe("blue20"))
 
 
 def test_get_universe_round_trips_registry() -> None:
@@ -229,6 +280,30 @@ class TestBlue20AgainstBroker:
             symbol="LLY",
             reason=REASON_NOT_FRACTIONABLE,
             detail=result.unusable[0].detail,
+        )
+
+
+class TestCore10AgainstBroker:
+    def test_core10_validates_clean_against_an_all_good_broker(self) -> None:
+        symbols = get_universe("core10")
+        result = validate_universe(symbols, FakeAlpacaClient())
+        assert result.is_clean is True
+        assert list(result.usable) == symbols
+
+    def test_one_non_fractionable_etf_shrinks_the_usable_universe(self) -> None:
+        client = FakeAlpacaClient()
+        client.set_asset("GLD", fractionable=False)
+        result = validate_universe(get_universe("core10"), client)
+        assert "GLD" not in result.usable
+        assert len(result.usable) == 9
+        assert result.unusable[0] == DroppedSymbol(
+            symbol="GLD",
+            reason=REASON_NOT_FRACTIONABLE,
+            detail=result.unusable[0].detail,
+        )
+        # Nothing silently filtered: the dropped name is still accounted for.
+        assert set(result.usable) | {d.symbol for d in result.dropped} == set(
+            get_universe("core10")
         )
 
 
