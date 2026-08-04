@@ -146,9 +146,14 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
 
 ## How work is done here (conventions)
 
-- **Branch per slice off fresh `main`; PR-only; `main` is protected.** No direct
-  pushes to `main`. (This session's designated dev branch is
-  `claude/plan-new-project-l4n535`.)
+- **Branch per slice off fresh `main`; PR-only.** No direct pushes to `main`; name
+  branches `claude/<slice>`. Parallel lanes get their own git worktree so
+  in-flight branches never collide, and the landing is serialized through one
+  integration commit so `main` stays reviewable.
+  **Caveat, verified 2026-08-05:** GitHub branch protection on `main` is *not*
+  actually enabled (`gh api repos/:owner/:repo/branches/main/protection` → 404).
+  PR-only is honored by convention here, not enforced by the platform — do not
+  rely on the platform to stop a direct push.
 - **Fast gate before every push.** `make check` must pass; the pre-push hook runs
   it. Bypass only with a scoped reason via `git push --no-verify`.
 - **Layer tests by cost.** Fast layer = no infra, runs everywhere. Integration
