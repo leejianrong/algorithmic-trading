@@ -31,7 +31,20 @@ class DataAdapter(Protocol):
         *,
         adjusted: bool = True,
     ) -> list[Bar]:
-        """Return ``symbol``'s daily bars in ``[start, end]``, ascending by time."""
+        """Return ``symbol``'s bars in ``[start, end]``, ascending by time.
+
+        **Absence is data, not failure** (ADR-0032). A symbol the source simply has
+        no rows for in this window — a stock that had not listed yet, an ETF launched
+        mid-range, a delisted name — returns an **empty list**. Raise only when the
+        *lookup itself* fails: a transport error, bad credentials, an unreadable
+        file, a malformed response.
+
+        The distinction is load-bearing because the engine acts on it: an empty list
+        is a reported, tolerated gap in a multi-symbol universe, while an exception
+        is a reported failure. Conflating them either aborts a legitimate
+        long-horizon backtest or silently swallows a typo'd ticker. See
+        :func:`trading.engine.load_series`.
+        """
         ...
 
 
