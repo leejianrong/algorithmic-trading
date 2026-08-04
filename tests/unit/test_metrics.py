@@ -17,17 +17,20 @@ import pytest
 
 from trading.engine import EquityPoint
 from trading.metrics import (
+    MIN_TRADES_PER_PARAMETER,
     PerformanceMetrics,
     annualized_return,
     avg_exposure,
     calmar,
     compute,
     daily_returns,
+    entry_count,
     max_drawdown,
     peak_exposure,
     sharpe,
     sortino,
     total_return,
+    trades_per_parameter,
     turnover,
     win_rate,
 )
@@ -295,3 +298,132 @@ class TestCompute:
         metrics = compute(result)
         assert metrics.avg_exposure == 0.0
         assert metrics.peak_exposure == 0.0
+
+
+class TestEntryCount:
+    """Position-opening entries, not raw fills (ADR-0029)."""
+
+    def test_round_trip_counts_as_one_entry(self) -> None:
+        fills = [
+            (_ts(1), Fill(symbol="A", side=Side.BUY, qty=10.0, price=100.0)),
+            (_ts(2), Fill(symbol="A", side=Side.SELL, qty=10.0, price=110.0)),
+        ]
+        assert entry_count(fills) == 1
+
+    def test_reentry_after_a_full_exit_is_a_second_entry(self) -> None:
+        fills = [
+            (_ts(1), Fill(symbol="A", side=Side.BUY, qty=10.0, price=100.0)),
+            (_ts(2), Fill(symbol="A", side=Side.SELL, qty=10.0, price=110.0)),
+            (_ts(3), Fill(symbol="A", side=Side.BUY, qty=5.0, price=105.0)),
+        ]
+        assert entry_count(fills) == 2
+
+    def test_adding_to_an_open_position_is_not_a_new_entry(self) -> None:
+        """A rebalance top-up must not inflate the significance denominator."""
+        fills = [
+            (_ts(1), Fill(symbol="A", side=Side.BUY, qty=10.0, price=100.0)),
+            (_ts(2), Fill(symbol="A", side=Side.BUY, qty=5.0, price=101.0)),
+            (_ts(3), Fill(symbol="A", side=Side.BUY, qty=5.0, price=102.0)),
+        ]
+        assert entry_count(fills) == 1
+
+    def test_partial_exit_then_top_up_is_not_a_new_entry(self) -> None:
+        fills = [
+            (_ts(1), Fill(symbol="A", side=Side.BUY, qty=10.0, price=100.0)),
+            (_ts(2), Fill(symbol="A", side=Side.SELL, qty=4.0, price=110.0)),
+            (_ts(3), Fill(symbol="A", side=Side.BUY, qty=2.0, price=108.0)),
+        ]
+        assert entry_count(fills) == 1
+
+    def test_entries_are_counted_per_symbol(self) -> None:
+        fills = [
+            (_ts(1), Fill(symbol="A", side=Side.BUY, qty=1.0, price=10.0)),
+            (_ts(1), Fill(symbol="B", side=Side.BUY, qty=1.0, price=10.0)),
+            (_ts(1), Fill(symbol="C", side=Side.BUY, qty=1.0, price=10.0)),
+        ]
+        assert entry_count(fills) == 3
+
+    def test_still_open_position_counts(self) -> None:
+        fills = [(_ts(1), Fill(symbol="A", side=Side.BUY, qty=10.0, price=100.0))]
+        assert entry_count(fills) == 1
+
+    def test_no_fills_is_zero(self) -> None:
+        assert entry_count([]) == 0
+
+
+class TestTradesPerParameter:
+    def test_ratio_is_entries_over_parameters(self) -> None:
+        # Three separate round trips -> 3 entries; 2 free parameters -> 1.5.
+        fills = []
+        for day in (1, 3, 5):
+            fills.append((_ts(day), Fill(symbol="A", side=Side.BUY, qty=1.0, price=10.0)))
+            fills.append((_ts(day + 1), Fill(symbol="A", side=Side.SELL, qty=1.0, price=11.0)))
+        assert trades_per_parameter(fills, 2) == pytest.approx(1.5)
+
+    def test_unknown_parameter_count_is_none_not_zero(self) -> None:
+        """An absent check must not read as a failed check."""
+        fills = [(_ts(1), Fill(symbol="A", side=Side.BUY, qty=1.0, price=10.0))]
+        assert trades_per_parameter(fills, None) is None
+
+    def test_zero_parameter_strategy_reports_none(self) -> None:
+        fills = [(_ts(1), Fill(symbol="A", side=Side.BUY, qty=1.0, price=10.0))]
+        assert trades_per_parameter(fills, 0) is None
+
+
+class TestUnderpowered:
+    def _metrics(self, ratio: float | None) -> PerformanceMetrics:
+        return PerformanceMetrics(
+            total_return=0.0,
+            annualized_return=0.0,
+            sharpe=0.0,
+            sortino=0.0,
+            calmar=0.0,
+            max_drawdown=0.0,
+            win_rate=0.0,
+            turnover=0.0,
+            avg_exposure=0.0,
+            peak_exposure=0.0,
+            trade_count=0,
+            trades_per_parameter=ratio,
+        )
+
+    def test_below_the_floor_is_underpowered(self) -> None:
+        assert self._metrics(MIN_TRADES_PER_PARAMETER - 0.1).underpowered
+
+    def test_at_the_floor_is_not_underpowered(self) -> None:
+        assert not self._metrics(MIN_TRADES_PER_PARAMETER).underpowered
+
+    def test_unknown_ratio_is_not_a_failure(self) -> None:
+        assert not self._metrics(None).underpowered
+
+
+class TestComputeSignificance:
+    def _result(self, entries: int) -> object:
+        from trading.engine import BacktestResult
+        from trading.types import Portfolio
+
+        fills = []
+        for i in range(entries):
+            fills.append((_ts(1), Fill(symbol=f"S{i}", side=Side.BUY, qty=1.0, price=10.0)))
+        return BacktestResult(
+            symbols=["A"],
+            starting_cash=100.0,
+            equity_curve=_curve([100.0, 101.0]),
+            final_portfolio=Portfolio(cash=100.0),
+            fills=fills,
+        )
+
+    def test_trade_count_always_populated(self) -> None:
+        metrics = compute(self._result(4))  # type: ignore[arg-type]
+        assert metrics.trade_count == 4
+        assert metrics.trades_per_parameter is None
+
+    def test_free_parameters_turns_on_the_ratio(self) -> None:
+        metrics = compute(self._result(60), free_parameters=4)  # type: ignore[arg-type]
+        assert metrics.trades_per_parameter == pytest.approx(15.0)
+        assert metrics.underpowered
+
+    def test_ample_sample_is_not_underpowered(self) -> None:
+        metrics = compute(self._result(60), free_parameters=2)  # type: ignore[arg-type]
+        assert metrics.trades_per_parameter == pytest.approx(30.0)
+        assert not metrics.underpowered

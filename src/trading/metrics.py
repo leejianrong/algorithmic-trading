@@ -22,7 +22,7 @@ from itertools import pairwise
 from math import sqrt
 from typing import TYPE_CHECKING
 
-from trading.types import Side
+from trading.types import SHARE_EPS, Side
 
 if TYPE_CHECKING:
     from trading.engine import BacktestResult, EquityPoint
@@ -221,6 +221,61 @@ def peak_exposure(exposures: list[float]) -> float:
     return max(exposures)
 
 
+# Below this many trades per free parameter, a result is not evidence — it is an
+# anecdote fitted to noise, and the report says so. The 30-50 range is the common
+# practitioner floor for statistical significance in a parameter search; 30 is the
+# lenient end of it (ADR-0029).
+MIN_TRADES_PER_PARAMETER = 30.0
+
+
+def entry_count(fills: Sequence[tuple[object, Fill]]) -> int:
+    """Number of *position-opening* trades across the blotter.
+
+    A round trip is two fills (a buy in, a sell out) and a rebalance can add
+    several more, so counting raw fills would inflate the trade count several-fold
+    — and trade count is the denominator of a statistical-significance claim, which
+    makes over-counting the flattering direction. This counts only the fills that
+    take a symbol from flat to held, reconstructing the running position per symbol
+    from the blotter in submission order (the same reconstruction
+    :func:`win_rate` does).
+
+    Positions still open at the end of the run count: an entry is a decision the
+    strategy made, whether or not it has been closed yet.
+    """
+    held: dict[str, float] = {}
+    entries = 0
+    for _ts, fill in fills:
+        current = held.get(fill.symbol, 0.0)
+        if fill.side is Side.BUY:
+            if current <= SHARE_EPS:
+                entries += 1
+            held[fill.symbol] = current + fill.qty
+        else:
+            held[fill.symbol] = current - fill.qty
+    return entries
+
+
+def trades_per_parameter(
+    fills: Sequence[tuple[object, Fill]],
+    free_parameters: int | None,
+) -> float | None:
+    """Entries per tunable strategy parameter, or ``None`` when unknowable.
+
+    The overfitting question this answers: a strategy with 4 knobs and 12 trades
+    has not been validated, it has been decorated. Returns
+    ``entry_count / free_parameters``.
+
+    ``None`` when ``free_parameters`` is ``None`` (the caller did not say) — an
+    honest absence, never a stand-in ``0.0`` that would read as a *failed* check
+    rather than an *absent* one. A strategy with zero free parameters (e.g.
+    ``buy_and_hold``) cannot be overfit by parameter search, so it reports
+    ``None`` too rather than dividing by zero.
+    """
+    if free_parameters is None or free_parameters <= 0:
+        return None
+    return entry_count(fills) / free_parameters
+
+
 @dataclass(frozen=True, slots=True)
 class PerformanceMetrics:
     """Headline performance figures for a run.
@@ -239,10 +294,38 @@ class PerformanceMetrics:
     turnover: float
     avg_exposure: float
     peak_exposure: float
+    # Sample-size honesty (ADR-0029). ``trade_count`` is position-opening entries,
+    # not raw fills. ``trades_per_parameter`` is ``None`` when the caller did not
+    # supply a free-parameter count, or when the strategy has none to overfit.
+    # Both default so existing positional/keyword construction stays valid.
+    trade_count: int = 0
+    trades_per_parameter: float | None = None
+
+    @property
+    def underpowered(self) -> bool:
+        """Whether the sample is too small to support a parameter search.
+
+        ``True`` only when a ratio is known *and* falls below
+        :data:`MIN_TRADES_PER_PARAMETER`. An unknown ratio is not a failure, so
+        this stays ``False`` — the report distinguishes the two in its wording.
+        """
+        ratio = self.trades_per_parameter
+        return ratio is not None and ratio < MIN_TRADES_PER_PARAMETER
 
 
-def compute(result: BacktestResult, periods_per_year: float = 252.0) -> PerformanceMetrics:
-    """Assemble :class:`PerformanceMetrics` from a run's curve and fills."""
+def compute(
+    result: BacktestResult,
+    periods_per_year: float = 252.0,
+    *,
+    free_parameters: int | None = None,
+) -> PerformanceMetrics:
+    """Assemble :class:`PerformanceMetrics` from a run's curve and fills.
+
+    ``free_parameters`` is the strategy's count of tunable constructor arguments
+    (see :func:`trading.strategies.free_parameter_count`). Supplying it turns on
+    the trades-per-parameter significance figure; omitting it leaves that figure
+    ``None`` and changes nothing else, so every existing caller is unaffected.
+    """
     curve = result.equity_curve
     exposures = [point.exposure for point in curve]
     return PerformanceMetrics(
@@ -256,4 +339,6 @@ def compute(result: BacktestResult, periods_per_year: float = 252.0) -> Performa
         turnover=turnover(result.fills, curve, periods_per_year),
         avg_exposure=avg_exposure(exposures),
         peak_exposure=peak_exposure(exposures),
+        trade_count=entry_count(result.fills),
+        trades_per_parameter=trades_per_parameter(result.fills, free_parameters),
     )

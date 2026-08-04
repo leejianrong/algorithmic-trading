@@ -2,7 +2,10 @@
 
 ``summarize`` renders the headline performance block — total & annualized return,
 Sharpe, Sortino, Calmar, max drawdown, average/peak exposure, win rate, and
-turnover — alongside the V3 guardrail lines (rejected/clamped orders, halt).
+turnover — alongside the V3 guardrail lines (rejected/clamped orders, halt) and,
+when the caller supplies the strategy's free-parameter count, the
+trades-per-parameter sample-size check with a warning when it is too thin to be
+evidence (ADR-0029).
 ``write_equity_csv`` writes one
 row per trading day with an ``exposure`` column and, when a benchmark run is
 supplied, a ``benchmark_equity`` column aligned by timestamp. ``write_equity_png``
@@ -18,7 +21,7 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from trading.metrics import compute
+from trading.metrics import MIN_TRADES_PER_PARAMETER, compute
 
 if TYPE_CHECKING:
     from trading.engine import BacktestResult, EquityPoint
@@ -37,6 +40,7 @@ def summarize(
     benchmark: BacktestResult | None = None,
     *,
     periods_per_year: float = 252.0,
+    free_parameters: int | None = None,
 ) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
 
@@ -44,8 +48,13 @@ def summarize(
     comparing the strategy to the (unconstrained) benchmark run. ``periods_per_year``
     scales the annualized figures (Sharpe/Sortino/Calmar/annualized return) to the
     run's bar frequency; the default of 252.0 keeps daily runs byte-identical.
+
+    ``free_parameters`` (from
+    :func:`trading.strategies.free_parameter_count`) adds the trades-per-parameter
+    significance line and, when the sample is too thin to support that many knobs,
+    an explicit warning (ADR-0029). Omitted, the block is unchanged.
     """
-    metrics = compute(result, periods_per_year)
+    metrics = compute(result, periods_per_year, free_parameters=free_parameters)
     lines = [
         f"Symbols:       {', '.join(result.symbols)}",
         f"Starting cash: ${result.starting_cash:,.2f}",
@@ -60,8 +69,20 @@ def summarize(
         f"Peak exposure: {metrics.peak_exposure * 100:.2f}%",
         f"Win rate:      {metrics.win_rate * 100:.2f}%",
         f"Turnover:      {metrics.turnover * 100:.2f}%",
+        f"Trades:        {metrics.trade_count} entry/entries",
         f"Bars:          {len(result.equity_curve)}",
     ]
+    if metrics.trades_per_parameter is not None:
+        lines.append(
+            f"Trades/param:  {metrics.trades_per_parameter:.1f} "
+            f"({metrics.trade_count} entries / {free_parameters} free parameter(s))"
+        )
+        if metrics.underpowered:
+            lines.append(
+                f"  ⚠ under {MIN_TRADES_PER_PARAMETER:.0f} trades per free parameter — "
+                "too small a sample to distinguish edge from noise; widen the "
+                "universe or the date range before trusting these numbers"
+            )
     if benchmark is not None:
         bench_symbol = ", ".join(benchmark.symbols)
         bench_return = compute(benchmark, periods_per_year).total_return

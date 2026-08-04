@@ -52,7 +52,12 @@ _METRIC_LABELS: dict[str, str] = {
     "turnover": "Turnover",
     "avg_exposure": "Avg exposure",
     "peak_exposure": "Peak exposure",
+    "trade_count": "Trades (entries)",
+    "trades_per_parameter": "Trades / parameter",
 }
+
+# Metrics that are plain counts, not ratios or percentages.
+_COUNT_METRICS = frozenset({"trade_count"})
 
 
 def _esc(value: Any) -> str:
@@ -111,7 +116,16 @@ def _metrics_panel(metrics: dict[str, Any] | None) -> str:
             continue
         label = _METRIC_LABELS.get(key, key.replace("_", " ").title())
         value = metrics[key]
-        rendered = _pct(value) if key in _PERCENT_METRICS else _ratio(value)
+        if value is None:
+            # An absent metric (e.g. trades-per-parameter on a strategy with no
+            # tunable knobs) reads as "not applicable", never as a zero score.
+            rendered = "n/a"
+        elif key in _PERCENT_METRICS:
+            rendered = _pct(value)
+        elif key in _COUNT_METRICS:
+            rendered = _num(value)
+        else:
+            rendered = _ratio(value)
         tiles.append(
             f'<div class="tile"><div class="tile-label">{_esc(label)}</div>'
             f'<div class="tile-value">{_esc(rendered)}</div></div>'
