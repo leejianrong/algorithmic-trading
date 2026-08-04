@@ -241,10 +241,17 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   branches `claude/<slice>`. Parallel lanes get their own git worktree so
   in-flight branches never collide, and the landing is serialized through one
   integration commit so `main` stays reviewable.
-  **Caveat, verified 2026-08-05:** GitHub branch protection on `main` is *not*
-  actually enabled (`gh api repos/:owner/:repo/branches/main/protection` → 404).
-  PR-only is honored by convention here, not enforced by the platform — do not
-  rely on the platform to stop a direct push.
+  **Now platform-enforced, as of 2026-08-04.** Branch protection on `main` is on
+  and `enforce_admins` is **true**, so a direct push is rejected for everyone
+  including the repo owner — the previous caveat ("not actually enabled … do not
+  rely on the platform") is obsolete. Required to merge: all six CI checks
+  (`lint`, `typecheck`, `unit`, `integration`, `build`, `security`), a PR (0
+  approvals, so a solo maintainer can self-merge), a branch up to date with `main`
+  (`strict`), linear history, and resolved conversations. Force-pushes and branch
+  deletion are blocked. Inspect with
+  `gh api repos/:owner/:repo/branches/main/protection`; the escape hatch, if a
+  required check can never pass, is to edit protection — an admin can still do
+  that, which is what keeps `enforce_admins: true` from deadlocking a solo repo.
 - **Fast gate before every push.** `make check` must pass; the pre-push hook runs
   it. Bypass only with a scoped reason via `git push --no-verify`.
 - **Layer tests by cost.** Fast layer = no infra, runs everywhere. Integration
