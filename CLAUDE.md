@@ -110,6 +110,18 @@ As of this writing:
   verified against the broker before live use. Fast gate green; `backtest --source
   synthetic --symbols @blue20 --sector-map @blue20 --max-sector-exposure 0.30` runs
   end to end offline.
+- **Cross-sectional strategy (offline-verified):** `cross_sectional`
+  (`strategies/cross_sectional.py`, ADR-0025) joins the registry — the first
+  *cross-equity* (relative-strength) strategy. Each rebalance it ranks the whole
+  universe by trailing total return over `lookback` (default 120) from
+  `context.history` (past+present only), holds the top `top_k` (default 8) at equal
+  weight `weight/top_k` (weight default 0.9), and targets 0.0 for the rest (exit).
+  Turnover is controlled by a `rebalance_days` cadence (default 21 ≈ monthly), not
+  daily churn; long-or-flat only; warmup stays flat until `lookback` bars exist. All
+  four params sweep via `trading sweep --param` (constructor kwargs). Fits the
+  existing `Strategy` seam with no engine/interface change; `weight/top_k` must stay
+  under the position cap (K=8 → ~11%, safe) or the guardrails clamp. Fast gate green;
+  runs end to end on `--symbols @blue20 --source synthetic`.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR); and
   locking `alpaca-py` into the dependency set (deferred while the build sandbox is
   offline). Real Alpaca paper/live-quote runs need `pip install alpaca-py` plus
@@ -188,7 +200,7 @@ src/trading/
   data/alpaca_client.py    # AlpacaClient seam + Fake/Real clients (ADR-0017/0018)
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022)
-  strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion + registry
+  strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry
   universe.py              # curated named stock baskets (blue20) + @name CLI expansion (ADR-0024)
   metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure (periods_per_year)
   sweep.py                 # parameter sweep / walk-forward over Engine.run (ADR-0016)

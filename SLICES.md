@@ -284,11 +284,17 @@ bar). Wrong → decisions use unfinished data.
    validates it live at connect-time. `universe.py` (ADR-0024) is the seed candidate
    set; this closes the honesty gap — the backtest universe mirrors what is actually
    tradable, not an assumed list.
-2. **Cross-sectional rank-and-hold-top-K strategy.** Score every symbol from
-   `context.history`, hold the top K at equal weight, flat the rest. Long-only (no
-   shorting, ADR-0011); needs a rebalance cadence / hysteresis to control turnover.
-   Fits the existing `Strategy` seam with no engine change — `@blue20` is a natural
-   candidate universe.
+2. **Cross-sectional rank-and-hold-top-K strategy.** **Done** —
+   `cross_sectional` (`strategies/cross_sectional.py`, ADR-0025). Each rebalance it
+   scores every symbol by trailing total return over `lookback` (default 120) from
+   `context.history` (past+present only), ranks descending, holds the top `top_k`
+   (default 8) at equal weight `weight/top_k` (weight default 0.9), and targets 0.0
+   for the rest (exit). Turnover is controlled by a `rebalance_days` cadence (default
+   21 ≈ monthly), not daily churn; long-only (no shorting, ADR-0011); warmup stays
+   flat until `lookback` bars exist. All four params sweep via `trading sweep`. Fits
+   the existing `Strategy` seam with no engine change; `@blue20` is the candidate
+   universe. Fast tests green (top-K pick, cadence, drop-out exit, no look-ahead,
+   plus an offline end-to-end run on `@blue20 --source synthetic`).
 3. **Limit / market-on-open order support.** Honor the already-present `Order.type` /
    `Order.limit_price` fields: `SimulatedBroker` fills a limit only when the next
    bar's OHLC reaches it (else a DAY cancel); `AlpacaBroker` maps to a limit or
