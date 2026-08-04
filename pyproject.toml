@@ -69,3 +69,9 @@ files = ["src", "tests"]
 [[tool.mypy.overrides]]
 module = ["yfinance.*"]
 ignore_missing_imports = true
+# alpaca-py is an optional, lazily-imported live-trading dependency: it is not
+# installed in the fast gate and ships no stubs, so tolerate the missing import
+# (RealAlpacaClient converts every SDK response into our own types).
+[[tool.mypy.overrides]]
+module = ["alpaca.*"]
+ignore_missing_imports = true
