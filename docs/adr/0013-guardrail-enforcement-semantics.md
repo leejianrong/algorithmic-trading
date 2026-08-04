@@ -39,6 +39,14 @@ semantics:
    bounce. The monitor is stateful — one `Guardrails` instance per run — tracking
    the running equity peak and the previous bar's equity.
 
+   **Amended by [ADR-0031](0031-halt-recovery.md):** the latch is the *default*, not
+   the only option. Measured on real 2000-2020 data, latching for a 20-year session
+   halted every strategy (usually in 2001) and blocked entries for the following 19
+   years, which made the numbers meaningless. Two opt-in `RiskConfig` knobs —
+   `halt_recovery_drawdown_pct` and `halt_cooldown_bars`, both `None` by default —
+   can re-arm a tripped halt, with enforced anti-flap guarantees and per-episode
+   recording. With neither set, this paragraph holds exactly as written.
+
 4. **Cash sufficiency stays with the broker.** The caps keep buys within *equity*;
    the authoritative "can this fill be paid for?" check remains in
    `SimulatedBroker` (ADR-0004), the single accounting authority. Guardrails and
@@ -82,7 +90,7 @@ cause/first-trip timestamp are recorded on `BacktestResult` (`clamps`,
 | Option | Why not |
 |--------|---------|
 | Reject over-cap orders outright | Loses the exposure the strategy is actually allowed; a 1% overshoot shouldn't drop the whole trade. |
-| Un-halt when drawdown recovers | A recovering curve mid-crash is exactly when discipline matters; a latching stop is the safer real-capital habit. |
+| Un-halt when drawdown recovers | A recovering curve mid-crash is exactly when discipline matters; a latching stop is the safer real-capital habit. (Revisited and made available opt-in by ADR-0031, after the latch was measured to disable multi-decade backtests entirely.) |
 | Block exits while halted too | Traps you in a losing position — the opposite of a kill switch; you must always be able to reduce risk. |
 | Move cash checks into the guardrails | Duplicates accounting the broker already owns (ADR-0004) and risks the two drifting; caps and funding are separate concerns. |
 | Check each order against only the frozen pre-trade book | Same-bar orders queue and don't fill until the next bar, so the book doesn't move between checks; N orders each under the cap would collectively breach it. The within-bar tally closes that hole without joint sizing. |

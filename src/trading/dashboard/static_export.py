@@ -269,9 +269,25 @@ def _halt_banner(halt: dict[str, Any]) -> str:
     return (
         '<div class="halt-banner" role="alert">'
         f"<strong>Kill switch fired{when}.</strong> {_esc(reason)} — "
-        "new entries blocked while the halt latched (exits still allowed)."
+        f"new entries blocked while halted (exits still allowed). {_halt_episode_note(halt)}"
         "</div>"
     )
+
+
+def _halt_episode_note(halt: dict[str, Any]) -> str:
+    """Say whether the halt held for the rest of the run or re-armed (ADR-0031).
+
+    Reads the additive ``episodes``/``episode_count`` keys; an older ``result.json``
+    written before halt recovery existed has neither, and then the note reduces to
+    the latching wording the banner has always carried.
+    """
+    episodes = halt.get("episodes") or []
+    if not episodes:
+        return "The halt latched for the rest of the run."
+    resumed = sum(1 for episode in episodes if episode.get("resume_ts"))
+    if not resumed:
+        return "The halt latched for the rest of the run."
+    return f"{len(episodes)} halt episode(s), {resumed} re-armed."
 
 
 def _header(document: dict[str, Any]) -> str:

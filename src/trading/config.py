@@ -39,6 +39,25 @@ class RiskConfig:
     a ``sector_map`` is an optional per-sector gross cap (ADR-0019) that limits how
     much of equity may sit in any one sector; off by default. Every limit is
     overridable per run; :meth:`unlimited` returns the permissive opt-out.
+
+    ``halt_recovery_drawdown_pct`` and ``halt_cooldown_bars`` are the two optional
+    **halt-recovery** knobs (ADR-0031). Both are ``None`` by default, which keeps the
+    kill switch **latching for the whole run** exactly as ADR-0013 decided. Set
+    either (or both) and a tripped halt can *re-arm*:
+
+    * ``halt_recovery_drawdown_pct`` — re-arm once drawdown from the peak has
+      recovered back to at most this fraction. It must be strictly **below**
+      ``max_drawdown_pct``: that gap is the hysteresis band, and validating it here
+      is the first of the two anti-flap guarantees (a config where the trip and
+      re-arm levels coincide is rejected, not silently allowed to oscillate).
+    * ``halt_cooldown_bars`` — re-arm only after the halt has been in force for this
+      many bars (counting the bar it fired on). Must be a positive integer.
+
+    With both set the **earlier** trigger re-arms the switch (OR). ADR-0031 explains
+    why the more conservative AND was rejected: a halted long-or-flat strategy may
+    exit but not enter, so it drains to cash and its equity — hence its drawdown —
+    freezes, and a drawdown condition not already met at that moment can never be
+    met. AND would therefore silently reinstate the permanent latch.
     """
 
     max_position_pct: float = 0.25
@@ -48,6 +67,18 @@ class RiskConfig:
     target_volatility: float | None = None
     sector_map: Mapping[str, str] | None = None
     max_sector_exposure: float | None = None
+    halt_recovery_drawdown_pct: float | None = None
+    halt_cooldown_bars: int | None = None
+
+    @property
+    def halt_recovery_enabled(self) -> bool:
+        """Whether any recovery mechanism is configured (ADR-0031).
+
+        ``False`` — the default — means the halt latches for the run, the ADR-0013
+        behavior. The monitor checks this once per bar and skips the whole re-arm
+        path when it is off, so the latching path is untouched.
+        """
+        return self.halt_recovery_drawdown_pct is not None or self.halt_cooldown_bars is not None
 
     def __post_init__(self) -> None:
         if self.max_position_pct <= 0:
@@ -62,6 +93,21 @@ class RiskConfig:
             raise ValueError("target_volatility must be None or positive")
         if self.max_sector_exposure is not None and not 0 < self.max_sector_exposure <= 1.0:
             raise ValueError("max_sector_exposure must be None or in (0, 1]")
+        recovery = self.halt_recovery_drawdown_pct
+        if recovery is not None:
+            if not 0 <= recovery < 1.0:
+                raise ValueError("halt_recovery_drawdown_pct must be None or in [0, 1)")
+            # The hysteresis band must be non-empty: re-arming at (or above) the
+            # trip level would let the switch halt and re-arm on adjacent bars
+            # forever (ADR-0031, anti-flap guarantee 1).
+            if recovery >= self.max_drawdown_pct:
+                raise ValueError(
+                    "halt_recovery_drawdown_pct must be strictly below max_drawdown_pct "
+                    f"(got {recovery} >= {self.max_drawdown_pct}); the gap is the "
+                    "hysteresis band that stops the kill switch from flapping"
+                )
+        if self.halt_cooldown_bars is not None and self.halt_cooldown_bars < 1:
+            raise ValueError("halt_cooldown_bars must be None or a positive integer")
 
     @classmethod
     def unlimited(cls) -> RiskConfig:

@@ -14,7 +14,7 @@ from pathlib import Path
 
 from trading.dashboard.payload import build_payload
 from trading.dashboard.static_export import render_html, write_html
-from trading.engine import BacktestResult, EquityPoint
+from trading.engine import BacktestResult, EquityPoint, HaltEpisode
 from trading.metrics import PerformanceMetrics
 from trading.report import RESULT_SCHEMA_VERSION, result_to_dict
 from trading.types import Fill, Order, Portfolio, Side
@@ -131,6 +131,21 @@ def test_render_html_shows_halt_banner_when_halted() -> None:
     assert 'class="halt-banner"' in html
     assert "Kill switch fired" in html
     assert "max drawdown breached" in html
+    # No episodes recorded (a pre-ADR-0031 document): the latching wording stands.
+    assert "latched for the rest of the run" in html
+
+
+def test_render_html_banner_reports_re_armed_halt_episodes() -> None:
+    """A run whose halt re-armed must not be described as latched (ADR-0031)."""
+    result = _halted_result()
+    result.halt_episodes = [
+        HaltEpisode(halt_ts=_ts(2), reason="max drawdown breached", resume_ts=_ts(4)),
+        HaltEpisode(halt_ts=_ts(6), reason="max drawdown breached"),
+    ]
+    doc = result_to_dict(result, mode="backtest", frequency="1d", metrics=_metrics())
+    html = render_html(build_payload(doc))
+    assert "2 halt episode(s), 1 re-armed." in html
+    assert "latched for the rest of the run" not in html
 
 
 def test_render_html_no_halt_banner_when_not_halted() -> None:

@@ -18,6 +18,10 @@ Three honesty knobs sit on top of that, all opt-in and all off by default:
   volume the strategy hasn't reached. Every dropped symbol is printed.
 - ``verify-universe`` asks the broker which symbols are actually tradable and
   fractionable (ADR-0028), instead of trusting a curated basket.
+- ``--halt-recovery-drawdown`` / ``--halt-cooldown-bars`` let the drawdown kill
+  switch **re-arm** instead of latching for the whole run (ADR-0031) — the
+  difference between a protected 20-year backtest and one disabled from 2001
+  onward. Both off by default, on ``backtest``, ``paper``, and ``sweep``.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -199,11 +203,14 @@ def _build_risk(
     target_vol: float | None,
     sector_map: str,
     max_sector_exposure: float | None,
+    halt_recovery_drawdown: float | None = None,
+    halt_cooldown_bars: int | None = None,
 ) -> RiskConfig:
     """Assemble the run's RiskConfig, or the permissive opt-out when disabled.
 
     Raises ValueError (surfaced as a clean CLI error by the caller) on an invalid
-    limit or a malformed --sector-map.
+    limit, a malformed --sector-map, or a halt-recovery threshold that is not below
+    --max-drawdown (ADR-0031).
     """
     if no_guardrails:
         return RiskConfig.unlimited()
@@ -214,6 +221,8 @@ def _build_risk(
         target_volatility=target_vol,
         sector_map=_parse_sector_map(sector_map),
         max_sector_exposure=max_sector_exposure,
+        halt_recovery_drawdown_pct=halt_recovery_drawdown,
+        halt_cooldown_bars=halt_cooldown_bars,
     )
 
 
@@ -262,6 +271,22 @@ def backtest(
     ),
     max_drawdown: float = typer.Option(
         0.20, "--max-drawdown", help="Drawdown kill-switch threshold, fraction from peak."
+    ),
+    halt_recovery_drawdown: float | None = typer.Option(
+        None,
+        "--halt-recovery-drawdown",
+        help=(
+            "Re-arm the halted kill switch once drawdown has recovered to at most this "
+            "fraction (must be below --max-drawdown); off by default, so the halt latches."
+        ),
+    ),
+    halt_cooldown_bars: int | None = typer.Option(
+        None,
+        "--halt-cooldown-bars",
+        help=(
+            "Re-arm the halted kill switch after this many bars in force. With "
+            "--halt-recovery-drawdown, whichever triggers first wins. Off by default."
+        ),
     ),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
@@ -324,6 +349,8 @@ def backtest(
             target_vol=target_vol,
             sector_map=sector_map,
             max_sector_exposure=max_sector_exposure,
+            halt_recovery_drawdown=halt_recovery_drawdown,
+            halt_cooldown_bars=halt_cooldown_bars,
         )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -432,6 +459,8 @@ def _format_bar(outcome: BarOutcome) -> str:
         parts.append(f"REJECT {order.side.value.upper()} {order.symbol} ({reason})")
     if outcome.halted_now:
         parts.append("HALT: kill switch tripped — new entries blocked")
+    if outcome.resumed_now:
+        parts.append("RESUME: kill switch re-armed — new entries allowed again")
     parts.append(f"equity: ${outcome.equity:,.2f}  exposure: {outcome.exposure * 100:.1f}%")
     return "  |  ".join(parts)
 
@@ -486,6 +515,22 @@ def paper(
     ),
     max_drawdown: float = typer.Option(
         0.20, "--max-drawdown", help="Drawdown kill-switch threshold, fraction from peak."
+    ),
+    halt_recovery_drawdown: float | None = typer.Option(
+        None,
+        "--halt-recovery-drawdown",
+        help=(
+            "Re-arm the halted kill switch once drawdown has recovered to at most this "
+            "fraction (must be below --max-drawdown); off by default, so the halt latches."
+        ),
+    ),
+    halt_cooldown_bars: int | None = typer.Option(
+        None,
+        "--halt-cooldown-bars",
+        help=(
+            "Re-arm the halted kill switch after this many bars in force. With "
+            "--halt-recovery-drawdown, whichever triggers first wins. Off by default."
+        ),
     ),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
@@ -545,6 +590,8 @@ def paper(
             target_vol=target_vol,
             sector_map=sector_map,
             max_sector_exposure=max_sector_exposure,
+            halt_recovery_drawdown=halt_recovery_drawdown,
+            halt_cooldown_bars=halt_cooldown_bars,
         )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -780,6 +827,22 @@ def sweep(
     max_drawdown: float = typer.Option(
         0.20, "--max-drawdown", help="Drawdown kill-switch threshold, fraction from peak."
     ),
+    halt_recovery_drawdown: float | None = typer.Option(
+        None,
+        "--halt-recovery-drawdown",
+        help=(
+            "Re-arm the halted kill switch once drawdown has recovered to at most this "
+            "fraction (must be below --max-drawdown); off by default, so the halt latches."
+        ),
+    ),
+    halt_cooldown_bars: int | None = typer.Option(
+        None,
+        "--halt-cooldown-bars",
+        help=(
+            "Re-arm the halted kill switch after this many bars in force. With "
+            "--halt-recovery-drawdown, whichever triggers first wins. Off by default."
+        ),
+    ),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
     ),
@@ -835,6 +898,8 @@ def sweep(
             target_vol=target_vol,
             sector_map=sector_map,
             max_sector_exposure=max_sector_exposure,
+            halt_recovery_drawdown=halt_recovery_drawdown,
+            halt_cooldown_bars=halt_cooldown_bars,
         )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)

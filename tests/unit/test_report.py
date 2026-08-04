@@ -14,7 +14,7 @@ from typing import Any
 
 import pytest
 
-from trading.engine import BacktestResult, EquityPoint
+from trading.engine import BacktestResult, EquityPoint, HaltEpisode
 from trading.report import summarize, write_equity_csv, write_equity_png
 from trading.types import Fill, Portfolio, Side
 
@@ -40,6 +40,43 @@ def _result(
         final_portfolio=Portfolio(cash=equities[-1]),
         fills=fills or [],
     )
+
+
+class TestSummaryHaltLines:
+    """The halt block: unchanged under the default latch, episodes when it re-armed."""
+
+    @staticmethod
+    def _halted(episodes: list[HaltEpisode]) -> BacktestResult:
+        result = _result([100.0, 90.0, 95.0])
+        result.halted = True
+        result.halt_ts = _ts(2)
+        result.halt_reason = "drawdown 20.0% ≥ max 20.0%"
+        result.halt_episodes = episodes
+        return result
+
+    def test_single_latched_halt_prints_only_the_legacy_line(self) -> None:
+        # ADR-0031: one open-ended episode says nothing the Halt: line does not, so
+        # the default-config summary is byte-identical to before the feature.
+        summary = summarize(
+            self._halted([HaltEpisode(halt_ts=_ts(2), reason="drawdown 20.0% ≥ max 20.0%")])
+        )
+        assert "Halt:          fired at 2024-01-02T00:00:00+00:00" in summary
+        assert "Halt episodes:" not in summary
+
+    def test_re_armed_halts_report_the_episode_count_and_spans(self) -> None:
+        summary = summarize(
+            self._halted(
+                [
+                    HaltEpisode(
+                        halt_ts=_ts(2), reason="drawdown 20.0% ≥ max 20.0%", resume_ts=_ts(4)
+                    ),
+                    HaltEpisode(halt_ts=_ts(6), reason="drawdown 21.0% ≥ max 20.0%"),
+                ]
+            )
+        )
+        assert "Halt episodes: 2 (1 re-armed, 1 still in force at the end)" in summary
+        assert "#1 2024-01-02T00:00:00+00:00 → 2024-01-04T00:00:00+00:00" in summary
+        assert "#2 2024-01-06T00:00:00+00:00 → (in force)" in summary
 
 
 class TestSummaryMetricsBlock:

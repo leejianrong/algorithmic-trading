@@ -79,6 +79,55 @@ def test_backtest_target_vol_rejects_nonpositive(tmp_path: Path) -> None:
     assert "target_volatility" in result.output
 
 
+def test_backtest_halt_recovery_flags_run_offline(tmp_path: Path) -> None:
+    """Both ADR-0031 knobs thread through --build-risk on the real CLI path."""
+    out = tmp_path / "equity.csv"
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--source",
+            "synthetic",
+            "--max-drawdown",
+            "0.05",
+            "--halt-recovery-drawdown",
+            "0.02",
+            "--halt-cooldown-bars",
+            "5",
+            "--out",
+            str(out),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Final equity" in result.output
+
+
+def test_backtest_halt_recovery_above_the_trip_level_is_rejected(tmp_path: Path) -> None:
+    """The hysteresis band is validated at the CLI boundary, not discovered mid-run."""
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--source",
+            "synthetic",
+            "--max-drawdown",
+            "0.20",
+            "--halt-recovery-drawdown",
+            "0.20",
+            "--out",
+            str(tmp_path / "e.csv"),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 2
+    assert "strictly below max_drawdown_pct" in result.output
+
+
 def test_unknown_source_is_rejected(tmp_path: Path) -> None:
     result = runner.invoke(
         app,

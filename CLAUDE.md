@@ -159,6 +159,22 @@ As of this writing:
   range requested from the adapter and asserts each ends before the start line). Every
   run now reports its entry count, and below 30 trades per free parameter the summary
   warns explicitly. `volume` was parsed by every adapter and read by nothing until now.
+- **Halt recovery (offline-verified):** the drawdown kill switch can **re-arm**
+  instead of latching for the whole run (ADR-0031) — the latch was measured to halt
+  every strategy in ~2001 on 2000-2020 real data and then block entries for 19 years
+  (`cross_sectional`: -3.91% latched vs +1727% neutralized). Two opt-in `RiskConfig`
+  knobs, `halt_recovery_drawdown_pct` and `halt_cooldown_bars` (CLI
+  `--halt-recovery-drawdown` / `--halt-cooldown-bars` on backtest/paper/sweep), both
+  `None` by default so prior runs are byte-identical. Whichever triggers **first**
+  re-arms (OR, not AND: a halted long-or-flat book drains to cash and freezes its
+  drawdown, so AND measurably reinstated the permanent latch). Anti-flap is enforced:
+  the config rejects a recovery threshold at/above `max_drawdown_pct`, re-arming
+  resets the drawdown *control* peak to the resume equity (reported drawdown still
+  comes from `metrics`), and a re-arm bar never re-halts — so with a cooldown of N,
+  halts cannot recur faster than every N+1 bars. `BacktestResult` keeps
+  `halted`/`halt_ts`/`halt_reason` (first halt) and adds `halt_episodes`
+  (`(halt_ts, reason, resume_ts)`); `result.json`'s `halt` gains `episode_count` +
+  `episodes` additively, so `RESULT_SCHEMA_VERSION` stays **1**. Fast gate green.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR); and
   locking `alpaca-py` into the dependency set (deferred while the build sandbox is
   offline). Real Alpaca paper/live-quote runs need `pip install alpaca-py` plus
@@ -222,7 +238,9 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   overlapping ranges must agree bar-for-bar on the timestamps they share; a sub-range
   is a slice of its parent, never a re-anchored replay (ADR-0030).
 - **Guardrails are enforced, not advisory:** position/exposure caps and the
-  drawdown kill switch can veto or clamp orders (ADR-0009).
+  drawdown kill switch can veto or clamp orders (ADR-0009). The halt latches for the
+  whole run **unless** recovery is configured, and recovery is off by default
+  (ADR-0013 as amended by ADR-0031); exits are allowed while halted, always.
 - **One execution path:** backtest and paper differ only in feed and clock;
   never fork strategy/broker/portfolio logic between them (ADR-0002).
 - **No implicit shorting; fractional-share quantities allowed** (ADR-0011).
