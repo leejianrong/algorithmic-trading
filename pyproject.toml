@@ -15,6 +15,10 @@ dependencies = [
 [project.optional-dependencies]
 # Optional equity-curve image rendering (kept out of the core install).
 plot = ["matplotlib>=3.8"]
+# Optional web dashboard server (static HTML export needs none of this). FastAPI
+# and uvicorn are imported lazily by trading.dashboard.server (ADR-0023), so the
+# fast gate stays green without them.
+dashboard = ["fastapi>=0.110", "uvicorn>=0.29"]
 
 [project.scripts]
 trading = "trading.cli:app"
@@ -74,4 +78,10 @@ ignore_missing_imports = true
 # (RealAlpacaClient converts every SDK response into our own types).
 [[tool.mypy.overrides]]
 module = ["alpaca.*"]
+ignore_missing_imports = true
+# fastapi/uvicorn are the optional, lazily-imported dashboard-server dependency:
+# not installed in the fast gate, so tolerate the missing import (the server shell
+# guards each import and raises a clear ImportError naming the dashboard extra).
+[[tool.mypy.overrides]]
+module = ["fastapi.*", "uvicorn.*", "starlette.*"]
 ignore_missing_imports = true

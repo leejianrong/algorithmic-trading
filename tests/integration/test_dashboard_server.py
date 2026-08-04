@@ -17,7 +17,7 @@ import pytest
 pytest.importorskip("fastapi")
 pytest.importorskip("httpx")
 
-from fastapi.testclient import TestClient  # type: ignore[import-not-found]
+from fastapi.testclient import TestClient
 
 from trading.dashboard.server import create_app
 from trading.engine import BacktestResult, EquityPoint

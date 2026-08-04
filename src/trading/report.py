@@ -32,13 +32,20 @@ if TYPE_CHECKING:
 RESULT_SCHEMA_VERSION = 1
 
 
-def summarize(result: BacktestResult, benchmark: BacktestResult | None = None) -> str:
+def summarize(
+    result: BacktestResult,
+    benchmark: BacktestResult | None = None,
+    *,
+    periods_per_year: float = 252.0,
+) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
 
     When ``benchmark`` is supplied, appends a side-by-side total-return line
-    comparing the strategy to the (unconstrained) benchmark run.
+    comparing the strategy to the (unconstrained) benchmark run. ``periods_per_year``
+    scales the annualized figures (Sharpe/Sortino/Calmar/annualized return) to the
+    run's bar frequency; the default of 252.0 keeps daily runs byte-identical.
     """
-    metrics = compute(result)
+    metrics = compute(result, periods_per_year)
     lines = [
         f"Symbols:       {', '.join(result.symbols)}",
         f"Starting cash: ${result.starting_cash:,.2f}",
@@ -57,7 +64,7 @@ def summarize(result: BacktestResult, benchmark: BacktestResult | None = None) -
     ]
     if benchmark is not None:
         bench_symbol = ", ".join(benchmark.symbols)
-        bench_return = compute(benchmark).total_return
+        bench_return = compute(benchmark, periods_per_year).total_return
         delta = metrics.total_return - bench_return
         lines.append(
             f"Benchmark ({bench_symbol}): {bench_return * 100:+.2f}% "
