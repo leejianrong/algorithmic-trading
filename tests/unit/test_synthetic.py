@@ -45,6 +45,15 @@ def test_bars_are_valid_and_weekday_only() -> None:
     assert len(set(stamps)) == len(stamps)
 
 
+def test_raw_equals_adjusted_no_corporate_actions() -> None:
+    # ADR-0021: synthetic GBM has no corporate actions, so the adjusted flag must
+    # not change the numbers — the same series drives both feeds.
+    adapter = SyntheticAdapter(seed=3)
+    adjusted = adapter.get_bars("AAA", _START, _END, adjusted=True)
+    raw = adapter.get_bars("AAA", _START, _END, adjusted=False)
+    assert adjusted == raw and len(raw) > 0
+
+
 def test_count_matches_weekdays_in_range() -> None:
     # 2022-01-03 .. 2022-01-07 is Mon..Fri = 5 trading days.
     bars = SyntheticAdapter().get_bars(

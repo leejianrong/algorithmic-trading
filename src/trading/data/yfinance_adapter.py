@@ -76,7 +76,12 @@ class YFinanceAdapter:
         adjusted: bool = True,
     ) -> list[Bar]:
         if not adjusted:
-            raise ValueError("YFinanceAdapter serves adjusted prices only (ADR-0008)")
+            raise ValueError(
+                "YFinanceAdapter serves split/dividend-adjusted prices only "
+                "(ADR-0008); it is a backtest source and cannot supply raw quotes. "
+                "For RAW live paper quotes use --source alpaca; for an offline demo "
+                "use --source synthetic (raw == adjusted there)."
+            )
 
         path = self._cache_path(symbol, start, end)
         if not path.exists():

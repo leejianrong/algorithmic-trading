@@ -118,3 +118,14 @@ def test_bar_invariant_failure_is_located(tmp_path: Path) -> None:
     _write_csv(tmp_path, "AAPL", ["2024-01-02,10,5,9,10,10"])
     with pytest.raises(ValueError, match=r"AAPL\.csv:2"):
         CsvAdapter(tmp_path).get_bars("AAPL", *_range())
+
+
+def test_unadjusted_request_steers_to_alpaca_or_synthetic(tmp_path: Path) -> None:
+    # ADR-0021: CSV is a backtest-only (adjusted) source; the raw rejection must
+    # point the user at a raw live source and an offline demo source.
+    _write_csv(tmp_path, "AAPL", ["2024-01-02,10,11,9,10,10"])
+    adapter = CsvAdapter(tmp_path)
+    with pytest.raises(ValueError, match="--source alpaca"):
+        adapter.get_bars("AAPL", *_range(), adjusted=False)
+    with pytest.raises(ValueError, match="--source synthetic"):
+        adapter.get_bars("AAPL", *_range(), adjusted=False)

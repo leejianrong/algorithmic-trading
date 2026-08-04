@@ -75,6 +75,40 @@ class TestPollShape:
             assert set(slice_) == {"AAA", "BBB"}
 
 
+class _SpyAdapter:
+    """Records the ``adjusted`` value each ``get_bars`` call received."""
+
+    def __init__(self, bars: list[Bar]) -> None:
+        self._bars = bars
+        self.adjusted_calls: list[bool] = []
+
+    def get_bars(
+        self, symbol: str, start: datetime, end: datetime, *, adjusted: bool = True
+    ) -> list[Bar]:
+        self.adjusted_calls.append(adjusted)
+        return [b for b in self._bars if b.symbol == symbol and start <= b.ts <= end]
+
+
+class TestRawByDefault:
+    """ADR-0021: the paper feed requests RAW actual quotes unless told otherwise."""
+
+    def test_defaults_to_requesting_raw(self) -> None:
+        adapter = _SpyAdapter([_bar("AAA", d) for d in range(1, 4)])
+        feed = RecentWindowFeed(adapter, FakeClock(_ts(10)))
+
+        feed.poll(["AAA"], lookback=10)
+
+        assert adapter.adjusted_calls == [False]
+
+    def test_honors_an_explicit_adjusted_request(self) -> None:
+        adapter = _SpyAdapter([_bar("AAA", d) for d in range(1, 4)])
+        feed = RecentWindowFeed(adapter, FakeClock(_ts(10)), adjusted=True)
+
+        feed.poll(["AAA"], lookback=10)
+
+        assert adapter.adjusted_calls == [True]
+
+
 class TestDefaultPolicy:
     def test_complete_only_on_a_strictly_later_date(self) -> None:
         bar = _bar("AAA", 5)

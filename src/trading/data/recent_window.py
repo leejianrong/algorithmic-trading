@@ -56,10 +56,17 @@ class RecentWindowFeed:
         adapter: DataAdapter,
         clock: Clock,
         is_complete: CompletenessPolicy = default_is_complete,
+        *,
+        adjusted: bool = False,
     ) -> None:
         self._adapter = adapter
         self._clock = clock
         self._is_complete = is_complete
+        # Paper/live trades on RAW actual quotes, not adjusted total-return prices
+        # (ADR-0021): the strategy must decide and the book must mark in the same
+        # dollars the live broker reconciles from the real account, so this feed
+        # defaults to raw. Backtest keeps adjusted (ADR-0008) via its own feed.
+        self._adjusted = adjusted
 
     def poll(self, symbols: list[str], lookback: int) -> Feed:
         """Return the last ``lookback`` completed bars per symbol, merged & sorted.
@@ -71,7 +78,7 @@ class RecentWindowFeed:
         now = self._clock.now()
         series: dict[str, list[Bar]] = {}
         for symbol in symbols:
-            bars = self._adapter.get_bars(symbol, _FAR_PAST, now)
+            bars = self._adapter.get_bars(symbol, _FAR_PAST, now, adjusted=self._adjusted)
             completed = [b for b in bars if self._is_complete(b, now)]
             series[symbol] = completed[-lookback:]
         return build_feed(series)
