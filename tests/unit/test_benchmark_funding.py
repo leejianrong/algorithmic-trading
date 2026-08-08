@@ -18,6 +18,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from trading.broker import SimulatedBroker
 from trading.cli import _warn_if_benchmark_never_invested
 from trading.config import RiskConfig
@@ -233,14 +235,14 @@ class TestAFailedBenchmarkIsSurfaced:
         ]
         return result
 
-    def test_the_cli_warns_on_stderr(self, capsys) -> None:  # type: ignore[no-untyped-def]
+    def test_the_cli_warns_on_stderr(self, capsys: pytest.CaptureFixture[str]) -> None:
         _warn_if_benchmark_never_invested("SPY", self._flat_benchmark())
         err = capsys.readouterr().err
         assert "warning: benchmark SPY never took a position" in err
         assert "idle cash" in err
         assert "insufficient cash: need 1001.54, have 1000.00" in err
 
-    def test_a_healthy_benchmark_gets_no_warning(self, capsys) -> None:  # type: ignore[no-untyped-def]
+    def test_a_healthy_benchmark_gets_no_warning(self, capsys: pytest.CaptureFixture[str]) -> None:
         healthy = self._flat_benchmark()
         healthy.equity_curve = [
             EquityPoint(point.ts, point.equity, 0.998) for point in healthy.equity_curve
