@@ -160,6 +160,10 @@ in for ours.
   are allowed while halted, always (ADR-0013/0031). Because the side is part of the
   key, an exit is never even *compared* against a working entry: it is structural,
   not a special case that a later refactor could drop. Tested in both directions.
+  **Read this as a statement about the guard, not about the outcome** — the live
+  run found that Alpaca refuses an opposite-side market order while one is working
+  ("potential wash trade detected"), so a parked entry does block the exit at the
+  *venue*. See the second amendment below.
 - **A duplicate SELL is suppressed too, and that is not blocking an exit.** The
   first SELL is already at the venue and will still fill; a second would try to sell
   the same position twice, which this bench forbids outright.
@@ -223,6 +227,32 @@ Consequences:
 - A live test drives the same three-bars-one-order sequence against the paper
   account with the venue shut and asserts the exit is still accepted. It is
   double-gated on credentials **and** the SDK and skips when the market is open.
-  **Not yet executed:** the worktree this landed from had no credentials, so unlike
-  the rest of ADR-0036 the live half of this amendment is written but unwitnessed.
-  The fast layer is what the fix rests on.
+  ~~**Not yet executed:**~~ **now executed — see the second amendment below.** The
+  worktree this landed from had no credentials, so unlike the rest of ADR-0036 the
+  live half of this amendment shipped written but unwitnessed.
+
+## Second amendment (2026-08-08): the live half, executed
+
+Run against the paper account with the venue shut (Saturday, next open Mon 09:30
+ET). **The guard itself holds exactly as designed.** Three bars of the same unmet
+`BUY 0.01 AAPL` intent produced one order at the venue, parked at `accepted`, and
+two refusals both naming its id; the venue's own order list confirms exactly one
+new working order in the symbol, not three. The whole `TestMarketClosedOrder`
+class from this ADR's first half still passes unchanged, so the guard did not
+disturb the parked-order path it sits next to.
+
+Two things the offline fake had wrong, both now pinned:
+
+- **The venue accepts a duplicate.** Two identical BUYs submitted straight at the
+  client both came back `accepted` with distinct ids, both working. This ADR
+  *reasoned* that nothing else would stop the stack; it is now checked, and it has
+  its own live test so the day Alpaca starts deduplicating we hear about it.
+- **The venue refuses the opposite side, and the refusal used to kill the run.**
+  `403 {"code":40310000,"message":"potential wash trade detected. use complex
+  orders","reject_reason":"opposite side market/stop order exists"}`, raised as a
+  raw SDK `APIError` that nothing caught. It is now classified and recorded rather
+  than propagated, which is **ADR-0041** — including why the exit promise above is
+  a statement about this bench's guard and not about the system.
+
+The account was left flat and checked: no positions, no working orders,
+$100,000.06 cash.

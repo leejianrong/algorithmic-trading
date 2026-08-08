@@ -20,7 +20,9 @@ from trading.data.alpaca_client import (
     AlpacaOrder,
     AssetInfo,
     FakeAlpacaClient,
+    OrderRejectedError,
     PositionSnapshot,
+    _classify_order_error,
 )
 from trading.types import Bar, Side
 
@@ -308,3 +310,145 @@ class TestCancelOrder:
         # "we cancelled it", exactly as get_asset keeps unknown apart from refused.
         with pytest.raises(LookupError, match="no-such-order"):
             FakeAlpacaClient().cancel_order("no-such-order")
+
+
+class _StubApiError(Exception):
+    """A stand-in for ``alpaca.common.exceptions.APIError``, shaped from life.
+
+    Two details are copied deliberately, because the classifier depends on both
+    and they were observed on the wire (2026-08-08) rather than assumed:
+
+    * ``status_code`` is a plain int attribute.
+    * ``code`` is a *property that raises* when the body carries no numeric code.
+      alpaca-py implements it as ``json.loads(self._error)["code"]``, so an auth
+      failure -- whose body is just ``{"message": "unauthorized."}`` -- makes
+      ``exc.code`` throw ``KeyError`` rather than return ``None``.
+    """
+
+    def __init__(self, body: str, *, status_code: int, code: int | None = None) -> None:
+        super().__init__(body)
+        self.status_code = status_code
+        self._code = code
+
+    @property
+    def code(self) -> int:
+        if self._code is None:
+            raise KeyError("code")
+        return self._code
+
+
+class TestOrderRefusalClassification:
+    """ "The venue refused this order" vs "we could not ask" (ADR-0041).
+
+    Every case below is a real response body recorded against the paper venue on
+    2026-08-08. The discriminator is Alpaca's own error taxonomy: a refusal of a
+    specific order carries a numeric ``code`` in the body, and a credential or
+    transport failure does not.
+    """
+
+    def test_wash_trade_refusal_becomes_an_order_rejected_error(self) -> None:
+        # The one that started this: submitting a SELL while a BUY is parked.
+        exc = _StubApiError(
+            '{"code":40310000,"existing_order_id":"a182da86","message":"potential wash '
+            'trade detected. use complex orders","reject_reason":"opposite side '
+            'market/stop order exists"}',
+            status_code=403,
+            code=40310000,
+        )
+
+        classified = _classify_order_error(exc, "AAPL", 0.01, Side.SELL)
+
+        assert isinstance(classified, OrderRejectedError)
+        assert "AAPL" in str(classified)
+        assert "sell" in str(classified)
+        # The venue's own words survive verbatim; nothing is summarised away.
+        assert "potential wash trade detected" in str(classified)
+
+    @pytest.mark.parametrize(
+        ("status", "code", "body"),
+        [
+            (403, 40310000, '{"code":40310000,"message":"insufficient buying power"}'),
+            (422, 42210000, '{"code":42210000,"message":"asset \\"ZZZZ\\" not found"}'),
+            (422, 42210000, '{"code":42210000,"message":"fractional orders cannot be sold short"}'),
+        ],
+    )
+    def test_every_observed_refusal_is_classified(self, status: int, code: int, body: str) -> None:
+        exc = _StubApiError(body, status_code=status, code=code)
+
+        assert isinstance(_classify_order_error(exc, "AAPL", 1.0, Side.BUY), OrderRejectedError)
+
+    def test_bad_credentials_pass_through_untouched(self) -> None:
+        # 401 with NO numeric code: we could not ask, so the run must not carry on
+        # quietly recording rejections. Observed body, verbatim.
+        exc = _StubApiError('{"message": "unauthorized."}', status_code=401)
+
+        assert _classify_order_error(exc, "AAPL", 1.0, Side.BUY) is exc
+
+    def test_a_rate_limit_passes_through(self) -> None:
+        # Carries a code *and* is a 4xx, so only the explicit 429 exclusion keeps
+        # it out -- deliberately, or this passes for the wrong reason.
+        exc = _StubApiError(
+            '{"code":42910000,"message":"too many requests"}', status_code=429, code=42910000
+        )
+
+        assert _classify_order_error(exc, "AAPL", 1.0, Side.BUY) is exc
+
+    def test_a_server_error_passes_through(self) -> None:
+        # Likewise: a code is present, so it is the 4xx range check doing the work.
+        exc = _StubApiError(
+            '{"code":50010000,"message":"internal"}', status_code=500, code=50010000
+        )
+
+        assert _classify_order_error(exc, "AAPL", 1.0, Side.BUY) is exc
+
+    def test_a_transport_error_with_no_status_passes_through(self) -> None:
+        exc = ConnectionError("connection reset by peer")
+
+        assert _classify_order_error(exc, "AAPL", 1.0, Side.BUY) is exc
+
+    def test_a_4xx_without_a_numeric_code_passes_through(self) -> None:
+        # Belt and braces: absent taxonomy is not a refusal we can name.
+        exc = _StubApiError('{"message": "forbidden."}', status_code=403)
+
+        assert _classify_order_error(exc, "AAPL", 1.0, Side.BUY) is exc
+
+
+class TestFakeSubmitRefusal:
+    """The fake can refuse a submit, because the real venue does (ADR-0041).
+
+    Before this the fake accepted every order, which is precisely why the live
+    duplicate-guard test asserted an exit the venue actually refuses.
+    """
+
+    def test_a_scripted_refusal_raises_order_rejected_error(self) -> None:
+        client = FakeAlpacaClient({"AAPL": _series("AAPL", [100.0])})
+        client.set_submit_refusal("AAPL", "potential wash trade detected")
+
+        with pytest.raises(OrderRejectedError, match="wash trade"):
+            client.submit_order("AAPL", 1.0, Side.BUY)
+
+    def test_a_refusal_is_side_scoped_so_the_other_side_still_works(self) -> None:
+        # The live shape: a BUY parks at the venue and the SELL is what gets
+        # refused, so the fake must be able to refuse one direction only.
+        client = FakeAlpacaClient({"AAPL": _series("AAPL", [100.0])}, auto_fill=False)
+        client.set_submit_refusal("AAPL", "opposite side market/stop order exists", side=Side.SELL)
+
+        assert client.submit_order("AAPL", 1.0, Side.BUY).status == STATUS_NEW
+        with pytest.raises(OrderRejectedError):
+            client.submit_order("AAPL", 1.0, Side.SELL)
+
+    def test_a_refusal_leaves_the_account_untouched(self) -> None:
+        client = FakeAlpacaClient({"AAPL": _series("AAPL", [100.0])}, cash=10_000.0)
+        client.set_submit_refusal("AAPL", "insufficient buying power")
+
+        with pytest.raises(OrderRejectedError):
+            client.submit_order("AAPL", 1.0, Side.BUY)
+
+        assert client.get_account().cash == 10_000.0
+        assert client.list_positions() == []
+
+    def test_other_symbols_are_unaffected(self) -> None:
+        client = FakeAlpacaClient({"AAPL": _series("AAPL", [100.0])}, auto_fill=False)
+        client.set_submit_refusal("AAPL", "nope")
+
+        assert client.submit_order("MSFT", 1.0, Side.BUY).status == STATUS_NEW

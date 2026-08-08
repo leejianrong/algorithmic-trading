@@ -28,7 +28,7 @@ from __future__ import annotations
 import importlib.util
 import os
 from datetime import UTC, datetime, timedelta
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import pytest
 
@@ -154,6 +154,30 @@ class TestSdkShapeAssumptions:
         from alpaca.common.exceptions import APIError
 
         assert isinstance(APIError.status_code, property)
+
+    def test_api_error_code_raises_when_the_body_carries_no_code(self) -> None:
+        # What `_order_error_code` is defensive about, and why it cannot be a
+        # `getattr(exc, "code", None)`: alpaca-py implements `.code` as
+        # `json.loads(self._error)["code"]`, so a body without one *raises*
+        # rather than returning None. That distinction is the whole classifier:
+        # a refused order carries a code, an unauthorized request does not
+        # (both bodies below are verbatim from the paper API, 2026-08-08).
+        from alpaca.common.exceptions import APIError
+
+        from trading.data.alpaca_client import _order_error_code
+
+        # The SDK's constructor is untyped, and mypy runs twice -- once without the
+        # extra (where `APIError` is Any) and once with it. Going through an
+        # explicitly-Any alias types the same in both, so neither run needs an
+        # ignore the other would call unused (ADR-0018's double-typecheck).
+        make_error: Any = APIError
+        refusal: Any = make_error('{"code":40310000,"message":"insufficient buying power"}')
+        unauthorized: Any = make_error('{"message": "unauthorized."}')
+
+        assert _order_error_code(refusal) == 40310000
+        with pytest.raises(KeyError):
+            _ = unauthorized.code
+        assert _order_error_code(unauthorized) is None
 
     def test_the_queued_statuses_are_not_terminal(self) -> None:
         # The market-closed branch rests on this: a DAY order placed while the
@@ -282,6 +306,24 @@ class TestUniverseVerification:
 
 @_needs_live
 class TestRealBars:
+    """.. warning::
+
+    **Both split tests below were RED on 2026-08-08 and the finding is the
+    provider, not this code.** On 2026-08-04 the same call returned 499.30 raw
+    vs 121.08 adjusted -- the 4:1 split backed out, as ``Adjustment.ALL`` is
+    supposed to. On 2026-08-08 it returns 499.30 raw vs **484.31** adjusted:
+    a ratio of 1.031, i.e. dividends only. Asking for a window that *spans*
+    2020-08-31 shows the adjusted series still carrying a bare 4:1 price cliff
+    (484.24 -> 125.17), so the split is genuinely not being applied.
+
+    That is ADR-0008's phantom-split hazard arriving through ``--source
+    alpaca`` while the API still answers ``adjustment=all``, and it is the
+    ADR-0040 lesson again: a provider can regress under a green-looking
+    contract. Left failing on purpose -- weakening the assertion would hide an
+    honesty regression, and these tests skip in CI (no credentials), so they
+    gate nothing. Tracked in ADR-0041's consequences; it needs its own slice.
+    """
+
     def test_raw_and_adjusted_differ_across_a_split(self) -> None:
         # ADR-0021 is only meaningful if the two price notions actually diverge.
         # AAPL split 4:1 on 2020-08-31, so pre-split raw closes are ~4x adjusted.
@@ -627,6 +669,22 @@ class TestDuplicateOrderGuardLive:
     asks again on the next bar. The fast layer proves the guard deterministically;
     this proves the *condition* it guards against is the venue's real behaviour,
     and that only one order actually reaches the account.
+
+    Executed for the first time on 2026-08-08 (Saturday, next open Mon 09:30 ET),
+    and it did not pass as written. Two things the offline fake had wrong:
+
+    * The venue happily accepts a **duplicate** same-side order -- so the guard is
+      the only thing standing between a parked order and a compounding stack, as
+      ADR-0036 assumed but had never checked (:meth:`test_the_venue_itself_is_no_backstop`).
+    * The venue **refuses the opposite side** while an order is working::
+
+          HTTP 403 {"code":40310000,"existing_order_id":"a182da86-...",
+                    "message":"potential wash trade detected. use complex orders",
+                    "reject_reason":"opposite side market/stop order exists"}
+
+      so "a working BUY can never block a SELL" holds for *this bench's* guard and
+      not for the system. Worse, the raw ``APIError`` used to escape
+      ``AlpacaBroker.submit`` and kill the session; ADR-0041 classifies it.
     """
 
     def _require_closed(self) -> None:
@@ -668,13 +726,142 @@ class TestDuplicateOrderGuardLive:
             # Both refusals name the order that is still working.
             assert len(broker.rejections) == 2
             assert all(order_id in reason for (_order, reason) in broker.rejections)
-
-            # An exit is never blocked, even with that buy still working.
-            broker.submit(Order(_SYMBOL, Side.SELL, qty=_TINY_QTY))
-            assert len(broker.pending_order_ids) == 2
-            assert len(broker.rejections) == 2  # the SELL was not refused
+            assert all("still working at the venue" in r for (_o, r) in broker.rejections)
         finally:
             _flatten(client, _SYMBOL, opening_qty)
+
+    def test_the_venue_itself_is_no_backstop_against_duplicates(self) -> None:
+        """Two identical orders, straight at the client: Alpaca accepts both.
+
+        ADR-0036's premise, checked instead of assumed. The guard is bypassed here
+        deliberately -- this is a statement about the *venue*, and it is the reason
+        the guard has to exist at all. If Alpaca ever started rejecting the
+        duplicate itself this would go red, which is the notification we want.
+        """
+        from trading.data.alpaca_client import RealAlpacaClient
+
+        self._require_closed()
+        client = RealAlpacaClient()
+        placed = []
+        try:
+            for _ in range(2):
+                placed.append(client.submit_order(_SYMBOL, _TINY_QTY, Side.BUY))
+
+            assert len({o.id for o in placed}) == 2, "the venue issued one id for two orders"
+            for order in placed:
+                assert order.status not in ("rejected",)
+                assert client.get_order(order.id).status not in ("rejected",)
+            # Both are genuinely working at the account, not deduplicated for us.
+            assert {o.id for o in placed} <= set(_open_order_ids(client, _SYMBOL))
+        finally:
+            _flatten(client, _SYMBOL, 0.0)
+
+    def test_the_venue_refuses_the_exit_our_guard_deliberately_allows(self) -> None:
+        """The finding: our guard lets the SELL through, and Alpaca refuses it.
+
+        ADR-0036's amendment promised "a working BUY can never block a SELL". That
+        is still true of the guard -- the refusal is keyed on side, so an exit is
+        never even compared against a working entry -- and this test asserts it by
+        checking the rejection is *not* ours. But the venue has a wash-trade rule
+        of its own, so the exit does not reach the book while an entry is parked.
+
+        The bench's obligation is to report that honestly rather than die on it,
+        which is exactly what ADR-0041 makes it do: the refusal is recorded on
+        ``rejections`` (and so reaches ``result.json``), the parked BUY is
+        untouched, and the session carries on.
+        """
+        from trading.brokers.alpaca import AlpacaBroker
+        from trading.clock import WallClock
+        from trading.data.alpaca_client import RealAlpacaClient
+        from trading.types import Order
+
+        self._require_closed()
+        client = RealAlpacaClient()
+        broker = AlpacaBroker(
+            client,
+            clock=WallClock(),
+            poll_timeout=timedelta(seconds=0),
+            poll_interval=timedelta(seconds=1),
+        )
+        opening_qty = broker.portfolio.position(_SYMBOL).qty
+
+        try:
+            broker.submit(Order(_SYMBOL, Side.BUY, qty=_TINY_QTY))
+            assert len(broker.pending_order_ids) == 1
+            buy_id = broker.pending_order_ids[0]
+
+            # Must not raise: before ADR-0041 this line ended the session.
+            broker.submit(Order(_SYMBOL, Side.SELL, qty=_TINY_QTY))
+
+            assert len(broker.rejections) == 1
+            _order, reason = broker.rejections[0]
+            # Not our duplicate guard -- the guard is side-keyed and stayed out of it.
+            assert "still working at the venue" not in reason
+            # The venue's own words, carried through verbatim.
+            assert "Alpaca refused sell" in reason
+            assert "wash trade" in reason or "opposite side" in reason
+            # The parked BUY is untouched: still exactly one order at the venue.
+            assert broker.pending_order_ids == (buy_id,)
+            assert _open_order_ids(client, _SYMBOL) == [buy_id]
+        finally:
+            _flatten(client, _SYMBOL, opening_qty)
+
+    def test_a_refused_submit_leaves_nothing_pending(self) -> None:
+        """A refusal is not a phantom order: the broker must not start polling one.
+
+        Driven with a refusal that needs no parked order to provoke -- selling from
+        a flat account is a short, which this bench forbids (ADR-0011) and the
+        venue refuses with ``422 {"code":42210000,"message":"fractional orders
+        cannot be sold short"}``. It is the same submit-time path.
+        """
+        from trading.brokers.alpaca import AlpacaBroker
+        from trading.clock import WallClock
+        from trading.data.alpaca_client import RealAlpacaClient
+        from trading.types import Bar, Order
+
+        self._require_closed()
+        client = RealAlpacaClient()
+        if any(p.symbol == _SYMBOL for p in client.list_positions()):
+            pytest.skip(f"needs a flat book in {_SYMBOL} for the short to be refused")
+        broker = AlpacaBroker(client, clock=WallClock(), poll_timeout=timedelta(seconds=0))
+        bar = Bar(
+            symbol=_SYMBOL, ts=datetime.now(UTC), open=1.0, high=1.0, low=1.0, close=1.0, volume=1
+        )
+
+        broker.submit(Order(_SYMBOL, Side.SELL, qty=_TINY_QTY))
+
+        assert len(broker.rejections) == 1
+        assert broker.pending_order_ids == ()
+        assert broker.on_bar({_SYMBOL: bar}) == []  # nothing to poll, nothing filled
+
+    def test_a_credential_failure_is_not_recorded_as_a_venue_refusal(self) -> None:
+        """The other half of ADR-0041's classification, against the real API.
+
+        A bad key answers ``401 {"message": "unauthorized."}`` with no error code,
+        so it must reach the caller rather than be logged as the venue's verdict on
+        an order. Runs against the live endpoint precisely because the classifier
+        turns on a detail of the response body -- the absence of ``code`` -- that
+        only the real API can confirm.
+        """
+        from trading.brokers.alpaca import AlpacaBroker
+        from trading.clock import WallClock
+        from trading.data.alpaca_client import OrderRejectedError, RealAlpacaClient
+        from trading.types import Order
+
+        good = RealAlpacaClient()
+        bad = RealAlpacaClient(api_key="NOTAREALKEY", secret_key="NOTAREALSECRET")
+        # Construct the broker on a working client, then swap in the broken one, so
+        # the up-front reconcile succeeds and only `submit` faces the bad key.
+        broker = AlpacaBroker(good, clock=WallClock(), poll_timeout=timedelta(seconds=0))
+        broker._client = bad
+
+        with pytest.raises(Exception) as caught:
+            broker.submit(Order(_SYMBOL, Side.BUY, qty=_TINY_QTY))
+
+        assert not isinstance(caught.value, OrderRejectedError)
+        assert getattr(caught.value, "status_code", None) == 401
+        assert broker.rejections == []
+        assert broker.pending_order_ids == ()
 
     def test_the_account_is_left_flat(self) -> None:
         """The final read: no working orders and no position, from the venue itself.

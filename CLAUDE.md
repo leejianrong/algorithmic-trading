@@ -285,9 +285,53 @@ As of this writing:
   alternatives. Known cosmetic gaps, both in the shared engine's per-bar bookkeeping
   rather than the broker: a refusal reaches `BacktestResult.rejections` but not that
   bar's `BarOutcome.broker_rejections` (the engine snapshots the broker's list around
-  `on_bar` only) and the refused order still appears in `BarOutcome.submitted`. The
-  live test is written and gated but **unexecuted** (no credentials in the landing
-  worktree).
+  `on_bar` only) and the refused order still appears in `BarOutcome.submitted`.
+  ~~The live test is unexecuted~~ — **now run, see below.**
+- **The duplicate guard, witnessed live — and the venue refuses things too
+  (2026-08-08, ADR-0041):** the one half of ADR-0036 that shipped unexecuted was
+  driven against the paper account with the venue shut. **The guard holds exactly as
+  designed:** three bars of the same unmet `BUY 0.01 AAPL` queued **one** order at the
+  venue (parked `accepted`) plus two refusals naming its id, confirmed against
+  Alpaca's own order list; the whole pre-existing market-closed class still passes, so
+  the guard did not disturb the parked-order path. Two things the offline fake had
+  wrong. **(1)** the venue is genuinely no backstop — two identical BUYs submitted
+  straight at the client both came back `accepted` with distinct ids, both working, so
+  ADR-0036's *reasoned* premise is now checked (and has its own live test, so the day
+  Alpaca starts deduplicating we hear about it). **(2)** the venue **refuses the
+  opposite side** while an order is working: `403 {"code":40310000,"message":"potential
+  wash trade detected. use complex orders","reject_reason":"opposite side market/stop
+  order exists"}`. Nothing caught it, so the raw SDK `APIError` travelled out of
+  `RealAlpacaClient.submit_order`, out of `AlpacaBroker.submit`, through
+  `Engine._step` and out of `PaperSession.run` — the same artifact loss ADR-0033 fixed
+  for Ctrl-C, through a different door, on the *routine* path (the refusal only
+  happens while an order is parked, i.e. every overnight and weekend session), and a
+  breach of ADR-0017's "no SDK type escapes the seam". Now classified:
+  `OrderRejectedError` + `_classify_order_error`, discriminating on **Alpaca's own
+  error taxonomy** rather than a message substring — every refusal of a specific order
+  carries an eight-digit numeric `code` (403/`40310000` wash trade & insufficient
+  buying power, 422/`42210000` unknown asset & fractional short) while a bad key
+  answers `401 {"message": "unauthorized."}` with **no code**, so a 4xx-that-is-not-
+  401/429-with-a-code is a refusal and everything else propagates (ADR-0028's "the
+  broker said no" vs "we could not ask", biased toward propagating: a run that cannot
+  trade must stop, not narrate). `AlpacaBroker.submit` records it as `(Order, reason)`
+  carrying the venue's words verbatim, nothing enters `_pending`, and the next bar may
+  retry. `FakeAlpacaClient` gains side-scoped `set_submit_refusal` /
+  `set_submit_failure` — a fake that could never say no is exactly why the live test
+  asserted an exit the venue refuses. **ADR-0036's "a working BUY can never block a
+  SELL" is narrowed**: true of our guard (side-keyed, structural), false of the system
+  — a parked entry blocks the exit at the venue until it settles, which costs nothing
+  while the venue is shut but is real intraday, and is one more argument for KAN-678.
+  16 new fast tests + 5 live (double-gated, skip when the market is open). Account left
+  flat and checked: no positions, no working orders, $100,000.06.
+  **Separately, and NOT fixed:** Alpaca has **stopped applying split adjustments**.
+  On 2026-08-04 AAPL 2020-08-25 came back 499.30 raw / 121.08 adjusted; on 2026-08-08
+  the same call returns 499.30 / **484.31** (ratio 1.031 = dividends only), and a
+  window spanning the 4:1 split shows the *adjusted* series still carrying a bare
+  price cliff (484.24 → 125.17). That is ADR-0008's phantom-split hazard arriving
+  through `--source alpaca` while the API still answers `adjustment=all` — ADR-0040's
+  lesson again. The two `TestRealBars` split tests are **left red on purpose**
+  (weakening them would hide an honesty regression; they skip in CI, so they gate
+  nothing). Needs its own slice.
 - **Fill divergence — is the modelled 5 bps real? (offline-verified, ADR-0038):**
   `divergence.py` answers the one question no backtest can. `ShadowBroker` is a
   **`Broker` decorator** (no engine change, no `if paper:` — ADR-0002 intact) that
@@ -522,7 +566,8 @@ src/trading/
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5)
   broker.py                # SimulatedBroker + CostModel
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020);
-                           #   refuses a duplicate while a same-side order is working (ADR-0036)
+                           #   refuses a duplicate while a same-side order is working (ADR-0036);
+                           #   records a venue refusal at submit instead of dying (ADR-0041)
   report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023);
                            #   absent-symbol caveat lines + additive `absent` key (ADR-0032);
                            #   flags a benchmark that never invested (ADR-0037 amended)
@@ -543,6 +588,7 @@ src/trading/
   data/alpaca_client.py    # AlpacaClient seam + Fake/Real clients (ADR-0017/0018);
                            #   terminal order statuses (ADR-0033) + feed choice (ADR-0034)
                            #   + cancel_order, the seam's 6th call (ADR-0036)
+                           #   + OrderRejectedError: a submit-time venue refusal (ADR-0041)
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022);
                            #   per-symbol fetch guard: retry forever, escalate, never quarantine (ADR-0035)
