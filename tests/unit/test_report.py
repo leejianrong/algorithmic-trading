@@ -9,8 +9,9 @@ from __future__ import annotations
 
 import builtins
 import json
+import random
 from dataclasses import asdict
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, ClassVar
 
@@ -28,11 +29,13 @@ from trading.engine import (
     EquityPoint,
     HaltEpisode,
 )
-from trading.metrics import compare_to_benchmark, compute
+from trading.metrics import assess_significance, compare_to_benchmark, compute
 from trading.report import (
     RESULT_SCHEMA_VERSION,
     result_to_dict,
+    significance_lines,
     summarize,
+    summarize_significance,
     write_equity_csv,
     write_equity_png,
     write_result_json,
@@ -681,3 +684,158 @@ class TestBenchmarkSilentlyFlat:
         assert "Benchmark (SPY): +0.00%" in summary
         assert "Beta:          n/a" in summary
         assert "Correlation:   n/a" in summary
+
+
+# --- Sharpe significance block (ADR-0039) ------------------------------------
+
+
+def _noise_curve(n: int, seed: int, *, mean: float = 0.0005) -> list[EquityPoint]:
+    """An equity curve long enough to bootstrap, built from a locally-seeded RNG."""
+    rng = random.Random(seed)
+    equity = 1_000.0
+    points = [EquityPoint(_ts(1), equity, 0.5)]
+    for i in range(n):
+        equity *= 1.0 + rng.gauss(mean, 0.01)
+        points.append(EquityPoint(_ts(1) + timedelta(days=i + 1), equity, 0.5))
+    return points
+
+
+def _noise_result(n: int, seed: int, *, mean: float = 0.0005) -> BacktestResult:
+    curve = _noise_curve(n, seed, mean=mean)
+    return BacktestResult(
+        symbols=["AAA"],
+        starting_cash=curve[0].equity,
+        equity_curve=curve,
+        final_portfolio=Portfolio(cash=curve[-1].equity),
+        fills=[],
+    )
+
+
+class TestSummaryUnchangedWithoutSignificance:
+    """No significance report supplied → byte-identical summary (ADR-0039).
+
+    The whole block is caller-supplied and off by default, so an existing run
+    prints exactly the bytes it printed before this feature landed. Pinned as a
+    literal golden for the same reason ADR-0037's was.
+    """
+
+    GOLDEN = TestSummaryUnchangedWithoutBenchmark.GOLDEN
+
+    def test_summary_is_byte_identical_to_the_pre_adr_0039_text(self) -> None:
+        run = TestSummaryUnchangedWithoutBenchmark._run()
+        assert summarize(run, free_parameters=2) == self.GOLDEN
+        assert summarize(run, free_parameters=2, significance=None) == self.GOLDEN
+
+    def test_no_significance_label_leaks_in(self) -> None:
+        summary = summarize(TestSummaryUnchangedWithoutBenchmark._run())
+        for label in ("Sharpe 95% CI", "Beats bench:", "Trials:", "Deflated:"):
+            assert label not in summary
+
+
+class TestSignificanceSummaryLines:
+    """What the block says once a caller asks for it."""
+
+    def test_the_interval_line_carries_its_whole_provenance(self) -> None:
+        result = _noise_result(400, seed=61)
+        report = assess_significance(result.equity_curve, resamples=100, seed=5)
+        summary = summarize(result, significance=report)
+        assert "Sharpe 95% CI:" in summary
+        assert "stationary block bootstrap: 100 resamples" in summary
+        assert "60-bar blocks" in summary
+        assert "seed 5" in summary
+
+    def test_an_interval_straddling_zero_says_so_in_words(self) -> None:
+        """ADR-0029's precedent: a number that cannot conclude must say it cannot."""
+        result = _noise_result(400, seed=62, mean=0.0)
+        report = assess_significance(result.equity_curve, resamples=200)
+        assert report.sharpe_interval is not None
+        assert report.sharpe_interval.straddles_zero
+        assert "the interval straddles zero" in summarize(result, significance=report)
+
+    def test_a_confident_interval_prints_no_warning(self) -> None:
+        result = _noise_result(2_000, seed=63, mean=0.003)
+        report = assess_significance(result.equity_curve, resamples=200)
+        assert report.sharpe_interval is not None
+        assert not report.sharpe_interval.straddles_zero
+        assert "straddles zero" not in summarize(result, significance=report)
+
+    def test_the_paired_line_names_the_pairing(self) -> None:
+        base = _noise_curve(400, seed=64)
+        better = [EquityPoint(p.ts, p.equity * (1.0002**i), p.exposure) for i, p in enumerate(base)]
+        result = BacktestResult(
+            symbols=["AAA"],
+            starting_cash=better[0].equity,
+            equity_curve=better,
+            final_portfolio=Portfolio(cash=better[-1].equity),
+            fills=[],
+        )
+        report = assess_significance(better, base, resamples=100)
+        summary = summarize(result, significance=report)
+        assert "Beats bench:" in summary
+        assert "PAIRED resamples" in summary
+
+    def test_the_trial_lines_state_the_count_and_the_null(self) -> None:
+        result = _noise_result(400, seed=65)
+        report = assess_significance(
+            result.equity_curve, resamples=100, trial_sharpes=[0.2 * i for i in range(24)]
+        )
+        summary = summarize(result, significance=report)
+        assert "Trials:        24 scored" in summary
+        assert "Deflated:      P(true Sharpe > that null best)" in summary
+
+    def test_the_invisible_trials_caveat_reaches_the_page(self) -> None:
+        result = _noise_result(400, seed=66)
+        report = assess_significance(result.equity_curve, resamples=100)
+        assert "LOWER BOUND" in summarize(result, significance=report)
+
+    def test_a_short_run_explains_the_missing_interval_instead_of_faking_one(self) -> None:
+        result = _noise_result(10, seed=67)
+        report = assess_significance(result.equity_curve, resamples=100)
+        summary = summarize(result, significance=report)
+        assert "Sharpe 95% CI:" not in summary
+        assert "no Sharpe confidence interval" in summary
+
+    def test_summarize_significance_matches_the_inline_block(self) -> None:
+        result = _noise_result(400, seed=68)
+        report = assess_significance(result.equity_curve, resamples=50)
+        assert summarize_significance(report) == "\n".join(significance_lines(report))
+        assert summarize_significance(None) == ""
+
+
+class TestResultJsonSignificanceBlock:
+    """The additive top-level ``significance`` key (ADR-0039)."""
+
+    def test_no_significance_supplied_emits_null(self) -> None:
+        doc = result_to_dict(_result([100.0, 110.0]), mode="backtest")
+        assert doc["significance"] is None
+        assert doc["schema_version"] == RESULT_SCHEMA_VERSION == 1
+
+    def test_the_block_serializes_and_round_trips(self) -> None:
+        result = _noise_result(400, seed=71)
+        report = assess_significance(result.equity_curve, resamples=50)
+        doc = result_to_dict(result, mode="backtest", significance=report)
+        block = doc["significance"]
+        assert block["sharpe_interval"]["resamples"] == 50
+        assert block["deflated"]["trials"] == 1
+        assert block["paired"] is None
+        assert block["notes"]
+        assert json.loads(json.dumps(doc)) == doc
+
+    def test_metrics_stays_exactly_asdict_of_the_metrics(self) -> None:
+        """The contract ADR-0037 protected: significance must not leak into metrics."""
+        result = _noise_result(400, seed=72)
+        metrics = compute(result)
+        report = assess_significance(result.equity_curve, resamples=50)
+        doc = result_to_dict(result, mode="backtest", metrics=metrics, significance=report)
+        assert doc["metrics"] == asdict(metrics)
+        assert "significance" not in doc["metrics"]
+
+    def test_write_result_json_carries_the_block_to_disk(self, tmp_path: Path) -> None:
+        result = _noise_result(400, seed=73)
+        report = assess_significance(result.equity_curve, resamples=50)
+        assert report.sharpe_interval is not None
+        path = tmp_path / "result.json"
+        write_result_json(result, path, mode="backtest", significance=report)
+        with path.open() as fh:
+            loaded = json.load(fh)
+        assert loaded["significance"]["sharpe_interval"]["seed"] == report.sharpe_interval.seed

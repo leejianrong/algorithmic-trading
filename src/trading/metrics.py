@@ -21,14 +21,24 @@ knob (ADR-0022). Every one of them is ``float | None``, never a stand-in ``0.0``
 a beta of zero and "there was no benchmark" must never be confusable, so no
 :class:`BenchmarkComparison` exists at all when no benchmark ran, and an
 individual statistic inside one is ``None`` when it is mathematically undefined.
+
+Statistical significance (ADR-0039) sits at the bottom of the module: a stationary
+block bootstrap confidence interval on the Sharpe ratio, the *paired* "beats the
+benchmark in X% of resamples" figure, and the deflated Sharpe that discounts a
+sweep winner for the number of combinations that competed for the title. All of
+it is deterministic — every function takes an explicit integer ``seed`` and drives
+its own :class:`random.Random`; nothing here ever touches the global RNG, so the
+same run always yields the same interval.
 """
 
 from __future__ import annotations
 
+import random
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from itertools import pairwise
-from math import sqrt
+from math import e, sqrt
+from statistics import NormalDist
 from typing import TYPE_CHECKING
 
 from trading.types import SHARE_EPS, Side
@@ -76,6 +86,30 @@ def annualized_return(curve: Sequence[EquityPoint], periods_per_year: float = 25
     return float((1.0 + total_return(curve)) ** (periods_per_year / n)) - 1.0
 
 
+def _sharpe_of(
+    returns: Sequence[float],
+    periods_per_year: float,
+    rf: float = 0.0,
+) -> float:
+    """Annualized Sharpe of an already-extracted return series.
+
+    The arithmetic body of :func:`sharpe`, factored out so the bootstrap
+    (ADR-0039) can score a *resampled* return series with exactly the same
+    definition rather than a lookalike. Keeping one implementation is the whole
+    point: a confidence interval computed on a subtly different Sharpe would be an
+    interval around a number the report never prints.
+    """
+    if len(returns) < 2:
+        return 0.0
+    excess = [r - rf for r in returns]
+    mean = sum(excess) / len(excess)
+    variance = sum((r - mean) ** 2 for r in excess) / (len(excess) - 1)
+    stdev = sqrt(variance)
+    if stdev == 0.0:
+        return 0.0
+    return mean / stdev * sqrt(periods_per_year)
+
+
 def sharpe(
     curve: Sequence[EquityPoint],
     periods_per_year: float = 252.0,
@@ -87,16 +121,7 @@ def sharpe(
     ``√periods_per_year``. Returns 0.0 when there are fewer than two returns or
     the standard deviation is zero, so no NaN/inf leaks out.
     """
-    returns = daily_returns(curve)
-    if len(returns) < 2:
-        return 0.0
-    excess = [r - rf for r in returns]
-    mean = sum(excess) / len(excess)
-    variance = sum((r - mean) ** 2 for r in excess) / (len(excess) - 1)
-    stdev = sqrt(variance)
-    if stdev == 0.0:
-        return 0.0
-    return mean / stdev * sqrt(periods_per_year)
+    return _sharpe_of(daily_returns(curve), periods_per_year, rf)
 
 
 def sortino(
@@ -617,4 +642,599 @@ def compute(
         trade_count=entry_count(result.fills),
         trades_per_parameter=trades_per_parameter(result.fills, free_parameters),
         return_per_unit_exposure=return_per_unit_exposure(curve, periods_per_year),
+    )
+
+
+# --- Statistical significance of a Sharpe ratio (ADR-0039) -------------------
+
+# How many resamples a confidence interval is built from. 1,000 is the usual
+# floor for a 95% percentile interval: each tail is placed from ~25 draws, which
+# is enough to locate it but not enough to quote a third decimal. It is a
+# parameter on every entry point so a fast test can drop it and a serious study
+# can raise it.
+DEFAULT_BOOTSTRAP_RESAMPLES = 1_000
+
+# Block length in bars. Resampling *individual* returns would destroy the serial
+# structure a momentum or trend edge lives in and hand back a flatteringly narrow
+# interval; ~60 daily bars (a quarter) keeps runs of correlated returns intact.
+DEFAULT_BLOCK_LENGTH = 60
+
+# Two-sided coverage of the reported interval.
+DEFAULT_CONFIDENCE = 0.95
+
+# The seed every entry point defaults to. Fixed and public rather than drawn from
+# a clock: two runs of the same command must produce the same interval, and a test
+# that only passes on a re-run is a race, not luck.
+DEFAULT_BOOTSTRAP_SEED = 20260808
+
+# Below this many return periods there is nothing to bootstrap. A block bootstrap
+# needs enough observations to hold several whole blocks; under ~30 the resampled
+# series are near-copies of each other and the resulting interval is not merely
+# wide, it is meaningless. The functions return ``None`` rather than a garbage
+# interval (ADR-0039).
+MIN_BOOTSTRAP_OBSERVATIONS = 30
+
+# A resample must be able to draw at least this many blocks, or it is a rotation
+# of the original series rather than a resample of it. This is what caps the block
+# length on a short run: a 40-bar series cannot use 60-bar blocks.
+MIN_BLOCKS_PER_RESAMPLE = 4
+
+# Euler-Mascheroni, used by the expected-maximum-Sharpe approximation below.
+EULER_MASCHERONI = 0.5772156649015329
+
+# The probability a deflated Sharpe must clear before the winner of a search reads
+# as a finding rather than the best of N coin flips. Same spirit — and the same
+# "judgement call, not a law" caveat — as :data:`MIN_TRADES_PER_PARAMETER`.
+DEFLATED_SHARPE_CONFIDENCE = 0.95
+
+
+def effective_block_length(observations: int, requested: int) -> int:
+    """The block length a series of ``observations`` returns can actually support.
+
+    ``requested``, capped so a resample still draws at least
+    :data:`MIN_BLOCKS_PER_RESAMPLE` blocks, and never below 1. A 40-bar run that
+    asks for 60-bar blocks gets 10, not 60: with blocks as long as the series every
+    resample is a near-rotation of the original, every resampled Sharpe comes back
+    nearly identical, and the interval collapses into a confident lie. Reducing the
+    block length costs some autocorrelation fidelity, and the caller *says so*
+    rather than hiding it — the reduction is recorded on the returned value object
+    and in the summary's notes.
+
+    Raises ``ValueError`` for a non-positive ``requested`` length: that is a
+    programming error, not a property of the data.
+    """
+    if requested < 1:
+        raise ValueError(f"block_length must be >= 1, got {requested}")
+    cap = max(1, observations // MIN_BLOCKS_PER_RESAMPLE)
+    return max(1, min(requested, cap))
+
+
+def _stationary_indices(n: int, block_length: int, rng: random.Random) -> list[int]:
+    """One resample's worth of indices from the stationary bootstrap.
+
+    Politis & Romano's stationary bootstrap: start at a uniformly random index and
+    walk forward, restarting at a fresh uniform index with probability
+    ``1 / block_length`` at each step and wrapping around the end of the series.
+    Block lengths are therefore geometric with mean ``block_length``, which is what
+    makes the resampled series *stationary* — unlike fixed-length blocks, whose
+    join points sit at deterministic positions. ``block_length == 1`` degenerates
+    to the plain i.i.d. bootstrap.
+
+    Returns exactly ``n`` indices, so a resample has the same length as the
+    original series and its Sharpe is on the same footing as the observed one.
+    """
+    restart_probability = 1.0 / block_length
+    indices: list[int] = []
+    position = rng.randrange(n)
+    for _ in range(n):
+        indices.append(position)
+        starts_new_block = rng.random() < restart_probability
+        position = rng.randrange(n) if starts_new_block else (position + 1) % n
+    return indices
+
+
+def _percentile(sorted_values: Sequence[float], quantile: float) -> float:
+    """Linearly-interpolated percentile of an already-sorted series."""
+    if not sorted_values:
+        raise ValueError("cannot take a percentile of an empty series")
+    if len(sorted_values) == 1:
+        return sorted_values[0]
+    position = (len(sorted_values) - 1) * quantile
+    lower = int(position)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    weight = position - lower
+    return sorted_values[lower] + (sorted_values[upper] - sorted_values[lower]) * weight
+
+
+def _validate_bootstrap_args(resamples: int, confidence: float) -> None:
+    """Reject caller mistakes loudly; data shortfalls are handled separately."""
+    if resamples < 1:
+        raise ValueError(f"resamples must be >= 1, got {resamples}")
+    if not 0.0 < confidence < 1.0:
+        raise ValueError(f"confidence must be strictly between 0 and 1, got {confidence}")
+
+
+@dataclass(frozen=True, slots=True)
+class SharpeInterval:
+    """A bootstrap confidence interval around a run's annualized Sharpe (ADR-0039).
+
+    ``point`` is the Sharpe the report already prints — the observed one, not the
+    bootstrap mean, so the interval brackets the number on the page rather than a
+    neighbour of it. ``low``/``high`` are percentiles of the resampled Sharpes.
+
+    Every knob that could change the answer is carried on the object, because a
+    confidence interval whose provenance is invisible is a number nobody can check:
+    ``block_length`` is the *effective* length actually used (see
+    :func:`effective_block_length`), and ``seed`` is the exact integer that
+    reproduces this interval.
+    """
+
+    point: float
+    low: float
+    high: float
+    confidence: float
+    resamples: int
+    block_length: int
+    requested_block_length: int
+    observations: int
+    seed: int
+
+    @property
+    def width(self) -> float:
+        """How wide the interval is, in annualized Sharpe units."""
+        return self.high - self.low
+
+    @property
+    def straddles_zero(self) -> bool:
+        """Whether the data cannot rule out that the strategy has no edge at all.
+
+        ``True`` when the interval contains zero — the single most important thing
+        this module can say. A Sharpe of 0.42 with an interval of ``[-0.09, 0.84]``
+        is not a measurement of skill; it is a measurement of how little the sample
+        settles.
+        """
+        return self.low <= 0.0 <= self.high
+
+    @property
+    def block_length_was_reduced(self) -> bool:
+        """Whether the series was too short for the block length that was asked for."""
+        return self.block_length < self.requested_block_length
+
+
+def sharpe_confidence_interval(
+    curve: Sequence[EquityPoint],
+    periods_per_year: float = 252.0,
+    *,
+    resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    block_length: int = DEFAULT_BLOCK_LENGTH,
+    confidence: float = DEFAULT_CONFIDENCE,
+    seed: int = DEFAULT_BOOTSTRAP_SEED,
+) -> SharpeInterval | None:
+    """Percentile confidence interval on the annualized Sharpe, by block bootstrap.
+
+    Resamples the run's per-bar returns ``resamples`` times with the stationary
+    block bootstrap (:func:`_stationary_indices`), scores each resample with
+    :func:`_sharpe_of`, and takes the two symmetric percentiles bracketing
+    ``confidence`` of them. Blocks — not individual returns — are the unit of
+    resampling, so serial correlation survives; shuffling single returns would
+    destroy exactly the structure a trend or momentum edge consists of and report
+    an interval far too narrow.
+
+    Deterministic: the RNG is a local :class:`random.Random` seeded with ``seed``,
+    never the module-global one, so the same curve and seed always yield the same
+    interval.
+
+    ``None`` — never a fabricated interval — when the series is shorter than
+    :data:`MIN_BOOTSTRAP_OBSERVATIONS` returns, or has no variance at all (a flat
+    curve has a Sharpe of 0.0 by convention, not a distribution). Raises
+    ``ValueError`` for a nonsensical ``resamples``/``confidence``/``block_length``,
+    which is a caller bug rather than a data shortfall.
+    """
+    _validate_bootstrap_args(resamples, confidence)
+    returns = daily_returns(curve)
+    observations = len(returns)
+    if observations < MIN_BOOTSTRAP_OBSERVATIONS:
+        return None
+    if len(set(returns)) == 1:
+        # A perfectly flat series: every resample is the same series, so the
+        # "interval" would be a zero-width [0, 0] that reads as a measurement.
+        return None
+    effective = effective_block_length(observations, block_length)
+    rng = random.Random(seed)
+    scores = sorted(
+        _sharpe_of(
+            [returns[i] for i in _stationary_indices(observations, effective, rng)],
+            periods_per_year,
+        )
+        for _ in range(resamples)
+    )
+    tail = (1.0 - confidence) / 2.0
+    return SharpeInterval(
+        point=_sharpe_of(returns, periods_per_year),
+        low=_percentile(scores, tail),
+        high=_percentile(scores, 1.0 - tail),
+        confidence=confidence,
+        resamples=resamples,
+        block_length=effective,
+        requested_block_length=block_length,
+        observations=observations,
+        seed=seed,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class PairedBootstrap:
+    """How often the strategy beat its benchmark across *paired* resamples.
+
+    The powerful test, and the easy one to get wrong. Both series are resampled on
+    **one shared set of block indices**, so every resample is a coherent
+    alternative history in which the same stretches of market happened to both.
+    That pairing is what cancels the common market factor and leaves the difference
+    in skill; resampling the two independently would compare the strategy in one
+    imaginary market against the benchmark in a different one and report a number
+    that is confidently wrong.
+
+    ``win_rate`` is the fraction of resamples on which the strategy's Sharpe
+    exceeded the benchmark's. ``observed_edge`` is that same difference measured
+    once on the real, unresampled data — the thing the win rate expresses
+    confidence about.
+    """
+
+    win_rate: float
+    observed_edge: float
+    resamples: int
+    block_length: int
+    requested_block_length: int
+    observations: int
+    seed: int
+
+    @property
+    def block_length_was_reduced(self) -> bool:
+        """Whether the shared span was too short for the requested block length."""
+        return self.block_length < self.requested_block_length
+
+
+def paired_bootstrap(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint],
+    periods_per_year: float = 252.0,
+    *,
+    resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    block_length: int = DEFAULT_BLOCK_LENGTH,
+    seed: int = DEFAULT_BOOTSTRAP_SEED,
+) -> PairedBootstrap | None:
+    """ "Beats the benchmark in X% of resamples", resampled in lockstep.
+
+    Aligns the two equity curves by timestamp with :func:`aligned_returns` (never
+    positionally — ADR-0037), draws **one** index sequence per resample, and
+    applies that same sequence to both return series before scoring each with
+    :func:`_sharpe_of`. The win rate is the fraction of resamples on which the
+    strategy's Sharpe came out higher.
+
+    Deterministic on ``seed`` for the same reason
+    :func:`sharpe_confidence_interval` is. ``None`` when the two curves share fewer
+    than :data:`MIN_BOOTSTRAP_OBSERVATIONS` return periods — a win rate over a
+    handful of shared bars is noise wearing a percentage sign.
+    """
+    _validate_bootstrap_args(resamples, DEFAULT_CONFIDENCE)
+    strategy, bench = aligned_returns(curve, benchmark)
+    observations = len(strategy)
+    if observations < MIN_BOOTSTRAP_OBSERVATIONS:
+        return None
+    effective = effective_block_length(observations, block_length)
+    rng = random.Random(seed)
+    wins = 0
+    for _ in range(resamples):
+        # ONE index sequence, applied to BOTH series. This single shared list is
+        # the entire correctness story of the paired test.
+        indices = _stationary_indices(observations, effective, rng)
+        strategy_sharpe = _sharpe_of([strategy[i] for i in indices], periods_per_year)
+        bench_sharpe = _sharpe_of([bench[i] for i in indices], periods_per_year)
+        if strategy_sharpe > bench_sharpe:
+            wins += 1
+    return PairedBootstrap(
+        win_rate=wins / resamples,
+        observed_edge=_sharpe_of(strategy, periods_per_year) - _sharpe_of(bench, periods_per_year),
+        resamples=resamples,
+        block_length=effective,
+        requested_block_length=block_length,
+        observations=observations,
+        seed=seed,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class ReturnMoments:
+    """The first four moments of a return series, computed in one pass.
+
+    Enough to deflate a Sharpe ratio without carrying the whole return series
+    around — a sweep keeps one of these per run, not thousands of floats.
+    ``mean``/``stdev`` are the sample (``n - 1``) figures :func:`sharpe` already
+    uses, so ``mean / stdev`` is exactly the per-bar Sharpe the report prints
+    divided by ``√periods_per_year``. ``skew``/``kurtosis`` are the standard
+    population moment ratios, and ``kurtosis`` is **not** excess: a normal series
+    scores 3.0.
+    """
+
+    count: int
+    mean: float
+    stdev: float
+    skew: float
+    kurtosis: float
+
+
+def return_moments(returns: Sequence[float]) -> ReturnMoments | None:
+    """Moments of a return series, or ``None`` when they are undefined.
+
+    ``None`` with fewer than two returns, or when the series has no dispersion at
+    all (the skew and kurtosis ratios divide by the second moment).
+    """
+    n = len(returns)
+    if n < 2:
+        return None
+    mean = sum(returns) / n
+    deviations = [r - mean for r in returns]
+    sum_squares = sum(d * d for d in deviations)
+    m2 = sum_squares / n
+    if m2 <= 0.0:
+        return None
+    return ReturnMoments(
+        count=n,
+        mean=mean,
+        stdev=sqrt(sum_squares / (n - 1)),
+        skew=sum(d**3 for d in deviations) / n / m2**1.5,
+        kurtosis=sum(d**4 for d in deviations) / n / (m2 * m2),
+    )
+
+
+def curve_moments(curve: Sequence[EquityPoint]) -> ReturnMoments | None:
+    """:func:`return_moments` of an equity curve's per-bar returns."""
+    return return_moments(daily_returns(curve))
+
+
+def expected_max_sharpe(trials: int, sharpe_stdev: float) -> float:
+    """Per-bar Sharpe the *best* of ``trials`` skill-free strategies would still show.
+
+    The null this ticket exists to state: run 24 parameter combinations over the
+    same data and the best of them has a positive Sharpe even when not one has any
+    edge, purely because you kept the maximum of 24 draws. Bailey & López de
+    Prado's expected-maximum approximation puts a number on it —
+
+    ``sigma * [(1 - g) * inv_cdf(1 - 1/N) + g * inv_cdf(1 - 1/(N*e))]``
+
+    where ``sigma`` (``sharpe_stdev``) is the spread of per-bar Sharpes *across the
+    trials* and ``g`` is Euler-Mascheroni. The spread matters as much as the count:
+    24 near-identical combinations offer far less opportunity to get lucky than 24
+    genuinely different ones, and this formula says so.
+
+    Returns 0.0 for a single trial (nothing was selected, so nothing needs
+    deflating) or a zero spread (every trial scored the same, so the maximum was
+    not a lucky draw). Both are honest zeros, not fallbacks.
+    """
+    if trials <= 1 or sharpe_stdev <= 0.0:
+        return 0.0
+    normal = NormalDist()
+    return sharpe_stdev * (
+        (1.0 - EULER_MASCHERONI) * normal.inv_cdf(1.0 - 1.0 / trials)
+        + EULER_MASCHERONI * normal.inv_cdf(1.0 - 1.0 / (trials * e))
+    )
+
+
+def probabilistic_sharpe_ratio(
+    moments: ReturnMoments,
+    threshold_per_bar: float = 0.0,
+) -> float | None:
+    """Probability the *true* per-bar Sharpe exceeds ``threshold_per_bar``.
+
+    Bailey & López de Prado's PSR: the observed Sharpe's sampling distribution,
+    corrected for the return series' skew and kurtosis — because a Sharpe estimated
+    from negatively-skewed, fat-tailed returns is less trustworthy than the same
+    Sharpe from clean ones, and a strategy that sells tail risk manufactures
+    exactly those returns.
+
+    ``None`` when the variance correction is non-positive (an extreme combination
+    of a very high Sharpe and heavy tails makes the standard error imaginary), or
+    with fewer than two observations. Never a clipped 0.0/1.0 stand-in.
+    """
+    if moments.count < 2 or moments.stdev <= 0.0:
+        return None
+    observed = moments.mean / moments.stdev
+    variance_correction = (
+        1.0 - moments.skew * observed + (moments.kurtosis - 1.0) / 4.0 * observed * observed
+    )
+    if variance_correction <= 0.0:
+        return None
+    z = (observed - threshold_per_bar) * sqrt(moments.count - 1) / sqrt(variance_correction)
+    return NormalDist().cdf(z)
+
+
+@dataclass(frozen=True, slots=True)
+class DeflatedSharpe:
+    """A Sharpe ratio discounted for the number of trials that competed for it.
+
+    ``trials`` is what the tool could see — one run for a plain backtest, the
+    number of scored combinations for a sweep. ``null_best_sharpe`` is the
+    annualized Sharpe the luckiest of those trials would show with no edge at all,
+    and ``probability`` is ``P(true Sharpe > null_best_sharpe)``. A winner whose
+    probability sits at 0.31 is not a finding; it is the best of N coin flips.
+
+    ``probability`` is ``float | None`` — ``None`` means "undefined on this data",
+    a different fact from a low probability, and must never render the same way
+    (the ADR-0029/ADR-0037 rule).
+    """
+
+    trials: int
+    observed_sharpe: float
+    null_best_sharpe: float
+    probability: float | None
+    observations: int
+    trial_sharpe_stdev: float | None
+    skew: float
+    kurtosis: float
+
+    @property
+    def significant(self) -> bool:
+        """Whether the discounted Sharpe clears :data:`DEFLATED_SHARPE_CONFIDENCE`.
+
+        ``False`` when the probability is unknown: an unmeasurable result is not a
+        passing one. The report words the two cases differently.
+        """
+        return self.probability is not None and self.probability >= DEFLATED_SHARPE_CONFIDENCE
+
+
+def deflated_sharpe(
+    moments: ReturnMoments,
+    trial_sharpes: Sequence[float],
+    periods_per_year: float = 252.0,
+) -> DeflatedSharpe | None:
+    """Deflate a run's Sharpe for the search that produced it (KAN-619, ADR-0039).
+
+    ``trial_sharpes`` are the **annualized** Sharpes of every trial that competed —
+    for a sweep, one per scored combination, *including* the winner. Their count is
+    the multiple-comparison correction's ``N`` and their spread is its sigma (see
+    :func:`expected_max_sharpe`). ``moments`` describes the winner's own return
+    series, which carries the sample size and the non-normality correction.
+
+    A single trial is still a trial: a ``trial_sharpes`` of length one yields a
+    null threshold of 0.0, so the result degenerates to the plain probabilistic
+    Sharpe against zero rather than silently skipping the check. What the tool
+    *cannot* see is every run the operator made in a previous invocation, so the
+    correction is always a lower bound — :func:`assess_significance` says so in its
+    notes.
+
+    ``None`` when the moments carry no dispersion. Raises ``ValueError`` on an
+    empty ``trial_sharpes``: a result produced by no trials at all is a caller bug,
+    not a data property.
+    """
+    trials = len(trial_sharpes)
+    if trials < 1:
+        raise ValueError("trial_sharpes must hold at least the run being deflated")
+    if moments.stdev <= 0.0:
+        return None
+    root = sqrt(periods_per_year)
+    per_bar = [s / root for s in trial_sharpes]
+    stdev_per_bar: float | None = None
+    if trials > 1:
+        stdev_per_bar = sqrt(_sample_variance(per_bar, _mean(per_bar)))
+    threshold = expected_max_sharpe(trials, stdev_per_bar if stdev_per_bar is not None else 0.0)
+    return DeflatedSharpe(
+        trials=trials,
+        observed_sharpe=moments.mean / moments.stdev * root,
+        null_best_sharpe=threshold * root,
+        probability=probabilistic_sharpe_ratio(moments, threshold),
+        observations=moments.count,
+        trial_sharpe_stdev=None if stdev_per_bar is None else stdev_per_bar * root,
+        skew=moments.skew,
+        kurtosis=moments.kurtosis,
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class SignificanceReport:
+    """Everything ADR-0039 can say about whether a run's Sharpe means anything.
+
+    Each block is independently ``None`` when it could not be computed, and
+    ``notes`` explains *why*, in words a reader can act on — a wide interval and an
+    absent one are different facts, exactly as ADR-0029 distinguished an unknown
+    trades-per-parameter ratio from a failing one.
+    """
+
+    sharpe_interval: SharpeInterval | None = None
+    paired: PairedBootstrap | None = None
+    deflated: DeflatedSharpe | None = None
+    notes: list[str] = field(default_factory=list)
+
+
+def assess_significance(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint] | None = None,
+    periods_per_year: float = 252.0,
+    *,
+    resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    block_length: int = DEFAULT_BLOCK_LENGTH,
+    confidence: float = DEFAULT_CONFIDENCE,
+    seed: int = DEFAULT_BOOTSTRAP_SEED,
+    trial_sharpes: Sequence[float] | None = None,
+) -> SignificanceReport:
+    """Assemble the whole significance block for one run (ADR-0039).
+
+    Always returns an object; the *caller* decides whether to render it, exactly as
+    :func:`compare_to_benchmark` does. ``benchmark`` turns on the paired win rate.
+    ``trial_sharpes`` is the annualized Sharpe of every trial that competed for this
+    result — omit it and the run counts as its own single trial, which is the
+    truthful reading of a lone ``trading backtest`` invocation.
+
+    The notes are not decoration. They record the things a reader would otherwise
+    have to infer: that a short series forced a smaller block length, that no
+    benchmark meant no paired figure, and that the trial count covers only this
+    invocation.
+    """
+    notes: list[str] = []
+    interval = sharpe_confidence_interval(
+        curve,
+        periods_per_year,
+        resamples=resamples,
+        block_length=block_length,
+        confidence=confidence,
+        seed=seed,
+    )
+    if interval is None:
+        notes.append(
+            f"no Sharpe confidence interval: {max(len(curve) - 1, 0)} return period(s) is "
+            f"below the {MIN_BOOTSTRAP_OBSERVATIONS} a block bootstrap needs, or the curve "
+            "has no variance at all"
+        )
+    elif interval.block_length_was_reduced:
+        notes.append(
+            f"block length reduced from {interval.requested_block_length} to "
+            f"{interval.block_length} bars: {interval.observations} return period(s) cannot "
+            f"hold {MIN_BLOCKS_PER_RESAMPLE} blocks of the requested length, and blocks as "
+            "long as the series would resample nothing"
+        )
+
+    paired: PairedBootstrap | None = None
+    if benchmark is None:
+        notes.append(
+            "no benchmark ran, so there is no paired win rate — the figure that says "
+            "whether this strategy beats the alternative, not merely whether it beats zero"
+        )
+    else:
+        paired = paired_bootstrap(
+            curve,
+            benchmark,
+            periods_per_year,
+            resamples=resamples,
+            block_length=block_length,
+            seed=seed,
+        )
+        if paired is None:
+            notes.append(
+                "no paired win rate: the strategy and benchmark curves share fewer than "
+                f"{MIN_BOOTSTRAP_OBSERVATIONS} return periods"
+            )
+
+    deflated: DeflatedSharpe | None = None
+    moments = curve_moments(curve)
+    if moments is None:
+        notes.append(
+            "no deflated Sharpe: the return series has fewer than two periods, or no variance"
+        )
+    else:
+        sharpes = (
+            [moments.mean / moments.stdev * sqrt(periods_per_year)]
+            if trial_sharpes is None
+            else list(trial_sharpes)
+        )
+        deflated = deflated_sharpe(moments, sharpes, periods_per_year)
+        notes.append(
+            f"the deflation counts {len(sharpes)} trial(s) — only those visible in this "
+            "invocation. Runs made in earlier invocations, over other date ranges, or on "
+            "other strategies are invisible to this tool, so the correction is a LOWER "
+            "BOUND on the multiple-comparison problem, never a complete accounting"
+        )
+    return SignificanceReport(
+        sharpe_interval=interval,
+        paired=paired,
+        deflated=deflated,
+        notes=notes,
     )
