@@ -124,7 +124,10 @@ An empty result now caches an empty CSV and is served from disk thereafter.
   If a provider later gains history for that window, the stale empty CSV must be
   deleted by hand — the same staleness the positive cache already has.
 - Still open: the CLI does not yet *print* `absent` (it lands in the next
-  integration commit), a failing `--benchmark` symbol still aborts a
-  `backtest` command after the main run has already succeeded, and
-  `RecentWindowFeed.poll` still fetches without a per-symbol guard so one bad
-  symbol aborts a paper poll.
+  integration commit), and a failing `--benchmark` symbol still aborts a
+  `backtest` command after the main run has already succeeded.
+- **Amended 2026-08-08:** `RecentWindowFeed.poll` used to fetch without a
+  per-symbol guard, so one bad symbol aborted a paper poll. It now applies this
+  same treatment, reusing these types and reason codes — plus a retry/escalation
+  policy for the long-running case, since a session polls the same symbol
+  hundreds of times rather than once. See ADR-0035.
