@@ -158,6 +158,26 @@ class AlpacaClient(Protocol):
         """Fetch the current state of a previously submitted order."""
         ...
 
+    def cancel_order(self, order_id: str) -> None:
+        """Ask the venue to cancel a working order (ADR-0035).
+
+        The sixth call on the seam, and the widening ADR-0017 anticipated. It is
+        what lets an operator (or a test) clear an order the venue has *parked* --
+        a market order placed while the market is closed queues for the next open
+        and stays working indefinitely, so without this there is no way to take it
+        back short of the Alpaca dashboard.
+
+        Cancellation is a *request*, not a result: it returns nothing and the
+        order reaches ``canceled`` asynchronously, so callers must re-read it via
+        :meth:`get_order` (which is exactly what the broker's poll already does).
+        Cancelling an order that is already terminal succeeds silently -- verified
+        against the live paper venue, which answers a repeat cancel with 200, not
+        an error. An unknown order id raises :class:`LookupError`, keeping "we
+        never heard of it" apart from "we cancelled it" the same way
+        :meth:`get_asset` does.
+        """
+        ...
+
     def get_account(self) -> AccountSnapshot:
         """Current cash and equity."""
         ...
@@ -360,6 +380,21 @@ class FakeAlpacaClient:
 
     def get_order(self, order_id: str) -> AlpacaOrder:
         return self._state.orders[order_id]
+
+    def cancel_order(self, order_id: str) -> None:
+        """Mark a working order ``canceled``; a terminal one is left alone.
+
+        Mirrors what the live paper venue was observed to do (ADR-0035): a repeat
+        cancel is accepted silently rather than raising, and any partial fill the
+        order already got stays on the record so the broker can still emit it.
+        Unlike the venue, the transition is immediate -- there is no clock here.
+        """
+        order = self._state.orders.get(order_id)
+        if order is None:
+            raise LookupError(f"unknown Alpaca order {order_id!r}")
+        if order.status in TERMINAL_STATUSES:
+            return
+        self._state.orders[order_id] = replace(order, status=STATUS_CANCELED)
 
     def get_account(self) -> AccountSnapshot:
         return AccountSnapshot(cash=self._state.cash, equity=self._equity())
@@ -676,6 +711,23 @@ class RealAlpacaClient:
         return self._to_order(
             _require_model(self._trading.get_order_by_id(order_id), "get_order_by_id")
         )
+
+    def cancel_order(self, order_id: str) -> None:
+        """Cancel a working order at the venue (ADR-0035).
+
+        The SDK's ``cancel_order_by_id`` returns ``None`` and the order reaches
+        ``canceled`` a moment later, so this returns nothing and callers re-read
+        the status. An unknown id (the SDK's 404) becomes a :class:`LookupError`,
+        matching :meth:`get_asset`; anything else -- auth, rate limit, transport,
+        or a venue that refuses the cancel -- propagates unchanged, so "we could
+        not ask" is never mistaken for "it is cancelled".
+        """
+        try:
+            self._trading.cancel_order_by_id(order_id)
+        except Exception as exc:  # narrowed below: only a 404 becomes LookupError
+            if getattr(exc, "status_code", None) == 404:
+                raise LookupError(f"unknown Alpaca order {order_id!r}") from exc
+            raise
 
     def get_account(self) -> AccountSnapshot:
         account = _require_model(self._trading.get_account(), "get_account")
