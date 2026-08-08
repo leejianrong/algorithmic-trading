@@ -126,9 +126,12 @@ artifacts diff clean against the same command run on `origin/main`.
 
 ### The warmup is reported, never silent
 
-`PaperSession` exposes `warmup_bars`, `warmup_span` and `warmup_complete`, and the
-CLI prints one line into both stdout and `paper_session.log` before the first live
-bar:
+`PaperSession` exposes `warmup_bars`, `warmup_span` and `warmup_complete`, plus a
+`run(on_warmup=...)` hook that fires the instant priming finishes. The hook is not
+decoration: after warming up the session **sleeps to the next bar boundary**, so
+announcing on the first live bar report would leave a `--interval 1h` session
+silent for an hour after startup, which is indistinguishable from a hang. The CLI
+prints one line into both stdout and `paper_session.log`:
 
 ```
 Warmup: primed 512 completed bar(s) 2026-08-06 13:35..2026-08-08 19:55 as history;

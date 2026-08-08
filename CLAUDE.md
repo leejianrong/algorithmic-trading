@@ -497,8 +497,11 @@ As of this writing:
   proved not argued: same artifacts and stdout before/after, with the equity CSV's
   SHA-256 pinned as a golden; `Engine.run` is untouched and a backtest diffs clean
   against `origin/main`. The warmup is never silent — `warmup_bars` / `warmup_span` /
-  `warmup_complete` on the session, and one CLI line into stdout *and*
-  `paper_session.log` before the first live bar. New `paper --lookback N` exposes the
+  `warmup_complete` on the session, plus a `run(on_warmup=...)` hook so the CLI's one
+  line reaches stdout *and* `paper_session.log` the instant priming finishes — the
+  session then sleeps to the next boundary, so announcing on the first live bar would
+  leave a 1h session silent for an hour, indistinguishable from a hang. New
+  `paper --lookback N` exposes the
   window (a **floor** under `--once`, so it can never truncate a replay).
   `RESULT_SCHEMA_VERSION` stays **1**. Known gaps: the warmup is not in `result.json`
   or the dashboard, and nothing checks the primed history is actually long enough for

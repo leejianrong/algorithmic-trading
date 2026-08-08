@@ -902,9 +902,11 @@ def paper(
 
             A silent warmup is indistinguishable from a session that quietly did
             nothing, and the count is the operator's check that the strategy has its
-            lookback before it trades. Emitted from the first bar report so it lands
-            in chronological order, and again on the interrupt path so a session that
-            never reaches a live bar still says what it saw.
+            lookback before it trades. Wired to the session's ``on_warmup`` hook so
+            it lands the moment priming finishes -- the session then sleeps to the
+            next bar boundary, so waiting for the first bar report would leave a
+            1h live run silent for an hour after startup. Also called on both exit
+            paths, so a session that never reaches a live bar still says what it saw.
             """
             nonlocal announced
             if announced or not live:
@@ -935,7 +937,7 @@ def paper(
             _persist_state(state_path, outcome, broker.portfolio)
 
         try:
-            result = session.run(reporter=reporter, **run_kwargs)
+            result = session.run(reporter=reporter, on_warmup=announce_warmup, **run_kwargs)
             announce_warmup()
         except KeyboardInterrupt:
             announce_warmup()

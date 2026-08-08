@@ -34,6 +34,7 @@ from __future__ import annotations
 import hashlib
 from datetime import UTC, datetime
 from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
 from typer.testing import CliRunner
@@ -205,6 +206,23 @@ class TestFirstPollIsWarmupNotTrading:
         assert result.equity_curve == []
         assert result.fills == []
 
+    def test_the_warmup_hook_fires_before_the_session_waits(self) -> None:
+        """A live session sleeps a whole interval after priming, so telling the
+        operator on the *first live bar* would leave a 1h run silent for an hour.
+        The hook must fire while the warmup counts are already populated.
+        """
+        history = [_bar("AAA", d, 100.0 + d) for d in range(1, 31)]
+        live = _bar("AAA", 31, 131.0)
+        session, _ = _session([_feed_of(history), _feed_of([*history, live])], _EveryBar("AAA"))
+        seen: list[tuple[int, int]] = []
+
+        session.run(
+            max_empty_polls=1,
+            on_warmup=lambda: seen.append((session.warmup_bars, len(session.session_log))),
+        )
+
+        assert seen == [(30, 0)], "the hook must fire once, after priming, before any live bar"
+
     def test_the_warmup_is_reported_not_silent(self) -> None:
         history = [_bar("AAA", d, 100.0 + d) for d in range(1, 31)]
         session, _ = _session([_feed_of(history)], _EveryBar("AAA"))
@@ -268,6 +286,53 @@ class TestWarmupStillFeedsTheStrategy:
         session.run(max_empty_polls=1)
 
         assert strategy._long == {}, "the strategy must not have been run over history"
+
+
+class TestTheDefaultIsTheSafeOne:
+    """Constructed without an opinion, a ``PaperSession`` must not trade a backfill.
+
+    Every caller in the tree states its intent, so nothing else pins this — and the
+    unstated default is exactly what a future live wiring will get.
+    """
+
+    def test_warmup_is_on_unless_a_caller_opts_out(self) -> None:
+        history = [_bar("AAA", d, 100.0 + d) for d in range(1, 31)]
+        broker = _RecordingBroker(SimulatedBroker(Portfolio(cash=1_000.0), _ZERO_COST))
+        engine = Engine(FakeAdapter([]), broker, Guardrails(RiskConfig.unlimited()))
+        clock = FakeClock(datetime(2024, 3, 1, tzinfo=UTC))
+        # No `warmup=` argument anywhere: this is the shape a careless caller writes.
+        session = PaperSession(
+            engine,
+            _EveryBar("AAA"),
+            ["AAA"],
+            _ScriptedFeed([_feed_of(history)]),
+            clock,
+            lookback=1_000,
+        )
+
+        session.run(max_empty_polls=1)
+
+        assert broker.submitted == []
+        assert session.warmup_bars == 30
+
+    def test_the_cli_hands_once_the_replay_setting_and_live_the_safe_one(self) -> None:
+        """The CLI's two modes must map onto the two settings, not onto one of them.
+
+        Asserted through the constructor rather than the rendered help text, which
+        this repo does not test against.
+        """
+        seen: list[bool] = []
+        real_init = PaperSession.__init__
+
+        def spy(self: PaperSession, *args: object, **kwargs: object) -> None:
+            seen.append(bool(kwargs.get("warmup", True)))
+            real_init(self, *args, **kwargs)  # type: ignore[arg-type]
+
+        with pytest.MonkeyPatch.context() as mp, TemporaryDirectory() as tmp:
+            mp.setattr(PaperSession, "__init__", spy)
+            once = runner.invoke(app, [*_ONCE_ARGS, "--out", str(Path(tmp) / "once")])
+        assert once.exit_code == 0, once.output
+        assert seen == [False], "--once must replay and trade the whole range"
 
 
 class TestLaterPollsAreNotWarmup:

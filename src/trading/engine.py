@@ -697,6 +697,7 @@ class PaperSession:
         max_empty_polls: int = 2,
         max_polls: int = 100_000,
         reporter: object = None,
+        on_warmup: object = None,
     ) -> BacktestResult:
         """Poll → process new completed bars → sleep, until a stop condition.
 
@@ -707,9 +708,13 @@ class PaperSession:
 
         With ``warmup=True`` the first poll that reveals any bars is the *warmup*:
         those bars are primed as history and none of them is traded, reported, or
-        marked to a curve (ADR-0042). Every poll after it is live.
+        marked to a curve (ADR-0042). Every poll after it is live. ``on_warmup``, if
+        callable, is invoked with no arguments the moment that happens — the session
+        then sleeps until the next bar boundary, so without it a live run would say
+        nothing at all for a whole interval after starting.
         """
         call_reporter = reporter if callable(reporter) else None
+        call_on_warmup = on_warmup if callable(on_warmup) else None
         empty_polls = 0
 
         for _ in range(max_polls):
@@ -727,6 +732,8 @@ class PaperSession:
                     self._clock.sleep_until(self._next_due())
                     continue
                 self._absorb_warmup(fresh)
+                if call_on_warmup is not None:
+                    call_on_warmup()
                 # A poll that primed hundreds of bars is the opposite of quiet;
                 # counting it as empty would leave a default session one dull poll
                 # from stopping before it ever traded.
