@@ -385,12 +385,19 @@ class TestOrderRefusalClassification:
         assert _classify_order_error(exc, "AAPL", 1.0, Side.BUY) is exc
 
     def test_a_rate_limit_passes_through(self) -> None:
-        exc = _StubApiError('{"code":42910000,"message":"too many requests"}', status_code=429)
+        # Carries a code *and* is a 4xx, so only the explicit 429 exclusion keeps
+        # it out -- deliberately, or this passes for the wrong reason.
+        exc = _StubApiError(
+            '{"code":42910000,"message":"too many requests"}', status_code=429, code=42910000
+        )
 
         assert _classify_order_error(exc, "AAPL", 1.0, Side.BUY) is exc
 
     def test_a_server_error_passes_through(self) -> None:
-        exc = _StubApiError('{"code":50010000,"message":"internal"}', status_code=500)
+        # Likewise: a code is present, so it is the 4xx range check doing the work.
+        exc = _StubApiError(
+            '{"code":50010000,"message":"internal"}', status_code=500, code=50010000
+        )
 
         assert _classify_order_error(exc, "AAPL", 1.0, Side.BUY) is exc
 
