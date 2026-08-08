@@ -41,14 +41,25 @@ Sharpe quoted without the 24 is the number this bench exists not to print.
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
 parameters says so (ADR-0029).
+
+This module is also the process's only owner of two things a library must never
+touch (ADR-0043): the **signal disposition** — ``paper`` installs a SIGTERM handler
+for the length of its session so ``docker stop`` / ``systemd stop`` / ``kill`` take
+the same finalizing exit Ctrl-C already takes — and **logging configuration**, via
+the global ``--log-level`` / ``--log-format`` options on the app callback.
 """
 
 from __future__ import annotations
 
+import contextlib
 import csv
 import json
+import logging
+import signal
+from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from types import FrameType
 
 import typer
 
@@ -84,6 +95,12 @@ from trading.engine import (
 from trading.frequency import DAILY, Frequency
 from trading.interfaces import Broker, DataAdapter
 from trading.liquidity import DEFAULT_FORMATION_DAYS, screen_by_adv
+from trading.logging_config import (
+    DEFAULT_LOG_FORMAT,
+    DEFAULT_LOG_LEVEL,
+    LOG_FORMATS,
+    configure_logging,
+)
 from trading.metrics import (
     DEFAULT_BOOTSTRAP_RESAMPLES,
     DEFAULT_BOOTSTRAP_SEED,
@@ -107,12 +124,141 @@ from trading.universe import get_sector_map, get_universe, validate_universe
 
 app = typer.Typer(add_completion=False, help="Algorithmic trading test bench.")
 
+# Named, not ``__name__``. Running the CLI as ``python -m trading.cli`` — which is
+# how the signal tests drive it, and a perfectly ordinary way to run it — makes
+# ``__name__`` equal ``"__main__"``, a logger outside the ``trading`` tree and
+# therefore outside what ``--log-level`` governs: every record here would silently
+# fall back to the root's WARNING threshold and the session's own INFO lines would
+# vanish exactly when they are wanted. Observed, not theorised (ADR-0043).
+logger = logging.getLogger("trading.cli")
+
 
 @app.callback()
-def main() -> None:
-    """Algorithmic trading test bench. Use a subcommand (e.g. `backtest`)."""
-    # Present so `backtest`/`paper`/`gen-data` stay named subcommands rather than
-    # Typer collapsing a lone command into the root.
+def main(
+    log_level: str = typer.Option(
+        DEFAULT_LOG_LEVEL,
+        "--log-level",
+        help="Log threshold for this bench's own loggers: DEBUG | INFO | WARNING | "
+        "ERROR | CRITICAL. Logs go to stderr; the run's report stays on stdout. "
+        "Above WARNING it quiets third-party libraries too; below, it does not "
+        "make them louder.",
+    ),
+    log_format: str = typer.Option(
+        DEFAULT_LOG_FORMAT,
+        "--log-format",
+        help=f"Log record format: {' | '.join(LOG_FORMATS)}. JSON lines for a log "
+        "shipper reading an unattended session after the fact; text for a human.",
+    ),
+) -> None:
+    """Algorithmic trading test bench. Use a subcommand (e.g. `backtest`).
+
+    Also the single place logging is configured (ADR-0043). It happens here, in the
+    entry point, and never at import: a host application that imports ``trading`` as
+    a library keeps its own handlers untouched.
+    """
+    # This callback is also what keeps `backtest`/`paper`/`gen-data` named
+    # subcommands rather than Typer collapsing a lone command into the root.
+    try:
+        configure_logging(log_level, log_format)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+
+class SessionTerminated(KeyboardInterrupt):
+    """SIGTERM, re-delivered as the interrupt the paper loop already ends on.
+
+    Subclassing :class:`KeyboardInterrupt` is the whole trick: the ``except
+    KeyboardInterrupt`` that ADR-0033 added for Ctrl-C catches this unchanged, so a
+    stopped session and an interrupted one take *one* path to ``finalize()`` rather
+    than two that can drift apart. Only the sentence printed differs, and only so an
+    operator reading the log afterwards can tell "someone pressed Ctrl-C" from
+    "the orchestrator stopped the container".
+    """
+
+
+class _TerminationGuard:
+    """Turns the first SIGTERM into an interrupt and ignores every one after it.
+
+    Two questions, answered once each.
+
+    **Raise, or set a flag the loop checks?** Raise. A live session spends almost
+    all of its life inside ``Clock.sleep_until``, waiting out a bar interval — five
+    minutes on the Monday divergence run, an hour at ``--interval 1h``. A
+    cooperative flag is only read when the loop comes back round, so SIGTERM would
+    be noticed up to a whole interval later, and Docker sends SIGKILL ten seconds
+    after SIGTERM: the flag would lose the artifacts exactly the way no handler at
+    all does. Raising interrupts the sleep immediately (PEP 475 retries a signalled
+    ``time.sleep`` *unless* the handler raised). The cost is real and accepted: an
+    exception from a handler lands at whatever bytecode boundary the interpreter
+    happened to reach, so it can surface from inside any call the loop is making.
+    That is survivable here only because of the second answer.
+
+    **What about a signal arriving mid-finalization?** It is dropped. Once the loop
+    has been left, this guard is disarmed and every further SIGTERM is logged and
+    ignored, so writing ``equity_curve.csv`` and ``result.json`` cannot be
+    interrupted half way — truncating the artifacts the first signal was honoured in
+    order to save would be a strictly worse outcome than taking a moment longer.
+    Finalization is bounded work (assembling an in-memory result and writing four
+    small files, milliseconds in practice), so the ten-second grace period is not
+    close to binding, and ``kill -9`` remains available to an operator who disagrees.
+    """
+
+    def __init__(self) -> None:
+        self.armed = True
+        self.signals = 0
+
+    def handle(self, signum: int, frame: FrameType | None) -> None:
+        self.signals += 1
+        if not self.armed:
+            # Reached only while finalizing (or after it). Logging from a handler is
+            # safe here because ``logging``'s locks are reentrant and this is the
+            # main thread; the alternative — silence — leaves an operator whose
+            # ``kill`` did nothing with no explanation at all.
+            logger.warning(
+                "signal %s received while finalizing — ignoring so the artifacts are "
+                "written whole; use SIGKILL to stop immediately (and lose them)",
+                signum,
+            )
+            return
+        self.armed = False
+        raise SessionTerminated
+
+    def disarm(self) -> None:
+        """Stop honouring SIGTERM: the loop is over and finalization has begun."""
+        self.armed = False
+
+
+@contextlib.contextmanager
+def _sigterm_stops_the_session() -> Iterator[_TerminationGuard]:
+    """Install the SIGTERM handler for the length of a session, then restore it.
+
+    Scoped to ``paper`` rather than the whole CLI, and installed at the entry point
+    rather than on import, for the same reason logging is: a signal disposition is
+    process-global state that belongs to whoever owns ``main``. A killed ``backtest``
+    is re-runnable from its inputs; a killed live session is gone, and it is the only
+    survivorship-free evidence this bench collects (ADR-0027/0035).
+
+    Degrades quietly rather than failing: :func:`signal.signal` raises ``ValueError``
+    off the main thread and the platform may not deliver SIGTERM at all, neither of
+    which is a reason to refuse to trade. The session then behaves exactly as it did
+    before ADR-0043, and says so once.
+    """
+    guard = _TerminationGuard()
+    try:
+        previous = signal.signal(signal.SIGTERM, guard.handle)
+    except (ValueError, OSError, AttributeError) as exc:  # pragma: no cover - platform-specific
+        logger.warning(
+            "SIGTERM handling unavailable (%s); a stop signal will end this session "
+            "without writing its artifacts — exit with Ctrl-C instead",
+            exc,
+        )
+        yield guard
+        return
+    try:
+        yield guard
+    finally:
+        signal.signal(signal.SIGTERM, previous)
 
 
 def _parse_date(label: str, value: str) -> datetime:
@@ -893,95 +1039,135 @@ def paper(
     state_path = out / "paper_state.json"
     mode = "live" if live else "once"
     typer.echo(f"Paper session ({mode}) — strategy={strategy} symbols={','.join(tickers)}\n")
-
-    with log_path.open("w") as log_fh:
-        announced = False
-
-        def announce_warmup() -> None:
-            """Say what was primed, exactly once, before the first live bar prints.
-
-            A silent warmup is indistinguishable from a session that quietly did
-            nothing, and the count is the operator's check that the strategy has its
-            lookback before it trades. Wired to the session's ``on_warmup`` hook so
-            it lands the moment priming finishes -- the session then sleeps to the
-            next bar boundary, so waiting for the first bar report would leave a
-            1h live run silent for an hour after startup. Also called on both exit
-            paths, so a session that never reaches a live bar still says what it saw.
-            """
-            nonlocal announced
-            if announced or not live:
-                return
-            announced = True
-            span = session.warmup_span
-            if span is None:
-                line = (
-                    "Warmup: no completed bars were available, so the strategy starts "
-                    "with empty history and stays flat until its lookback fills."
-                )
-            else:
-                line = (
-                    f"Warmup: primed {session.warmup_bars} completed bar(s) "
-                    f"{span[0]:%Y-%m-%d %H:%M}..{span[1]:%Y-%m-%d %H:%M} as history; "
-                    "no orders submitted for them (ADR-0042)."
-                )
-            typer.echo(line + "\n")
-            log_fh.write(line + "\n")
-            log_fh.flush()
-
-        def reporter(outcome: BarOutcome) -> None:
-            announce_warmup()
-            line = _format_bar(outcome)
-            typer.echo(line)
-            log_fh.write(line + "\n")
-            log_fh.flush()
-            _persist_state(state_path, outcome, broker.portfolio)
-
-        try:
-            result = session.run(reporter=reporter, on_warmup=announce_warmup, **run_kwargs)
-            announce_warmup()
-        except KeyboardInterrupt:
-            announce_warmup()
-            # A --live session has no natural exit: Ctrl-C *is* how it ends. Letting
-            # the interrupt propagate skipped everything below, so the equity CSV,
-            # result.json, and the summary were unreachable in live mode even though
-            # every bar had been processed and logged (ADR-0033).
-            typer.echo("\nInterrupted — finalizing with the bars processed so far.")
-            result = session.finalize()
-
-    csv_path = out / "equity_curve.csv"
-    write_equity_csv(result, csv_path)
-
-    # The canonical machine-readable artifact the dashboard consumes, alongside the
-    # CSV. Metrics are computed at the run's frequency (default 252/yr for daily).
-    free_params = free_parameter_count(strat)
-    metrics = compute_metrics(result, freq.periods_per_year, free_parameters=free_params)
-    result_json = out / "result.json"
-    write_result_json(result, result_json, mode="paper", frequency=freq.label, metrics=metrics)
-
-    typer.echo(
-        "\n"
-        + summarize(
-            result,
-            periods_per_year=freq.periods_per_year,
-            free_parameters=free_params,
-        )
+    # The one record that makes an unattended session's log answerable afterwards:
+    # what was asked for, and when. Everything per-bar stays on stdout (ADR-0043).
+    logger.info(
+        "paper session starting: mode=%s strategy=%s symbols=%s interval=%s source=%s "
+        "broker=%s lookback=%d out=%s",
+        mode,
+        strategy,
+        ",".join(tickers),
+        freq.label,
+        source,
+        broker_name,
+        window,
+        out,
     )
-    artifacts = [
-        f"Session log: {log_path}",
-        f"Running state: {state_path}",
-        f"Equity curve: {csv_path}",
-        f"Result JSON: {result_json}",
-    ]
 
-    if shadow is not None:
-        records = shadow.divergences
-        divergence_csv = out / "fill_divergence.csv"
-        write_divergence_csv(records, divergence_csv)
-        typer.echo("\n" + render_report(shadow.summary, records))
-        artifacts.append(f"Fill divergence: {divergence_csv}")
+    # SIGTERM is how a container, a service manager, or an operator at another
+    # terminal stops this process, and its default disposition would kill the
+    # interpreter without unwinding — losing the equity CSV, result.json and the
+    # summary exactly as an unhandled Ctrl-C did before ADR-0033. Installed here,
+    # around the session *and* the artifact writing that follows it, so a second
+    # signal cannot truncate what the first one was honoured to save (ADR-0043).
+    with _sigterm_stops_the_session() as termination:
+        with log_path.open("w") as log_fh:
+            announced = False
 
-    typer.echo(f"\nProcessed {len(session.session_log)} completed bar(s).")
-    typer.echo("\n".join(artifacts))
+            def announce_warmup() -> None:
+                """Say what was primed, exactly once, before the first live bar prints.
+
+                A silent warmup is indistinguishable from a session that quietly did
+                nothing, and the count is the operator's check that the strategy has
+                its lookback before it trades. Wired to the session's ``on_warmup``
+                hook so it lands the moment priming finishes -- the session then
+                sleeps to the next bar boundary, so waiting for the first bar report
+                would leave a 1h live run silent for an hour after startup. Also
+                called on both exit paths, so a session that never reaches a live bar
+                still says what it saw.
+                """
+                nonlocal announced
+                if announced or not live:
+                    return
+                announced = True
+                span = session.warmup_span
+                if span is None:
+                    line = (
+                        "Warmup: no completed bars were available, so the strategy starts "
+                        "with empty history and stays flat until its lookback fills."
+                    )
+                else:
+                    line = (
+                        f"Warmup: primed {session.warmup_bars} completed bar(s) "
+                        f"{span[0]:%Y-%m-%d %H:%M}..{span[1]:%Y-%m-%d %H:%M} as history; "
+                        "no orders submitted for them (ADR-0042)."
+                    )
+                typer.echo(line + "\n")
+                log_fh.write(line + "\n")
+                log_fh.flush()
+                logger.info("%s", line)
+
+            def reporter(outcome: BarOutcome) -> None:
+                announce_warmup()
+                line = _format_bar(outcome)
+                typer.echo(line)
+                log_fh.write(line + "\n")
+                log_fh.flush()
+                _persist_state(state_path, outcome, broker.portfolio)
+
+            try:
+                result = session.run(reporter=reporter, on_warmup=announce_warmup, **run_kwargs)
+                announce_warmup()
+            except KeyboardInterrupt as exc:
+                announce_warmup()
+                # A --live session has no natural exit: Ctrl-C *is* how it ends.
+                # Letting the interrupt propagate skipped everything below, so the
+                # equity CSV, result.json, and the summary were unreachable in live
+                # mode even though every bar had been processed and logged
+                # (ADR-0033). SIGTERM arrives here as the same exception on purpose
+                # (ADR-0043) — one exit path, two names for how it was triggered,
+                # because "the orchestrator stopped the container" and "someone
+                # pressed Ctrl-C" are different facts to read in a log afterwards.
+                trigger = (
+                    "SIGTERM received" if isinstance(exc, SessionTerminated) else "Interrupted"
+                )
+                logger.warning("%s — finalizing the session", trigger)
+                typer.echo(f"\n{trigger} — finalizing with the bars processed so far.")
+                result = session.finalize()
+
+        # From here on the session is over and the artifacts are being written; a
+        # further stop signal is dropped rather than allowed to truncate them.
+        termination.disarm()
+
+        csv_path = out / "equity_curve.csv"
+        write_equity_csv(result, csv_path)
+
+        # The canonical machine-readable artifact the dashboard consumes, alongside
+        # the CSV. Metrics are computed at the run's frequency (252/yr for daily).
+        free_params = free_parameter_count(strat)
+        metrics = compute_metrics(result, freq.periods_per_year, free_parameters=free_params)
+        result_json = out / "result.json"
+        write_result_json(result, result_json, mode="paper", frequency=freq.label, metrics=metrics)
+
+        typer.echo(
+            "\n"
+            + summarize(
+                result,
+                periods_per_year=freq.periods_per_year,
+                free_parameters=free_params,
+            )
+        )
+        artifacts = [
+            f"Session log: {log_path}",
+            f"Running state: {state_path}",
+            f"Equity curve: {csv_path}",
+            f"Result JSON: {result_json}",
+        ]
+
+        if shadow is not None:
+            records = shadow.divergences
+            divergence_csv = out / "fill_divergence.csv"
+            write_divergence_csv(records, divergence_csv)
+            typer.echo("\n" + render_report(shadow.summary, records))
+            artifacts.append(f"Fill divergence: {divergence_csv}")
+
+        typer.echo(f"\nProcessed {len(session.session_log)} completed bar(s).")
+        typer.echo("\n".join(artifacts))
+        logger.info(
+            "paper session finished: %d completed bar(s) processed, artifacts written to %s",
+            len(session.session_log),
+            out,
+        )
 
 
 def _coerce_param_value(token: str) -> object:

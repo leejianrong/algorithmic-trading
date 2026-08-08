@@ -55,6 +55,14 @@ Two quirks in the invocation. `--from` and `--to` are ignored under `--live` but
 parser still demands them. `--cash` is ignored under `--broker alpaca`, because the
 portfolio reconciles from the account.
 
+The per-bar lines go to stdout as always. Since ADR-0043 there is also a timestamped
+log on **stderr** carrying the session's lifecycle — when it started and with what,
+what it primed, why it stopped — plus anything the feed guard says about a symbol
+dropping out (ADR-0035), which used to be either unformatted or invisible. If you
+want that in a file, redirect stderr; `2>session.log` will not disturb the stdout
+report you are watching. `--log-level` and `--log-format json` exist and neither is
+needed here — the defaults are what the command above gets.
+
 ## What should happen, in order
 
 **09:30.** The session starts and prints a warmup line. It primes about 512 bars of
@@ -76,9 +84,17 @@ This looks like the program quitting unexpectedly. It is not.
 
 ## What to look out for
 
-**Exit with Ctrl-C and nothing else.** ADR-0033 makes `KeyboardInterrupt` write the
-artifacts. SIGTERM is not handled (KAN-681), so killing the process from another
-terminal loses the whole run. Do not `kill` it, do not close the terminal.
+**Ctrl-C and `kill` are both safe now.** ADR-0033 makes `KeyboardInterrupt` write the
+artifacts, and since ADR-0043 SIGTERM takes the same path, so `kill <pid>` from
+another terminal — or `docker stop`, or `systemd stop` — finalizes the run instead of
+destroying it. The summary names which one stopped it. Two things that are still not
+safe: `kill -9`, which by definition cannot be caught, and **closing the terminal**,
+which sends SIGHUP and is not handled. If you need to walk away from the session,
+start it under `nohup` or `tmux`.
+
+Once it is finalizing, a second `kill` is ignored on purpose, so that writing
+`equity_curve.csv` and `result.json` cannot be interrupted half way. It takes
+milliseconds. If you truly need it gone, `kill -9`.
 
 **Check the first order's timestamp.** If anything in `fill_divergence.csv` has a
 `submitted_ts` before 09:30, the warmup fix did not take and the sample is
