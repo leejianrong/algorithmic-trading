@@ -34,7 +34,7 @@ test:  ## Fast test layer only (no network, no infra).
 test-integration:  ## Integration layer, offline (needs optional extras / broker creds; no internet).
 	uv run pytest -m "integration and not network"
 
-test-network:  ## Live provider-contract layer (hits yfinance). Nightly in CI; never gates a merge.
+test-network:  ## Live provider-contract layer (yfinance + Alpaca). Nightly in CI; never gates a merge.
 	uv run pytest -m network
 
 test-all:  ## Every layer, including integration, network and e2e.

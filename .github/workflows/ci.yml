@@ -79,16 +79,42 @@ jobs:
   # most likely exactly when the repo is busiest. Nightly + on demand.
   # DO NOT add this job to branch protection: it never runs on a PR, so requiring it
   # would deadlock every merge.
+  #
+  # Holds the live provider-contract tests for BOTH providers now (ADR-0046):
+  # yfinance (column shape) and Alpaca (adjusted-really-means-adjusted, bar shape,
+  # asset metadata). The Alpaca half needs the optional SDK *and* paper credentials
+  # from repository secrets; without them those tests skip, and the annotation step
+  # below makes that skip visible rather than a green tick over nothing.
   integration-network:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
+    env:
+      # PAPER keys only — nothing in the `network` layer places, cancels, or
+      # modifies an order. Absent secrets expand to "", which is exactly what the
+      # tests' credential gate checks for, so a fork or an unconfigured repo skips
+      # cleanly instead of failing.
+      ALPACA_API_KEY: ${{ secrets.ALPACA_API_KEY }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --frozen
-      - run: uv run pytest -m network
+      # The Alpaca SDK is an optional extra and is NOT part of `uv sync --frozen`
+      # (ADR-0018). Without it every Alpaca contract test skips on SDK grounds and
+      # the credentials would never even be consulted.
+      - run: uv sync --frozen --extra alpaca
+      - name: Report whether Alpaca credentials are available
+        run: |
+          if [ -n "$ALPACA_API_KEY" ] && [ -n "$ALPACA_SECRET_KEY" ]; then
+            echo "::notice title=Alpaca contract tests::Credentials present — the Alpaca provider-contract tests will RUN."
+          else
+            echo "::warning title=Alpaca contract tests SKIPPED::ALPACA_API_KEY / ALPACA_SECRET_KEY are not set, so the Alpaca provider-contract tests did not run. A green job here does NOT mean Alpaca's contract holds. Add the paper-key secrets (ADR-0046) to enable them."
+          fi
+      # `-rs` lists every skip with its reason in the run log, so a skipped
+      # provider check is legible instead of an invisible dot (ADR-0040: "a
+      # skipped provider check is a green tick that means nothing").
+      - run: uv run pytest -m network -rs
 
   build:
     runs-on: ubuntu-latest

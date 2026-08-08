@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import importlib.util
 import os
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 from typing import TYPE_CHECKING, Any
 
 import pytest
@@ -51,6 +51,11 @@ _needs_live = pytest.mark.skipif(
 # A liquid, fractionable mega-cap, and a ticker that cannot exist.
 _SYMBOL = "AAPL"
 _UNKNOWN = "ZZZZNOTREAL"
+# A symbol whose split Alpaca *does* back out of its adjusted series, used by
+# the ADR-0021 raw-vs-adjusted tests. TSLA split 5:1 on 2020-08-31 -- the same
+# session AAPL split 4:1, which Alpaca gets wrong (ADR-0045).
+_SPLIT_SYMBOL = "TSLA"
+_SPLIT_RATIO = 5.0
 # Tiny: a hundredth of one share, a couple of dollars of paper money.
 _TINY_QTY = 0.01
 
@@ -306,38 +311,46 @@ class TestUniverseVerification:
 
 @_needs_live
 class TestRealBars:
-    """.. warning::
+    """Bars, and the raw-vs-adjusted split (ADR-0021).
 
-    **Both split tests below were RED on 2026-08-08 and the finding is the
-    provider, not this code.** On 2026-08-04 the same call returned 499.30 raw
-    vs 121.08 adjusted -- the 4:1 split backed out, as ``Adjustment.ALL`` is
-    supposed to. On 2026-08-08 it returns 499.30 raw vs **484.31** adjusted:
-    a ratio of 1.031, i.e. dividends only. Asking for a window that *spans*
-    2020-08-31 shows the adjusted series still carrying a bare 4:1 price cliff
-    (484.24 -> 125.17), so the split is genuinely not being applied.
+    **History, because these two tests were red for a reason.** Both split tests
+    below asserted against **AAPL**, and both went red on 2026-08-08 when Alpaca
+    stopped applying AAPL's 2020-08-31 4:1 split to its adjusted series (499.30
+    raw vs 484.31 adjusted, a ratio of 1.031 = dividends only). They were left
+    failing on purpose, because weakening an assertion to match a broken provider
+    hides an honesty regression.
 
-    That is ADR-0008's phantom-split hazard arriving through ``--source
-    alpaca`` while the API still answers ``adjustment=all``, and it is the
-    ADR-0040 lesson again: a provider can regress under a green-looking
-    contract. Left failing on purpose -- weakening the assertion would hide an
-    honesty regression, and these tests skip in CI (no credentials), so they
-    gate nothing. Tracked in ADR-0041's consequences; it needs its own slice.
+    That finding now has its own slice. The defect is **one symbol's data, not
+    the provider's pipeline** — measured 2026-08-09, TSLA 5:1, NVDA 10:1, GOOGL
+    20:1, AMZN 20:1 and CMG 50:1 are all correctly adjusted, and only AAPL is
+    not — so these two tests are retargeted at TSLA, which splits 5:1 on the very
+    same 2020-08-31 date. They now test what they were always *for*: that the two
+    price notions really do diverge across a corporate action, which is the only
+    thing that makes ADR-0021 meaningful.
+
+    The provider's own state is not swept under the carpet, it is stated in two
+    louder places: ``tests/integration/test_alpaca_contract.py`` (nightly,
+    ``network``-marked) carries a **strict xfail** that turns the nightly RED the
+    day Alpaca fixes AAPL, and ``test_adjusted_aapl_is_refused_by_the_guard``
+    below asserts our own refusal (ADR-0045). Nothing here is weaker than it was;
+    the honesty moved to where it runs every night instead of only when someone
+    happens to have credentials loaded.
     """
 
     def test_raw_and_adjusted_differ_across_a_split(self) -> None:
         # ADR-0021 is only meaningful if the two price notions actually diverge.
-        # AAPL split 4:1 on 2020-08-31, so pre-split raw closes are ~4x adjusted.
+        # TSLA split 5:1 on 2020-08-31, so pre-split raw closes are ~5x adjusted.
         from trading.data.alpaca_client import RealAlpacaClient
 
         client = RealAlpacaClient()
         start, end = datetime(2020, 8, 25, tzinfo=UTC), datetime(2020, 8, 28, tzinfo=UTC)
 
-        adjusted = client.get_daily_bars(_SYMBOL, start, end, adjusted=True)
-        raw = client.get_daily_bars(_SYMBOL, start, end, adjusted=False)
+        adjusted = client.get_daily_bars(_SPLIT_SYMBOL, start, end, adjusted=True)
+        raw = client.get_daily_bars(_SPLIT_SYMBOL, start, end, adjusted=False)
 
         assert adjusted and raw
         assert [b.ts for b in adjusted] == [b.ts for b in raw]
-        assert raw[0].close > adjusted[0].close * 3.5
+        assert raw[0].close > adjusted[0].close * 4.5
 
     def test_adapter_honors_the_per_call_adjusted_flag(self) -> None:
         from trading.data.alpaca_adapter import AlpacaAdapter
@@ -345,9 +358,39 @@ class TestRealBars:
         adapter = AlpacaAdapter()
         start, end = datetime(2020, 8, 25, tzinfo=UTC), datetime(2020, 8, 28, tzinfo=UTC)
 
-        assert adapter.get_bars(_SYMBOL, start, end, adjusted=False)[0].close > (
-            adapter.get_bars(_SYMBOL, start, end, adjusted=True)[0].close * 3.5
+        assert adapter.get_bars(_SPLIT_SYMBOL, start, end, adjusted=False)[0].close > (
+            adapter.get_bars(_SPLIT_SYMBOL, start, end, adjusted=True)[0].close * 4.5
         )
+
+    def test_adjusted_aapl_is_refused_by_the_guard(self) -> None:
+        """The provider defect, asserted as *our* behaviour rather than theirs.
+
+        Stated as an if/else on the measured provider state so it is correct in
+        both worlds: while Alpaca leaves AAPL's split in, the guard must refuse
+        the window (ADR-0045); once Alpaca fixes it, the guard must fall silent.
+        Neither branch is a skip, so this can never quietly stop meaning anything.
+        """
+        from trading.data.alpaca_adapter import AlpacaAdapter, UnadjustedSplitError
+        from trading.data.alpaca_client import RealAlpacaClient
+
+        start, end = datetime(2020, 8, 25, tzinfo=UTC), datetime(2020, 9, 4, tzinfo=UTC)
+        client = RealAlpacaClient()
+        adjusted = {b.ts: b for b in client.get_daily_bars(_SYMBOL, start, end, adjusted=True)}
+        raw = {b.ts: b for b in client.get_daily_bars(_SYMBOL, start, end, adjusted=False)}
+        shared = sorted(set(adjusted) & set(raw))
+        pre = [ts for ts in shared if ts.date() < date(2020, 8, 31)][-1]
+        post = next(ts for ts in shared if ts.date() >= date(2020, 8, 31))
+        applied = (raw[pre].close / adjusted[pre].close) / (raw[post].close / adjusted[post].close)
+
+        adapter = AlpacaAdapter()
+        if abs(applied - 1.0) < 0.02:  # the split is still not backed out
+            with pytest.raises(UnadjustedSplitError) as excinfo:
+                adapter.get_bars(_SYMBOL, start, end, adjusted=True)
+            assert "2020-08-31" in str(excinfo.value)
+            assert "4:1" in str(excinfo.value)
+        else:
+            assert abs(applied - 4.0) < 0.08, f"unexpected adjustment factor {applied}"
+            assert adapter.get_bars(_SYMBOL, start, end, adjusted=True)
 
     def test_recent_sip_bars_are_refused_as_a_subscription_error(self) -> None:
         """A data-plan refusal is classified, not leaked as a raw SDK error.
