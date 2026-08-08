@@ -305,7 +305,9 @@ class TestGuardLeavesTheHappyPathAlone:
             CostConfig(commission_per_share=0.0, slippage_bps=0.0),
         )
         engine = Engine(adapter, broker, Guardrails(RiskConfig()))
-        session = PaperSession(engine, BuyAndHold(), ["AAA", "BAD"], feed, clock, lookback=10)
+        session = PaperSession(
+            engine, BuyAndHold(), ["AAA", "BAD"], feed, clock, lookback=10, warmup=False
+        )
 
         result = session.run(max_empty_polls=1)
 

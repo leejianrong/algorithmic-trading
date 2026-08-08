@@ -89,7 +89,17 @@ def _run_paper(adapter: _DualAdapter, strategy: object) -> object:
     engine = Engine(adapter, broker, Guardrails(RiskConfig.unlimited()))
     clock = FakeClock(_LATER)
     feed = RecentWindowFeed(adapter, clock)  # defaults to RAW (ADR-0021)
-    session = PaperSession(engine, strategy, [_SYM], feed, clock)  # type: ignore[arg-type]
+    # warmup=False: this is a replay of a scripted range (the --once shape), so every
+    # bar must reach the strategy. The raw-vs-adjusted question is about *which
+    # prices* the feed serves, not about which bars are live (ADR-0021/0042).
+    session = PaperSession(
+        engine,
+        strategy,  # type: ignore[arg-type]
+        [_SYM],
+        feed,
+        clock,
+        warmup=False,
+    )
     return session.run()
 
 

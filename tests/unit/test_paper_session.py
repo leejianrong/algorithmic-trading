@@ -9,6 +9,15 @@ airtight and also prove the completed-bar gate and the guardrail halt carry over
 
 Everything here uses ``FakeClock`` and ``FakeAdapter`` — no real waiting, no
 network.
+
+Every session below passes ``warmup=False``, because every session below is a
+*replay*: the feed reveals a whole scripted range at once and the point is that
+paper trades it exactly as a backtest does. That is ``trading paper --once``. A
+``--live`` session takes the opposite default (``warmup=True``), where the window
+of already-closed bars sitting in the feed at startup is history to prime rather
+than a range to trade — see ``test_paper_warmup.py`` and ADR-0042. The flag is
+spelled out here rather than left implicit so a replay can never be mistaken for a
+live session, or vice versa.
 """
 
 from __future__ import annotations
@@ -127,7 +136,7 @@ def _paper_over(
     broker = SimulatedBroker(Portfolio(cash=starting_cash), _ZERO_COST)
     engine = Engine(FakeAdapter(bars), broker, Guardrails(risk))
     feed = RecentWindowFeed(FakeAdapter(bars), clock, lambda b, now: True)
-    session = PaperSession(engine, strategy, symbols, feed, clock, lookback=1_000)
+    session = PaperSession(engine, strategy, symbols, feed, clock, lookback=1_000, warmup=False)
     result = session.run(max_empty_polls=1, **run_kwargs)
     return result, session
 
@@ -200,7 +209,9 @@ class TestCompletedBarsOnly:
         engine = Engine(FakeAdapter(bars), broker, Guardrails(RiskConfig.unlimited()))
         clock = ImmediateClock(start=_ts(5, hour=15))
         feed = RecentWindowFeed(FakeAdapter(bars), clock)  # default completeness policy
-        session = PaperSession(engine, _ScriptedWeights("AAA", [0.1]), ["AAA"], feed, clock)
+        session = PaperSession(
+            engine, _ScriptedWeights("AAA", [0.1]), ["AAA"], feed, clock, warmup=False
+        )
 
         result = session.run(max_empty_polls=1)
 
@@ -216,7 +227,9 @@ class TestCompletedBarsOnly:
         engine = Engine(FakeAdapter(bars), broker, Guardrails(RiskConfig.unlimited()))
         clock = FakeClock(_ts(6))  # a day past the last bar → all complete
         feed = RecentWindowFeed(FakeAdapter(bars), clock)
-        session = PaperSession(engine, _ScriptedWeights("AAA", [0.1]), ["AAA"], feed, clock)
+        session = PaperSession(
+            engine, _ScriptedWeights("AAA", [0.1]), ["AAA"], feed, clock, warmup=False
+        )
 
         session.run(max_empty_polls=1)
 
@@ -232,7 +245,9 @@ class TestIdempotentReprocessing:
         engine = Engine(FakeAdapter(bars), broker, Guardrails(RiskConfig.unlimited()))
         clock = FakeClock(_ts(10))
         feed = RecentWindowFeed(FakeAdapter(bars), clock)
-        session = PaperSession(engine, _ScriptedWeights("AAA", [0.1]), ["AAA"], feed, clock)
+        session = PaperSession(
+            engine, _ScriptedWeights("AAA", [0.1]), ["AAA"], feed, clock, warmup=False
+        )
 
         session.run(max_empty_polls=3)  # several extra polls, all re-seeing the bars
 
@@ -280,6 +295,7 @@ class TestSleepAndPolling:
             feed,
             clock,
             poll_interval=timedelta(days=1),
+            warmup=False,
         )
 
         session.run(max_empty_polls=2)
@@ -293,7 +309,9 @@ class TestSleepAndPolling:
         engine = Engine(FakeAdapter(bars), broker, Guardrails(RiskConfig.unlimited()))
         clock = FakeClock(_ts(20))
         feed = RecentWindowFeed(FakeAdapter(bars), clock)
-        session = PaperSession(engine, _ScriptedWeights("AAA", [0.1]), ["AAA"], feed, clock)
+        session = PaperSession(
+            engine, _ScriptedWeights("AAA", [0.1]), ["AAA"], feed, clock, warmup=False
+        )
 
         session.run(max_new_bars=3)
 
@@ -317,6 +335,7 @@ def _session_with_clock(
         clock,
         poll_interval=poll_interval,
         frequency=frequency,
+        warmup=False,
     )
 
 
@@ -388,6 +407,7 @@ class TestIntradayParity:
             clock,
             frequency=Frequency.parse("1h"),
             lookback=1_000,
+            warmup=False,
         )
         paper = session.run(max_empty_polls=1)
 

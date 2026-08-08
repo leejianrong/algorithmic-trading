@@ -780,6 +780,13 @@ def paper(
         "where the fills diverge — price, slippage bps, latency, rejections "
         "(ADR-0038). Off by default; enabling it never touches the live path.",
     ),
+    lookback: int | None = typer.Option(
+        None,
+        "--lookback",
+        help="How many recent completed bars each poll requests, and therefore how "
+        f"much history a --live session warms up on (default {DEFAULT_PAPER_LOOKBACK}). "
+        "Under --once this is a floor: the replay always covers the whole range.",
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/paper"), "--out", help="Result directory."),
 ) -> None:
@@ -832,7 +839,7 @@ def paper(
     # Sub-daily bars need the interval-aware completeness policy (ADR-0022); daily
     # keeps the default policy so the daily path stays byte-identical to V5.
     is_complete = interval_is_complete(freq.delta) if freq.is_intraday else default_is_complete
-    lookback = DEFAULT_PAPER_LOOKBACK
+    window = DEFAULT_PAPER_LOOKBACK if lookback is None else lookback
     run_kwargs: dict[str, int] = {}
     if live:
         clock: WallClock | FakeClock = WallClock()
@@ -841,7 +848,7 @@ def paper(
         series = {s: adapter.get_bars(s, start, end) for s in tickers}
         all_bars = [bar for bars in series.values() for bar in bars]
         total = len({bar.ts for bar in all_bars})
-        lookback = max(DEFAULT_PAPER_LOOKBACK, total + 1)
+        window = max(window, total + 1)
         clock = FakeClock(end + timedelta(days=1))
         feed = RecentWindowFeed(FakeAdapter(all_bars), clock, is_complete)
         run_kwargs = {"max_empty_polls": 1}
@@ -863,7 +870,23 @@ def paper(
         tracked_broker = shadow
     engine = Engine(adapter, tracked_broker, Guardrails(risk))
 
-    session = PaperSession(engine, strat, tickers, feed, clock, lookback=lookback, frequency=freq)
+    # Warmup is what separates the two modes' *first* poll (ADR-0042). A --live
+    # session opens onto a window of bars that closed before it started: those are
+    # history to prime, not a range to trade, or the session fires hundreds of
+    # orders priced off stale opens and poisons the fill-divergence sample it
+    # exists to collect (ADR-0038). A --once replay is the opposite by definition —
+    # replaying [from, to] and trading it *is* the mode — so it opts out, which is
+    # what keeps --once byte-identical to every run before this flag existed.
+    session = PaperSession(
+        engine,
+        strat,
+        tickers,
+        feed,
+        clock,
+        lookback=window,
+        frequency=freq,
+        warmup=live,
+    )
 
     out.mkdir(parents=True, exist_ok=True)
     log_path = out / "paper_session.log"
@@ -872,8 +895,39 @@ def paper(
     typer.echo(f"Paper session ({mode}) — strategy={strategy} symbols={','.join(tickers)}\n")
 
     with log_path.open("w") as log_fh:
+        announced = False
+
+        def announce_warmup() -> None:
+            """Say what was primed, exactly once, before the first live bar prints.
+
+            A silent warmup is indistinguishable from a session that quietly did
+            nothing, and the count is the operator's check that the strategy has its
+            lookback before it trades. Emitted from the first bar report so it lands
+            in chronological order, and again on the interrupt path so a session that
+            never reaches a live bar still says what it saw.
+            """
+            nonlocal announced
+            if announced or not live:
+                return
+            announced = True
+            span = session.warmup_span
+            if span is None:
+                line = (
+                    "Warmup: no completed bars were available, so the strategy starts "
+                    "with empty history and stays flat until its lookback fills."
+                )
+            else:
+                line = (
+                    f"Warmup: primed {session.warmup_bars} completed bar(s) "
+                    f"{span[0]:%Y-%m-%d %H:%M}..{span[1]:%Y-%m-%d %H:%M} as history; "
+                    "no orders submitted for them (ADR-0042)."
+                )
+            typer.echo(line + "\n")
+            log_fh.write(line + "\n")
+            log_fh.flush()
 
         def reporter(outcome: BarOutcome) -> None:
+            announce_warmup()
             line = _format_bar(outcome)
             typer.echo(line)
             log_fh.write(line + "\n")
@@ -882,7 +936,9 @@ def paper(
 
         try:
             result = session.run(reporter=reporter, **run_kwargs)
+            announce_warmup()
         except KeyboardInterrupt:
+            announce_warmup()
             # A --live session has no natural exit: Ctrl-C *is* how it ends. Letting
             # the interrupt propagate skipped everything below, so the equity CSV,
             # result.json, and the summary were unreachable in live mode even though
