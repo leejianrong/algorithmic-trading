@@ -256,6 +256,36 @@ As of this writing:
   `canceled`, not yet watched), and **duplicate order stacking** — while orders sit
   parked the portfolio stays flat, so a target-weight strategy re-emits the same order
   every bar and the broker submits it again; needs its own slice (ADR-0036).
+- **Fill divergence — is the modelled 5 bps real? (offline-verified, ADR-0038):**
+  `divergence.py` answers the one question no backtest can. `ShadowBroker` is a
+  **`Broker` decorator** (no engine change, no `if paper:` — ADR-0002 intact) that
+  forwards `portfolio`/`submit`/`on_bar`/`rejections` to the live broker verbatim and
+  replays the same orders through a throwaway `SimulatedBroker` seeded from a *copy*
+  of the pre-bar live book. The counterfactual is deliberate: the reference price is
+  the **next bar's open** — exactly what `SimulatedBroker` fills at — so both the
+  realized and the modelled fill divide by the *same* reference and `realized −
+  modelled` is a statement about the cost model, not about which bar was picked. The
+  reference is captured once and never re-anchored if the venue settles bars later.
+  Price notion follows the feed and is printed (`--live` is RAW per ADR-0021; the
+  `--once` replay materializes adjusted bars and says so) — a raw fill measured
+  against an adjusted open is meaningless arithmetic that still prints a number.
+  Latency is *observation* latency off the injected `Clock` (never `time.time()`), an
+  upper bound because a polling broker only notices a fill when it polls. Nothing is
+  dropped: a venue rejection vs a modelled fill, a modelled funding rejection vs a
+  venue fill, a partial fill (ADR-0033) as one `partial` row, and an order still
+  parked at the venue (ADR-0036) as `pending` are all rows. **The shadow cannot
+  perturb the live path, structurally:** the live call runs first and unguarded, all
+  shadow work is inside `try/except Exception` that disables the shadow and records
+  the failure, and the counterfactual holds a copy with no client. Proved by running
+  the same strategy through a plain broker and through a `ShadowBroker` whose shadow
+  raises on every call and asserting the two `BacktestResult`s are **equal**; the null
+  test (simulated vs its own model → exactly zero divergence) calibrates the
+  reference price. CLI `trading paper --divergence` writes `fill_divergence.csv` and
+  prints the block; **off by default**, with a CLI test asserting `equity_curve.csv`
+  and `result.json` are byte-identical with and without the flag. Below
+  `MIN_PAIRED_FILLS = 30` the verdict says the model is "neither confirmed nor
+  refuted" (ADR-0029's spirit). Wanted next: a `divergence` block in `result.json` +
+  a dashboard panel (additive; `divergence_rows` already emits the flat shape).
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -264,8 +294,9 @@ As of this writing:
   **survivorship-bias-free point-in-time universe** (ADR-0027 records the gap; the
   `--source csv` path is the hook), **per-bar rolling liquidity** (the ADV screen is
   point-in-time, judged once before the run), **parameter-stability / heatmap output**
-  from a sweep, **regime-split metrics**, and a **paper-vs-simulated fill divergence
-  report** (the thing paper trading is actually for).
+  from a sweep, and **regime-split metrics**. The **paper-vs-simulated fill
+  divergence report** is built (ADR-0038) but has only ~one live paired fill behind
+  it — the mechanism is done, the *evidence* about 5 bps is not.
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -345,6 +376,7 @@ src/trading/
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020)
   report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023);
                            #   absent-symbol caveat lines + additive `absent` key (ADR-0032)
+  divergence.py            # ShadowBroker: live-vs-modelled fill comparison + report (ADR-0038)
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
                            #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed);
                            #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032)
