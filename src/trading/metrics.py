@@ -1129,6 +1129,24 @@ def deflated_sharpe(
     )
 
 
+def trial_count_note(trials: int) -> str:
+    """The caveat that must accompany every deflated Sharpe (ADR-0039 §4).
+
+    Public and shared rather than inlined where it is first needed, because
+    :func:`assess_significance` is not the only caller: ``trading sweep`` deflates
+    its winner straight off :meth:`~trading.sweep.SweepSummary.deflated_winner`
+    (it kept the trials' moments, not their curves, so there is nothing to
+    bootstrap) and must print the *same* sentence. ADR-0039 calls the caveat "not
+    optional and not conditional", and two copies of a sentence like that drift.
+    """
+    return (
+        f"the deflation counts {trials} trial(s) — only those visible in this "
+        "invocation. Runs made in earlier invocations, over other date ranges, or on "
+        "other strategies are invisible to this tool, so the correction is a LOWER "
+        "BOUND on the multiple-comparison problem, never a complete accounting"
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class SignificanceReport:
     """Everything ADR-0039 can say about whether a run's Sharpe means anything.
@@ -1226,12 +1244,7 @@ def assess_significance(
             else list(trial_sharpes)
         )
         deflated = deflated_sharpe(moments, sharpes, periods_per_year)
-        notes.append(
-            f"the deflation counts {len(sharpes)} trial(s) — only those visible in this "
-            "invocation. Runs made in earlier invocations, over other date ranges, or on "
-            "other strategies are invisible to this tool, so the correction is a LOWER "
-            "BOUND on the multiple-comparison problem, never a complete accounting"
-        )
+        notes.append(trial_count_note(len(sharpes)))
     return SignificanceReport(
         sharpe_interval=interval,
         paired=paired,

@@ -178,6 +178,93 @@ def test_sweep_reports_skipped_invalid_combos(tmp_path: Path) -> None:
     assert "skipped" in result.output.lower()
 
 
+class TestWinnerDeflation:
+    """A sweep's headline is the maximum of N draws, and must say so (ADR-0039).
+
+    Run 24 combinations over one data set and the best scores well above zero even
+    if not one has an edge, purely because you kept the maximum. This block is not
+    behind a flag: the sweep already ran every trial and kept each one's
+    ``ReturnMoments``, so the deflation is arithmetic on numbers already in hand —
+    no bootstrap, no cost, nothing to opt into.
+    """
+
+    def _sweep(self, tmp_path: Path, *extra: str) -> Result:
+        return runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "sma_crossover",
+                "--param",
+                "fast=5,10",
+                "--param",
+                "slow=20,40",
+                "--source",
+                "synthetic",
+                "--seed",
+                "5",
+                "--out",
+                str(tmp_path / "sweep.csv"),
+                *extra,
+                *_COMMON,
+            ],
+        )
+
+    def test_the_table_is_followed_by_the_trial_count_and_the_null(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path)
+        assert result.exit_code == 0, result.output
+        # 2 x 2 combinations all ran, so the winner beat exactly four trials.
+        assert "combos=4" in result.output
+        assert "Trials:        4 scored" in result.output
+        assert "the luckiest skill-free one would show Sharpe" in result.output
+        assert "Deflated:      P(true Sharpe > that null best)" in result.output
+
+    def test_the_deflation_sits_under_the_table_not_over_it(self, tmp_path: Path) -> None:
+        """The ranking is the answer; the deflation is the caveat on it."""
+        result = self._sweep(tmp_path)
+        assert result.output.index("rank  fast") < result.output.index("Trials:")
+
+    def test_the_invisible_trials_caveat_is_printed_here_too(self, tmp_path: Path) -> None:
+        """ADR-0039 calls the sentence "not optional and not conditional"."""
+        result = self._sweep(tmp_path)
+        assert "LOWER BOUND" in result.output
+        assert "counts 4 trial(s)" in result.output
+
+    def test_the_deflation_does_not_touch_the_results_csv(self, tmp_path: Path) -> None:
+        """It is a statement *about* the ranking, not another ranked column."""
+        out = tmp_path / "sweep.csv"
+        assert self._sweep(tmp_path).exit_code == 0
+        lines = out.read_text().splitlines()
+        assert lines[0].startswith("rank,fast,slow,window")
+        assert len(lines) == 1 + 4
+        assert "Trials" not in out.read_text()
+
+    def test_a_sweep_that_produced_no_runs_deflates_nothing(self, tmp_path: Path) -> None:
+        """No trials means no winner; an absent block, never a fabricated one."""
+        result = runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "sma_crossover",
+                "--param",
+                "fast=40",  # 40 >= slow(30): the only combo is rejected
+                "--param",
+                "slow=30",
+                "--source",
+                "synthetic",
+                "--seed",
+                "5",
+                "--out",
+                str(tmp_path / "sweep.csv"),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "No runs produced" in result.output
+        assert "Trials:" not in result.output
+
+
 class TestWalkForwardCli:
     """`--folds` runs TRUE out-of-sample validation (ADR-0026)."""
 
