@@ -11,11 +11,12 @@ from __future__ import annotations
 
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Any
 
 from trading.dashboard.payload import build_payload
 from trading.dashboard.static_export import render_html, write_html
 from trading.engine import BacktestResult, EquityPoint, HaltEpisode
-from trading.metrics import PerformanceMetrics
+from trading.metrics import PerformanceMetrics, compute
 from trading.report import RESULT_SCHEMA_VERSION, result_to_dict
 from trading.types import Fill, Order, Portfolio, Side
 
@@ -168,3 +169,99 @@ def test_write_html_writes_self_contained_file(tmp_path: Path) -> None:
     text = out.read_text(encoding="utf-8")
     assert "<svg" in text
     assert "http://" not in text and "https://" not in text
+
+
+# --- Benchmark-relative panel (ADR-0037) -------------------------------------
+
+
+def _benchmark_doc(
+    strategy: list[float],
+    bench: list[float] | None,
+    *,
+    exposure: float = 0.5,
+) -> dict[str, Any]:
+    """A result document over two hand-built curves, on shared daily timestamps."""
+    curve = [EquityPoint(_ts(i + 1), e, exposure) for i, e in enumerate(strategy)]
+    result = BacktestResult(
+        symbols=["AAA"],
+        starting_cash=strategy[0],
+        equity_curve=curve,
+        final_portfolio=Portfolio(cash=strategy[-1]),
+        fills=[],
+    )
+    bench_curve = (
+        [EquityPoint(_ts(i + 1), e, 1.0) for i, e in enumerate(bench)]
+        if bench is not None
+        else None
+    )
+    return result_to_dict(
+        result,
+        mode="backtest",
+        frequency="1d",
+        metrics=compute(result),
+        benchmark_curve=bench_curve,
+    )
+
+
+_STRATEGY_CURVE = [100.0, 104.0, 101.0, 107.0]
+_BENCHMARK_CURVE = [50.0, 51.0, 50.0, 52.0]
+
+
+def test_benchmark_panel_renders_the_relative_statistics() -> None:
+    doc = _benchmark_doc(_STRATEGY_CURVE, _BENCHMARK_CURVE)
+    html = render_html(build_payload(doc))
+    assert "Benchmark-relative" in html
+    for label in ("Beta", "Alpha (annualized)", "Correlation", "Information ratio", "Shared bars"):
+        assert label in html
+    block = doc["benchmark_metrics"]
+    assert block["beta"] is not None
+    assert f"{block['beta']:.2f}" in html
+
+
+def test_benchmark_panel_says_so_plainly_when_no_benchmark_ran() -> None:
+    # The key is present and null: this run had no benchmark, and the page says
+    # that rather than leaving the reader to wonder whether it was just omitted.
+    html = render_html(build_payload(_benchmark_doc(_STRATEGY_CURVE, None)))
+    assert "Benchmark-relative" in html
+    assert "No benchmark ran for this result" in html
+    assert "--benchmark SYMBOL" in html
+
+
+def test_benchmark_panel_is_absent_for_a_pre_adr_0037_document() -> None:
+    # An older result.json has no `benchmark_metrics` key at all; invent nothing.
+    doc = _benchmark_doc(_STRATEGY_CURVE, None)
+    del doc["benchmark_metrics"]
+    assert "Benchmark-relative" not in render_html(build_payload(doc))
+
+
+def test_undefined_statistics_render_n_a_not_zero() -> None:
+    # A flat benchmark leaves beta/alpha/correlation undefined. "0.00" would read
+    # as a measured zero, which is a different claim entirely.
+    doc = _benchmark_doc(_STRATEGY_CURVE, [50.0, 50.0, 50.0, 50.0])
+    block = doc["benchmark_metrics"]
+    assert block["beta"] is None
+    html = render_html(build_payload(doc))
+    assert "n/a" in html
+
+
+def test_the_nested_benchmark_block_never_leaks_into_the_flat_tile_grid() -> None:
+    html = render_html(build_payload(_benchmark_doc(_STRATEGY_CURVE, _BENCHMARK_CURVE)))
+    # A raw dict repr in a tile would be the failure mode of appending an unknown
+    # structured key to the flat metric grid.
+    assert "shared_bars" not in html.split('<script type="application/json"')[0]
+    assert "{&#x27;" not in html
+
+
+def test_return_per_unit_exposure_is_shown_as_a_percentage() -> None:
+    doc = _benchmark_doc([100.0, 110.0], _BENCHMARK_CURVE[:2], exposure=0.5)
+    html = render_html(build_payload(doc))
+    assert "Return / exposure" in html
+    value = doc["metrics"]["return_per_unit_exposure"]
+    assert value is not None
+    assert f"{value * 100:+.2f}%" in html
+
+
+def test_benchmark_panel_keeps_the_page_self_contained() -> None:
+    html = render_html(build_payload(_benchmark_doc(_STRATEGY_CURVE, _BENCHMARK_CURVE)))
+    assert "http://" not in html
+    assert "https://" not in html

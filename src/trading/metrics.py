@@ -12,6 +12,15 @@ Nothing here reads a future bar or reaches into engine internals; callers pass a
 ``Sequence[EquityPoint]`` (or a whole :class:`BacktestResult` to :func:`compute`)
 and a fill blotter. The exposure helpers take a plain per-bar ``list[float]`` so
 they're ready for the later exposure-wiring step without a change here.
+
+Benchmark-relative figures (ADR-0037) — beta, alpha, correlation, and the
+information ratio — live here too, alongside return-per-unit-of-exposure. They
+follow the same conventions as everything above: a zero risk-free rate (Q17),
+sample (``n - 1``) moments, and ``periods_per_year`` as the single annualization
+knob (ADR-0022). Every one of them is ``float | None``, never a stand-in ``0.0``:
+a beta of zero and "there was no benchmark" must never be confusable, so no
+:class:`BenchmarkComparison` exists at all when no benchmark ran, and an
+individual statistic inside one is ``None`` when it is mathematically undefined.
 """
 
 from __future__ import annotations
@@ -25,6 +34,8 @@ from typing import TYPE_CHECKING
 from trading.types import SHARE_EPS, Side
 
 if TYPE_CHECKING:
+    from datetime import datetime
+
     from trading.engine import BacktestResult, EquityPoint
     from trading.types import Fill
 
@@ -276,6 +287,258 @@ def trades_per_parameter(
     return entry_count(fills) / free_parameters
 
 
+# --- Exposure-adjusted and benchmark-relative figures (ADR-0037) -------------
+
+
+def return_per_unit_exposure(
+    curve: Sequence[EquityPoint],
+    periods_per_year: float = 252.0,
+) -> float | None:
+    """Annualized return divided by average gross exposure — ``None`` if never invested.
+
+    The comparability fix. A strategy that averages 17% invested and one that
+    averages 90% invested are not comparable on raw return: the first is mostly a
+    pile of cash, and cash earns nothing here (there is no interest-on-cash model).
+    Dividing the annualized return by :func:`avg_exposure` restates it as the
+    return earned *per dollar actually at risk*, which is the number that ranks
+    two such strategies on the same axis.
+
+    Returns ``None`` — not ``0.0`` — when average exposure is zero or negative
+    (a book that was never invested), because the ratio is undefined rather than
+    bad. See ADR-0037 for the linearity caveat: this is a comparability lens, not
+    a promise that levering the strategy to full investment would earn it.
+    """
+    average = avg_exposure([point.exposure for point in curve])
+    if average <= 0.0:
+        return None
+    return annualized_return(curve, periods_per_year) / average
+
+
+def align_curves(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint],
+) -> list[tuple[datetime, float, float]]:
+    """The two equity series restricted to the timestamps they actually share.
+
+    Returns ``(ts, strategy_equity, benchmark_equity)`` triples in timestamp order,
+    one per shared timestamp. This is the whole correctness story for every
+    benchmark-relative figure below: positionally zipping two curves of different
+    length — or with different gaps — would pair bar *i* of one against an
+    unrelated bar *i* of the other and fabricate a correlation out of the offset.
+    Curves are keyed by timestamp and intersected instead, so a benchmark that
+    starts late, ends early, or is missing a day contributes only where it really
+    lines up.
+
+    Duplicate timestamps within a curve collapse to the last occurrence; engine
+    curves have one point per bar, so this is a defensive nicety, not a case that
+    arises.
+    """
+    own_by_ts = {point.ts: point.equity for point in curve}
+    bench_by_ts = {point.ts: point.equity for point in benchmark}
+    shared = sorted(own_by_ts.keys() & bench_by_ts.keys())
+    return [(ts, own_by_ts[ts], bench_by_ts[ts]) for ts in shared]
+
+
+def _step_returns(values: Sequence[float]) -> list[float]:
+    """Simple step-to-step returns of a bare equity series (see :func:`daily_returns`)."""
+    return [0.0 if prev <= 0 else curr / prev - 1.0 for prev, curr in pairwise(values)]
+
+
+def aligned_returns(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint],
+) -> tuple[list[float], list[float]]:
+    """Paired per-step returns over the shared timestamps of the two curves.
+
+    Both lists have the same length by construction. Returns are taken *after*
+    alignment, between consecutive shared timestamps, so both sides always measure
+    the same calendar span. Where the benchmark has a gap, the step that bridges it
+    is longer than one bar on both sides — an honest pairing of the same interval,
+    at the cost of a slightly uneven sampling grid (ADR-0037).
+    """
+    rows = align_curves(curve, benchmark)
+    return _step_returns([row[1] for row in rows]), _step_returns([row[2] for row in rows])
+
+
+def _mean(values: Sequence[float]) -> float:
+    return sum(values) / len(values)
+
+
+def _sample_variance(values: Sequence[float], mean: float) -> float:
+    return sum((v - mean) ** 2 for v in values) / (len(values) - 1)
+
+
+def _sample_covariance(
+    xs: Sequence[float], ys: Sequence[float], mean_x: float, mean_y: float
+) -> float:
+    products = ((x - mean_x) * (y - mean_y) for x, y in zip(xs, ys, strict=True))
+    return sum(products) / (len(xs) - 1)
+
+
+def _beta_of(strategy: Sequence[float], bench: Sequence[float]) -> float | None:
+    if len(strategy) < 2:
+        return None
+    mean_b = _mean(bench)
+    var_b = _sample_variance(bench, mean_b)
+    if var_b == 0.0:
+        return None
+    return _sample_covariance(strategy, bench, _mean(strategy), mean_b) / var_b
+
+
+def _correlation_of(strategy: Sequence[float], bench: Sequence[float]) -> float | None:
+    if len(strategy) < 2:
+        return None
+    mean_s, mean_b = _mean(strategy), _mean(bench)
+    sd_s = sqrt(_sample_variance(strategy, mean_s))
+    sd_b = sqrt(_sample_variance(bench, mean_b))
+    if sd_s == 0.0 or sd_b == 0.0:
+        return None
+    return _sample_covariance(strategy, bench, mean_s, mean_b) / (sd_s * sd_b)
+
+
+def _alpha_of(
+    strategy: Sequence[float],
+    bench: Sequence[float],
+    periods_per_year: float,
+    rf: float,
+) -> float | None:
+    slope = _beta_of(strategy, bench)
+    if slope is None:
+        return None
+    per_period = (_mean(strategy) - rf) - slope * (_mean(bench) - rf)
+    return per_period * periods_per_year
+
+
+def _information_ratio_of(
+    strategy: Sequence[float],
+    bench: Sequence[float],
+    periods_per_year: float,
+) -> float | None:
+    if len(strategy) < 2:
+        return None
+    active = [s - b for s, b in zip(strategy, bench, strict=True)]
+    mean_active = _mean(active)
+    tracking_error = sqrt(_sample_variance(active, mean_active))
+    if tracking_error == 0.0:
+        return None
+    return mean_active / tracking_error * sqrt(periods_per_year)
+
+
+def beta(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint],
+) -> float | None:
+    """Sensitivity of the strategy's returns to the benchmark's.
+
+    ``cov(r_s, r_b) / var(r_b)`` over the aligned returns, on the sample
+    (``n - 1``) basis :func:`sharpe` and :func:`sortino` already use. ``None``
+    when there are fewer than two aligned return periods, or when the benchmark
+    has zero variance (a flat benchmark makes the slope undefined, not zero).
+    """
+    strategy, bench = aligned_returns(curve, benchmark)
+    return _beta_of(strategy, bench)
+
+
+def correlation(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint],
+) -> float | None:
+    """Pearson correlation of the aligned per-bar returns, or ``None`` if undefined.
+
+    ``None`` when there are fewer than two aligned return periods or either side
+    has zero variance.
+    """
+    strategy, bench = aligned_returns(curve, benchmark)
+    return _correlation_of(strategy, bench)
+
+
+def alpha(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint],
+    periods_per_year: float = 252.0,
+    rf: float = 0.0,
+) -> float | None:
+    """Annualized Jensen's alpha: return not explained by benchmark exposure.
+
+    Per-period ``mean(r_s - rf) - beta * mean(r_b - rf)``, scaled to a year by
+    *multiplying* by ``periods_per_year``. That arithmetic scaling — rather than
+    the geometric compounding :func:`annualized_return` uses — is the standard
+    CAPM convention and the only one consistent with alpha being a mean-excess
+    quantity; ADR-0037 records the choice. ``rf`` is zero by default, matching the
+    Sharpe basis fixed by Q17. ``None`` whenever :func:`beta` is ``None``.
+    """
+    strategy, bench = aligned_returns(curve, benchmark)
+    return _alpha_of(strategy, bench, periods_per_year, rf)
+
+
+def information_ratio(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint],
+    periods_per_year: float = 252.0,
+) -> float | None:
+    """Annualized active return over its tracking error.
+
+    Mean of the active return ``r_s - r_b`` divided by that series' sample
+    standard deviation (the tracking error), scaled by ``√periods_per_year`` —
+    exactly :func:`sharpe`'s shape, with the benchmark in place of the risk-free
+    rate. ``None`` with fewer than two aligned return periods, or when the
+    tracking error is zero (a strategy that *is* the benchmark has no active
+    return to reward).
+    """
+    strategy, bench = aligned_returns(curve, benchmark)
+    return _information_ratio_of(strategy, bench, periods_per_year)
+
+
+@dataclass(frozen=True, slots=True)
+class BenchmarkComparison:
+    """How a run related to its benchmark, on the bars the two actually shared.
+
+    A relation between two runs, deliberately *not* a field of
+    :class:`PerformanceMetrics`: it belongs beside the benchmark curve, not inside
+    the strategy's own numbers. The object exists only when a benchmark ran, so a
+    ``None`` where one of these is expected is the unambiguous "no benchmark"
+    signal — never a zeroed-out comparison. Inside it, each statistic is
+    independently ``None`` when it is mathematically undefined (too few shared
+    bars, a zero-variance series), which is a *different* fact and reads
+    differently in the report.
+
+    ``shared_bars`` is the number of timestamps the two curves had in common. A
+    caller that compares it against the strategy's own bar count can tell a full
+    overlap from a partial one; the report prints that caveat.
+    """
+
+    shared_bars: int
+    beta: float | None
+    alpha: float | None
+    correlation: float | None
+    information_ratio: float | None
+
+
+def compare_to_benchmark(
+    curve: Sequence[EquityPoint],
+    benchmark: Sequence[EquityPoint],
+    periods_per_year: float = 252.0,
+    rf: float = 0.0,
+) -> BenchmarkComparison:
+    """Assemble the whole benchmark-relative block, aligning the curves once.
+
+    Equivalent to calling :func:`beta`, :func:`alpha`, :func:`correlation`, and
+    :func:`information_ratio` individually, but it intersects the timestamps a
+    single time. Always returns an object: the *caller* decides whether a
+    benchmark existed at all.
+    """
+    rows = align_curves(curve, benchmark)
+    strategy = _step_returns([row[1] for row in rows])
+    bench = _step_returns([row[2] for row in rows])
+    return BenchmarkComparison(
+        shared_bars=len(rows),
+        beta=_beta_of(strategy, bench),
+        alpha=_alpha_of(strategy, bench, periods_per_year, rf),
+        correlation=_correlation_of(strategy, bench),
+        information_ratio=_information_ratio_of(strategy, bench, periods_per_year),
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class PerformanceMetrics:
     """Headline performance figures for a run.
@@ -300,6 +563,14 @@ class PerformanceMetrics:
     # Both default so existing positional/keyword construction stays valid.
     trade_count: int = 0
     trades_per_parameter: float | None = None
+    # The exposure-adjusted return (ADR-0037), defaulted so existing
+    # positional/keyword construction stays valid. It needs no benchmark — it is
+    # the comparability lens between a lightly-invested strategy and a
+    # fully-invested one — and is ``None`` only when the book was never invested.
+    # The *benchmark-relative* figures deliberately do not live here: they
+    # describe a relation between two runs, not a property of this one
+    # (:class:`BenchmarkComparison`).
+    return_per_unit_exposure: float | None = None
 
     @property
     def underpowered(self) -> bool:
@@ -325,6 +596,10 @@ def compute(
     (see :func:`trading.strategies.free_parameter_count`). Supplying it turns on
     the trades-per-parameter significance figure; omitting it leaves that figure
     ``None`` and changes nothing else, so every existing caller is unaffected.
+
+    Benchmark-relative figures are *not* computed here — they need a second run,
+    so :func:`compare_to_benchmark` takes both curves and returns its own value
+    object (ADR-0037).
     """
     curve = result.equity_curve
     exposures = [point.exposure for point in curve]
@@ -341,4 +616,5 @@ def compute(
         peak_exposure=peak_exposure(exposures),
         trade_count=entry_count(result.fills),
         trades_per_parameter=trades_per_parameter(result.fills, free_parameters),
+        return_per_unit_exposure=return_per_unit_exposure(curve, periods_per_year),
     )

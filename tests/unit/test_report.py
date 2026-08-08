@@ -8,9 +8,11 @@ re-derivations of the code under test. No engine, no network.
 from __future__ import annotations
 
 import builtins
+import json
+from dataclasses import asdict
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -22,12 +24,14 @@ from trading.engine import (
     EquityPoint,
     HaltEpisode,
 )
+from trading.metrics import compare_to_benchmark, compute
 from trading.report import (
     RESULT_SCHEMA_VERSION,
     result_to_dict,
     summarize,
     write_equity_csv,
     write_equity_png,
+    write_result_json,
 )
 from trading.types import Fill, Portfolio, Side
 
@@ -332,3 +336,265 @@ class TestSignificanceLines:
         text = summarize(_result([100.0, 110.0]))
         for label in ("Total return:", "Sharpe:", "Max drawdown:", "Turnover:", "Bars:"):
             assert label in text
+
+
+# --- Benchmark-relative metrics (ADR-0037) -----------------------------------
+
+
+def _bench_curve(
+    days: list[int], equities: list[float], exposure: float = 1.0
+) -> list[EquityPoint]:
+    """A benchmark equity curve on explicit day numbers (for misalignment cases)."""
+    return [EquityPoint(_ts(d), e, exposure) for d, e in zip(days, equities, strict=True)]
+
+
+class TestSummaryUnchangedWithoutBenchmark:
+    """The regression that matters most: no benchmark → byte-identical summary.
+
+    A literal golden, not a set of substring probes. Every benchmark-relative line
+    ADR-0037 adds is gated on a benchmark actually having been run, so a run
+    without one must render exactly the text it rendered before the feature
+    existed — including the ADR-0029 significance block.
+    """
+
+    GOLDEN = (
+        "Symbols:       AAA\n"
+        "Starting cash: $1,000.00\n"
+        "Final equity:  $1,080.00\n"
+        "Total return:  +8.00%\n"
+        "Annualized:    +12655.47%\n"
+        "Sharpe:        8.50\n"
+        "Sortino:       18.64\n"
+        "Calmar:        4302.86\n"
+        "Max drawdown:  2.94%\n"
+        "Avg exposure:  42.00%\n"
+        "Peak exposure: 60.00%\n"
+        "Win rate:      100.00%\n"
+        "Turnover:      5147.86%\n"
+        "Trades:        1 entry/entries\n"
+        "Bars:          5\n"
+        "Trades/param:  0.5 (1 entries / 2 free parameter(s))\n"
+        "  ⚠ under 30 trades per free parameter — too small a sample to distinguish "
+        "edge from noise; widen the universe or the date range before trusting these numbers"
+    )
+
+    @staticmethod
+    def _run() -> BacktestResult:
+        fills = [
+            (_ts(2), Fill("AAA", Side.BUY, 5.0, 100.0, 0.5)),
+            (_ts(4), Fill("AAA", Side.SELL, 5.0, 110.0, 0.5)),
+        ]
+        return _result(
+            [1000.0, 1020.0, 990.0, 1050.0, 1080.0],
+            exposures=[0.0, 0.5, 0.45, 0.6, 0.55],
+            fills=fills,
+        )
+
+    def test_summary_is_byte_identical_to_the_pre_adr_0037_text(self) -> None:
+        assert summarize(self._run(), free_parameters=2) == self.GOLDEN
+
+    def test_no_benchmark_relative_label_leaks_in(self) -> None:
+        summary = summarize(self._run())
+        for label in ("Beta:", "Alpha", "Correlation:", "Info ratio:", "Ret/exposure:"):
+            assert label not in summary
+
+
+class TestBenchmarkRelativeSummary:
+    """The block that only appears when a benchmark ran."""
+
+    @staticmethod
+    def _pair() -> tuple[BacktestResult, BacktestResult]:
+        strat = _result([100.0, 104.0, 101.0, 107.0, 106.0], exposures=[0.5] * 5)
+        bench = _result([50.0, 51.0, 50.0, 52.0, 51.5], exposures=[1.0] * 5, symbols=["SPY"])
+        return strat, bench
+
+    def test_all_five_lines_render(self) -> None:
+        strat, bench = self._pair()
+        summary = summarize(strat, bench)
+        for label in ("Beta:", "Alpha (ann.):", "Correlation:", "Info ratio:", "Ret/exposure:"):
+            assert label in summary
+
+    def test_the_pre_existing_benchmark_line_is_untouched(self) -> None:
+        strat, bench = self._pair()
+        assert "Benchmark (SPY): +3.00%" in summarize(strat, bench)
+
+    def test_values_match_the_metrics_module(self) -> None:
+        strat, bench = self._pair()
+        expected = compare_to_benchmark(strat.equity_curve, bench.equity_curve)
+        assert expected.beta is not None and expected.correlation is not None
+        summary = summarize(strat, bench)
+        assert f"Beta:          {expected.beta:.2f}" in summary
+        assert f"Correlation:   {expected.correlation:.2f}" in summary
+
+    def test_exposure_adjusted_line_names_both_sides(self) -> None:
+        strat, bench = self._pair()
+        line = next(
+            ln for ln in summarize(strat, bench).splitlines() if ln.startswith("Ret/exposure:")
+        )
+        # Average exposures 50% (strategy) and 100% (benchmark) both appear, so the
+        # reader can see why the raw returns were never comparable.
+        assert "50.00% vs 100.00% invested" in line
+
+    def test_partial_overlap_is_flagged_not_silently_absorbed(self) -> None:
+        strat = _result([100.0, 104.0, 101.0, 107.0, 106.0], exposures=[0.5] * 5)
+        bench = _result([50.0, 51.0, 52.0], symbols=["SPY"])
+        # The benchmark covers only days 3-5 of the strategy's five bars.
+        bench.equity_curve = _bench_curve([3, 4, 5], [50.0, 51.0, 52.0])
+        summary = summarize(strat, bench)
+        assert "Bench overlap: 3 of 5 strategy bars" in summary
+        assert "cover only the shared span" in summary
+
+    def test_full_overlap_prints_no_caveat(self) -> None:
+        strat, bench = self._pair()
+        assert "Bench overlap:" not in summarize(strat, bench)
+
+    def test_one_shared_bar_says_so_instead_of_four_n_a_lines(self) -> None:
+        strat = _result([100.0, 104.0, 101.0], exposures=[0.5] * 3)
+        bench = _result([50.0, 51.0], symbols=["SPY"])
+        bench.equity_curve = _bench_curve([3, 4], [50.0, 51.0])
+        summary = summarize(strat, bench)
+        assert "Bench overlap: 1 shared bar(s) with the benchmark" in summary
+        assert "too few to compute beta, alpha, correlation, or information ratio" in summary
+        assert "Beta:" not in summary
+
+    def test_undefined_statistics_render_n_a_never_zero(self) -> None:
+        # A flat benchmark has no variance, so beta/alpha/correlation are undefined.
+        strat = _result([100.0, 104.0, 101.0, 107.0], exposures=[0.5] * 4)
+        bench = _result([50.0, 50.0, 50.0, 50.0], symbols=["SPY"])
+        summary = summarize(strat, bench)
+        assert "Beta:          n/a" in summary
+        assert "Alpha (ann.):  n/a" in summary
+        assert "Correlation:   n/a" in summary
+        # The active return still exists, so the information ratio is a number.
+        assert "Info ratio:    n/a" not in summary
+
+    def test_never_invested_strategy_reports_n_a_per_unit(self) -> None:
+        strat = _result([100.0, 104.0, 101.0], exposures=[0.0] * 3)
+        bench = _result([50.0, 51.0, 52.0], symbols=["SPY"])
+        line = next(
+            ln for ln in summarize(strat, bench).splitlines() if ln.startswith("Ret/exposure:")
+        )
+        assert line.startswith("Ret/exposure:  n/a vs benchmark")
+
+
+class TestResultJsonBenchmarkBlock:
+    """``result.json`` carries the comparison additively — no schema bump."""
+
+    STRATEGY: ClassVar[list[float]] = [100.0, 104.0, 101.0, 107.0]
+    BENCHMARK: ClassVar[list[float]] = [50.0, 51.0, 50.0, 52.0]
+
+    @classmethod
+    def _strat(cls) -> BacktestResult:
+        return _result(cls.STRATEGY, exposures=[0.5] * 4)
+
+    @classmethod
+    def _curve(cls, equities: list[float]) -> list[EquityPoint]:
+        return [EquityPoint(_ts(i + 1), e, 1.0) for i, e in enumerate(equities)]
+
+    @classmethod
+    def _doc(cls, *, with_benchmark: bool, frequency: str = "1d") -> dict[str, Any]:
+        strat = cls._strat()
+        return result_to_dict(
+            strat,
+            mode="backtest",
+            frequency=frequency,
+            metrics=compute(strat),
+            benchmark_curve=cls._curve(cls.BENCHMARK) if with_benchmark else None,
+        )
+
+    def test_schema_version_does_not_move(self) -> None:
+        assert self._doc(with_benchmark=True)["schema_version"] == RESULT_SCHEMA_VERSION == 1
+
+    def test_block_is_null_without_a_benchmark(self) -> None:
+        doc = self._doc(with_benchmark=False)
+        assert doc["benchmark_metrics"] is None
+        # ...and the exposure-adjusted return, which needs no benchmark, is not.
+        assert doc["metrics"]["return_per_unit_exposure"] is not None
+
+    def test_block_is_derived_from_the_two_curves(self) -> None:
+        block = self._doc(with_benchmark=True)["benchmark_metrics"]
+        assert block is not None
+        assert block["shared_bars"] == 4
+        assert set(block) == {"shared_bars", "beta", "alpha", "correlation", "information_ratio"}
+
+    def test_the_metrics_key_is_still_exactly_asdict_of_the_metrics(self) -> None:
+        # The comparison lives beside benchmark_curve at the top level, never
+        # inside metrics: a v1 reader's `metrics` contract is untouched.
+        strat = self._strat()
+        metrics = compute(strat)
+        doc = result_to_dict(
+            strat,
+            mode="backtest",
+            metrics=metrics,
+            benchmark_curve=self._curve(self.BENCHMARK),
+        )
+        assert doc["metrics"] == asdict(metrics)
+        assert "benchmark" not in doc["metrics"]
+
+    def test_every_v1_key_is_still_present_and_unchanged(self) -> None:
+        with_bench = self._doc(with_benchmark=True)
+        without = self._doc(with_benchmark=False)
+        v1_keys = {
+            "schema_version",
+            "mode",
+            "frequency",
+            "symbols",
+            "starting_cash",
+            "final_equity",
+            "total_return",
+            "equity_curve",
+            "benchmark_curve",
+            "metrics",
+            "fills",
+            "clamps",
+            "rejections",
+            "absent",
+            "halt",
+        }
+        assert v1_keys <= set(with_bench)
+        for key in v1_keys - {"benchmark_curve"}:
+            assert with_bench[key] == without[key]
+
+    def test_the_document_still_round_trips_through_json(self) -> None:
+        doc = self._doc(with_benchmark=True)
+        assert json.loads(json.dumps(doc)) == doc
+
+    def test_a_precomputed_comparison_is_respected(self) -> None:
+        strat = self._strat()
+        # Built against a FLAT benchmark, so its beta is None by construction.
+        precomputed = compare_to_benchmark(strat.equity_curve, self._curve([50.0] * 4))
+        doc = result_to_dict(
+            strat,
+            mode="backtest",
+            metrics=compute(strat),
+            benchmark_curve=self._curve(self.BENCHMARK),
+            benchmark_metrics=precomputed,
+        )
+        # The caller's block wins over anything this function could re-derive.
+        assert doc["benchmark_metrics"]["beta"] is None
+
+    def test_the_interval_label_sets_the_annualization_factor(self) -> None:
+        daily = self._doc(with_benchmark=True)["benchmark_metrics"]
+        hourly = self._doc(with_benchmark=True, frequency="1h")["benchmark_metrics"]
+        # Alpha scales with periods_per_year, so the two must differ...
+        assert daily["alpha"] != hourly["alpha"]
+        # ...while beta is scale-free and must not.
+        assert daily["beta"] == hourly["beta"]
+
+    def test_an_unknown_frequency_label_falls_back_to_the_daily_basis(self) -> None:
+        odd = self._doc(with_benchmark=True, frequency="7 fortnights")["benchmark_metrics"]
+        assert odd == self._doc(with_benchmark=True)["benchmark_metrics"]
+
+    def test_write_result_json_carries_the_block_to_disk(self, tmp_path: Path) -> None:
+        strat = self._strat()
+        path = tmp_path / "nested" / "result.json"
+        write_result_json(
+            strat,
+            path,
+            mode="backtest",
+            metrics=compute(strat),
+            benchmark_curve=self._curve(self.BENCHMARK),
+        )
+        with path.open() as fh:
+            loaded = json.load(fh)
+        assert loaded["benchmark_metrics"]["shared_bars"] == 4
