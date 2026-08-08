@@ -14,8 +14,11 @@ import pytest
 
 from trading.brokers.alpaca import AlpacaBroker
 from trading.clock import FakeClock
-from trading.data.alpaca_client import FakeAlpacaClient
+from trading.data.alpaca_client import AlpacaOrder, FakeAlpacaClient
+from trading.data.fake import FakeAdapter
+from trading.engine import BacktestResult, Engine
 from trading.interfaces import Broker
+from trading.strategies.equal_weight import EqualWeight
 from trading.types import Bar, Order, Side
 
 
@@ -323,3 +326,267 @@ class TestRejectionShape:
 
         assert simulated.rejections, "expected the underfunded order to be rejected"
         assert type(broker.rejections[0][0]) is type(simulated.rejections[0][0])
+
+
+class _ParkingClient(FakeAlpacaClient):
+    """A venue that accepts every order and then parks it, never filling.
+
+    This is the market-closed branch ADR-0036 drove live: a fractional DAY market
+    order comes back ``accepted`` -- not filled, not rejected -- and queues for the
+    next open. ``auto_fill=False`` keeps the order working and stamping it
+    ``accepted`` matches what the real venue reported, so the account stays flat
+    for as long as the order sits there. That flat account is exactly what made the
+    broker resubmit: the portfolio reconciles from it (ADR-0020), so a target-weight
+    strategy sees its target unmet on every bar.
+
+    Every submission is recorded, so a test can count what actually *reached* the
+    venue rather than inferring it from the broker's own bookkeeping.
+    """
+
+    def __init__(self, bars: dict[str, list[Bar]] | None = None, *, cash: float = 10_000.0) -> None:
+        super().__init__(bars, cash=cash, auto_fill=False)
+        self.submitted: list[AlpacaOrder] = []
+
+    def submit_order(self, symbol: str, qty: float, side: Side) -> AlpacaOrder:
+        placed = super().submit_order(symbol, qty, side)
+        parked = self.set_order_status(placed.id, "accepted")
+        self.submitted.append(parked)
+        return parked
+
+
+class TestDuplicateOrderGuard:
+    """A working order suppresses a same-direction duplicate (ADR-0036, KAN-669).
+
+    The bug, confirmed live on 2026-08-08: while an order sits ``accepted`` at the
+    venue the portfolio reconciles from the account and therefore still reads
+    **flat**, so a target-weight strategy re-emits the same order every bar and the
+    broker submitted it again. Orders compounded for as long as the venue held them
+    and then all filled at once.
+
+    The guardrails are no backstop here. :class:`~trading.risk.Guardrails` nets
+    same-bar committed exposure, but that tally is reset at the top of *every* bar
+    while ``current_gross`` comes from a book that reads flat, so each bar
+    re-authorises a fresh 100% of gross exposure. ``max_position_pct`` caps one
+    order, not the running total.
+    """
+
+    def _broker(self, client: _ParkingClient) -> AlpacaBroker:
+        # A zero poll timeout: the first poll sees a working status, the deadline has
+        # already passed, and on_bar returns with the order still pending -- the
+        # timeout branch, with no clock advance to script.
+        return AlpacaBroker(client, clock=_clock(), poll_timeout=timedelta(seconds=0))
+
+    def test_parked_order_is_not_resubmitted_on_later_bars(self) -> None:
+        client = _ParkingClient({"AAA": _series("AAA", [100.0, 100.0, 100.0])})
+        broker = self._broker(client)
+
+        for _ in range(3):
+            broker.submit(Order("AAA", Side.BUY, qty=10))
+            broker.on_bar({"AAA": _bar("AAA", 100.0)})
+
+        # THE assertion: three bars of an unmet target, one order at the venue.
+        assert len(client.submitted) == 1
+        assert broker.pending_order_ids == ("1",)
+
+    def test_refusal_is_recorded_with_the_working_order_id(self) -> None:
+        client = _ParkingClient({"AAA": _series("AAA", [100.0, 100.0])})
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        broker.on_bar({"AAA": _bar("AAA", 100.0)})
+        duplicate = Order("AAA", Side.BUY, qty=10)
+        broker.submit(duplicate)
+
+        assert len(broker.rejections) == 1
+        (order, reason) = broker.rejections[0]
+        # The tuple shape the result document reads (ADR-0036), carrying the order
+        # that was *refused*, not the one still working.
+        assert order is duplicate
+        assert "1" in reason  # names the working order at the venue
+        assert "working" in reason
+        assert "AAA" in reason
+
+    def test_refusal_survives_the_result_document(self) -> None:
+        # A refusal must be visible, not silent: it has to reach result.json and the
+        # summary the same way a venue rejection does.
+        import json
+
+        from trading.engine import BacktestResult
+        from trading.report import result_to_dict
+        from trading.types import Portfolio
+
+        client = _ParkingClient({"AAA": _series("AAA", [100.0])})
+        broker = self._broker(client)
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        broker.submit(Order("AAA", Side.BUY, qty=2.5))
+
+        result = BacktestResult(
+            symbols=["AAA"],
+            starting_cash=10_000.0,
+            equity_curve=[],
+            final_portfolio=Portfolio(cash=10_000.0),
+            rejections=list(broker.rejections),
+        )
+        document = result_to_dict(result, mode="paper")
+
+        assert document["rejections"] == [
+            {"symbol": "AAA", "qty": 2.5, "side": "buy", "reason": broker.rejections[0][1]}
+        ]
+        assert json.loads(json.dumps(document))["rejections"] == document["rejections"]
+
+    def test_a_working_buy_never_blocks_a_sell(self) -> None:
+        # The exit invariant. Long-or-flat (ADR-0011) means a SELL is the only way
+        # out, and an unsellable position is far worse than a duplicate buy -- the
+        # same reasoning the halt path already uses ("exits are allowed while
+        # halted, always", ADR-0013/0031). The refusal is keyed on symbol *and*
+        # side, so a working BUY is never even compared against a SELL.
+        client = _ParkingClient({"AAA": _series("AAA", [100.0])})
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        broker.submit(Order("AAA", Side.SELL, qty=10))
+
+        assert [o.side for o in client.submitted] == [Side.BUY, Side.SELL]
+        assert broker.rejections == []
+
+    def test_a_working_sell_never_blocks_a_buy(self) -> None:
+        # The mirror of the above, for completeness: the key is direction-scoped in
+        # both directions, so the guard can only ever suppress a *repeat* of an
+        # intent the venue is already working on.
+        client = _ParkingClient({"AAA": _series("AAA", [100.0])})
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.SELL, qty=10))
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+
+        assert [o.side for o in client.submitted] == [Side.SELL, Side.BUY]
+        assert broker.rejections == []
+
+    def test_a_working_sell_suppresses_a_duplicate_sell(self) -> None:
+        # Refusing a *second* exit does not block the exit: the first SELL is
+        # already working at the venue and will still fill. Duplicating it would
+        # oversell the position, which this bench forbids outright (ADR-0011).
+        client = _ParkingClient({"AAA": _series("AAA", [100.0])})
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.SELL, qty=10))
+        broker.submit(Order("AAA", Side.SELL, qty=10))
+
+        assert len(client.submitted) == 1
+        assert len(broker.rejections) == 1
+
+    def test_other_symbols_are_unaffected(self) -> None:
+        client = _ParkingClient({"AAA": _series("AAA", [100.0]), "BBB": _series("BBB", [50.0])})
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        broker.submit(Order("BBB", Side.BUY, qty=10))
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+
+        assert [o.symbol for o in client.submitted] == ["AAA", "BBB"]
+        assert len(broker.rejections) == 1
+
+    def test_a_settled_order_frees_the_symbol_again(self) -> None:
+        # The guard tracks *working* orders, so it cannot latch: once the venue
+        # settles the order the next order in the same direction goes through. This
+        # is what keeps a rebalance that legitimately tops up a position working.
+        client = _ParkingClient({"AAA": _series("AAA", [100.0, 100.0])})
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        client.fill_order("1", price=100.0)
+        broker.on_bar({"AAA": _bar("AAA", 100.0)})
+        assert broker.pending_order_ids == ()
+
+        broker.submit(Order("AAA", Side.BUY, qty=4))
+
+        assert len(client.submitted) == 2
+        assert broker.rejections == []
+
+    def test_partial_fill_that_ended_allows_a_follow_up_for_the_remainder(self) -> None:
+        # A partial fill is legitimate (ADR-0033). Once the venue *ends* the order
+        # -- canceled/expired, the routine end of a parked DAY order -- the rest of
+        # the intent is unfilled and nothing is working, so a follow-up order for the
+        # remainder is a new intent, not a duplicate.
+        client = _ParkingClient({"AAA": _series("AAA", [100.0, 100.0])})
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        client.set_order_status("1", "canceled", filled_qty=4.0, filled_avg_price=100.0)
+        fills = broker.on_bar({"AAA": _bar("AAA", 100.0)})
+        assert len(fills) == 1  # the partial still flows (ADR-0033)
+        assert broker.pending_order_ids == ()
+
+        broker.submit(Order("AAA", Side.BUY, qty=6))  # the remainder
+
+        assert len(client.submitted) == 2
+        # Only the venue's own "ended canceled" entry; no duplicate refusal.
+        assert len(broker.rejections) == 1
+        assert "canceled" in broker.rejections[0][1]
+
+    def test_partial_fill_still_working_suppresses_the_remainder(self) -> None:
+        # ``partially_filled`` is a *working* status: the rest of that same order is
+        # still live at the venue, so topping up the remainder would double it. The
+        # order is suppressed until the venue settles it -- at which point the
+        # previous test's path applies.
+        client = _ParkingClient({"AAA": _series("AAA", [100.0, 100.0])})
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        client.set_order_status("1", "partially_filled", filled_qty=4.0, filled_avg_price=100.0)
+        broker.on_bar({"AAA": _bar("AAA", 100.0)})
+        assert broker.pending_order_ids == ("1",)
+
+        broker.submit(Order("AAA", Side.BUY, qty=6))
+
+        assert len(client.submitted) == 1
+        assert len(broker.rejections) == 1
+
+
+class TestParkedOrdersDoNotCompoundExposure:
+    """N bars of a parked order must not authorise N x the intended exposure.
+
+    The end-to-end statement of the same bug, driven through the real
+    :class:`~trading.engine.Engine` with the default enforced guardrails, because
+    the guardrails are where an operator would *expect* to be protected and are
+    not: ``Guardrails`` resets its committed-exposure tally at the top of every bar
+    and reads ``current_gross`` off a portfolio that a parked order leaves flat, so
+    every bar re-authorises a fresh full allowance. Without the broker-level guard,
+    five bars of an unmet 20% target queue 100% of equity at the venue -- all of it
+    to fill at the next open.
+    """
+
+    TARGET = 0.20
+    BARS = 5
+    CASH = 10_000.0
+    PRICE = 100.0
+
+    def _run(self) -> tuple[_ParkingClient, BacktestResult]:
+        series = _series("AAA", [self.PRICE] * self.BARS)
+        client = _ParkingClient({"AAA": series}, cash=self.CASH)
+        broker = AlpacaBroker(client, clock=_clock(), poll_timeout=timedelta(seconds=0))
+        engine = Engine(FakeAdapter(series), broker)
+        result = engine.run(
+            EqualWeight(invested=self.TARGET),
+            ["AAA"],
+            series[0].ts,
+            series[-1].ts,
+        )
+        return client, result
+
+    def test_exposure_queued_at_the_venue_stays_within_the_target(self) -> None:
+        client, _ = self._run()
+
+        queued = sum(o.qty * self.PRICE for o in client.submitted)
+
+        # One target, one order: never BARS x the intent.
+        assert len(client.submitted) == 1
+        assert queued <= self.TARGET * self.CASH * 1.001
+        # And it is unambiguously below what the unguarded broker queued.
+        assert queued < self.BARS * self.TARGET * self.CASH
+
+    def test_every_suppressed_duplicate_is_reported(self) -> None:
+        _, result = self._run()
+
+        assert len(result.rejections) == self.BARS - 1
+        assert all("working" in reason for (_order, reason) in result.rejections)

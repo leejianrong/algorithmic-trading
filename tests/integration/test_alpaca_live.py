@@ -617,6 +617,86 @@ class TestMarketClosedOrder:
         assert _open_order_ids(client, _SYMBOL) == []
 
 
+@_needs_live
+class TestDuplicateOrderGuardLive:
+    """The duplicate-order guard against the real venue (ADR-0036 amended, KAN-669).
+
+    Needs the venue *shut*, because that is what parks an order long enough to be
+    duplicated: while it sits ``accepted``, the account -- and therefore the
+    portfolio the broker reconciles from -- reads flat, so a target-weight strategy
+    asks again on the next bar. The fast layer proves the guard deterministically;
+    this proves the *condition* it guards against is the venue's real behaviour,
+    and that only one order actually reaches the account.
+    """
+
+    def _require_closed(self) -> None:
+        if _market_is_open():
+            pytest.skip("an order only parks long enough to be duplicated when closed")
+
+    def test_a_parked_order_is_not_duplicated_at_the_venue(self) -> None:
+        from trading.brokers.alpaca import AlpacaBroker
+        from trading.clock import WallClock
+        from trading.data.alpaca_client import RealAlpacaClient
+        from trading.types import Bar, Order
+
+        self._require_closed()
+        client = RealAlpacaClient()
+        broker = AlpacaBroker(
+            client,
+            clock=WallClock(),
+            # Zero timeout: one poll sees the parked order, on_bar returns at once.
+            poll_timeout=timedelta(seconds=0),
+            poll_interval=timedelta(seconds=1),
+        )
+        opening_qty = broker.portfolio.position(_SYMBOL).qty
+        before = set(_open_order_ids(client, _SYMBOL))
+        bar = Bar(
+            symbol=_SYMBOL, ts=datetime.now(UTC), open=1.0, high=1.0, low=1.0, close=1.0, volume=1
+        )
+
+        try:
+            # Three bars of the same unmet intent, which is what a target-weight
+            # strategy emits while the account reads flat.
+            for _ in range(3):
+                broker.submit(Order(_SYMBOL, Side.BUY, qty=_TINY_QTY))
+                broker.on_bar({_SYMBOL: bar})
+
+            assert len(broker.pending_order_ids) == 1
+            order_id = broker.pending_order_ids[0]
+            # The venue's own view: one new working order in the symbol, not three.
+            assert set(_open_order_ids(client, _SYMBOL)) - before == {order_id}
+            # Both refusals name the order that is still working.
+            assert len(broker.rejections) == 2
+            assert all(order_id in reason for (_order, reason) in broker.rejections)
+
+            # An exit is never blocked, even with that buy still working.
+            broker.submit(Order(_SYMBOL, Side.SELL, qty=_TINY_QTY))
+            assert len(broker.pending_order_ids) == 2
+            assert len(broker.rejections) == 2  # the SELL was not refused
+        finally:
+            _flatten(client, _SYMBOL, opening_qty)
+
+    def test_the_account_is_left_flat(self) -> None:
+        """The final read: no working orders and no position, from the venue itself.
+
+        Declared after the test above so it runs after it. A parked order that
+        outlives the run fills at the next open, hours later, and looks like a
+        phantom trade; a position that outlives it silently changes what every
+        later test starts from. ``_flatten`` already cancels then sells, so this
+        asserts the outcome rather than performing it -- and it holds on both
+        branches: if the venue opened mid-test the buy filled and was sold back.
+        The paper account this suite runs against is kept flat by convention
+        (ADR-0036 left it at $100,000.06 cash, checked rather than assumed).
+        """
+        from trading.data.alpaca_client import RealAlpacaClient
+
+        client = RealAlpacaClient()
+        _cancel_open_orders(client, _SYMBOL)
+
+        assert _open_order_ids(client, _SYMBOL) == []
+        assert [p for p in client.list_positions() if p.symbol == _SYMBOL] == []
+
+
 def _flatten(client: object, symbol: str, target_qty: float) -> None:
     """Leave the account as we found it: no working orders, no extra shares.
 
