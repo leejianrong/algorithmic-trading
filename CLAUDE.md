@@ -464,6 +464,48 @@ As of this writing:
   benchmark so it cannot go quiet as the strategy improves. `RESULT_SCHEMA_VERSION` stays
   **1** (nothing added). Known gap: nothing caps *how late* a benchmark may enter — the
   summary names the bar and leaves the judgement to the reader.
+- **A live session stopped trading a week of history on its first poll (2026-08-08,
+  ADR-0042, KAN-697):** `RecentWindowFeed.poll` asks for `[datetime.min, now]` and
+  keeps the newest `DEFAULT_PAPER_LOOKBACK = 512` completed bars, and
+  `PaperSession.run` treated every unseen timestamp as *fresh* — so on the **first**
+  poll of a `--live` session all 512 backfill bars went through `Engine._step`, which
+  runs the strategy, sizes, and **submits real orders**. Measured on the real live
+  wiring simulated offline (`RecentWindowFeed` + `interval_is_complete` +
+  `PaperSession` + a `FakeClock` that advances on `sleep_until`), `--interval 5m`,
+  session opening 15:02: **58 orders on bars that had closed before the session
+  started vs 5 on live bars**, the first one stamped eight days earlier. That poisons
+  the one thing paper trading is for — a backfill order's reference price is a
+  historical open while the venue fills today, so the ADR-0038 divergence sample was
+  ~86% noise and still cleared `MIN_PAIRED_FILLS` to print a verdict. The two obvious
+  fixes are both worse. **Skipping** the backfill starves the strategy: history
+  accumulates *only* inside `_step`, so `sma_crossover` would need 20 live bars
+  (100 min at 5m) and `cross_sectional` 121 before it could act. **Replaying with
+  submission suppressed** desynchronizes it: strategies are transition-driven
+  (`_long: dict[str, bool]`), so one fed history with its orders swallowed believes it
+  is long against a flat book, sees no transition on the live bar, and sits flat all
+  day *silently*. What ships instead: `engine.prime_history` loads warmup bars as
+  **data** — history + `last_close`, with the strategy, sizer, guardrails and broker
+  never invoked and **no `EquityPoint`** (the account held nothing then; a fabricated
+  curve corrupts every metric). The boundary is the **first poll that reveals bars**,
+  not "the first poll" (an opening fetch failure returns an empty feed under ADR-0035,
+  which would just delay the bug one poll) and not a wall-clock cutoff (a bar
+  mid-formation at startup is stamped *before* startup and would be skipped as
+  warmup); a priming poll resets the empty-poll counter, and a bar arriving
+  mid-session is never warmup. `PaperSession(warmup=True)` is the **default** — the
+  safe one — and `trading paper --once` passes `warmup=live`, i.e. opts out, because
+  replaying `[from, to]` and trading it *is* that mode. `--once` is byte-identical,
+  proved not argued: same artifacts and stdout before/after, with the equity CSV's
+  SHA-256 pinned as a golden; `Engine.run` is untouched and a backtest diffs clean
+  against `origin/main`. The warmup is never silent — `warmup_bars` / `warmup_span` /
+  `warmup_complete` on the session, plus a `run(on_warmup=...)` hook so the CLI's one
+  line reaches stdout *and* `paper_session.log` the instant priming finishes — the
+  session then sleeps to the next boundary, so announcing on the first live bar would
+  leave a 1h session silent for an hour, indistinguishable from a hang. New
+  `paper --lookback N` exposes the
+  window (a **floor** under `--once`, so it can never truncate a replay).
+  `RESULT_SCHEMA_VERSION` stays **1**. Known gaps: the warmup is not in `result.json`
+  or the dashboard, and nothing checks the primed history is actually long enough for
+  the configured strategy's lookback.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -553,7 +595,11 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   whole run **unless** recovery is configured, and recovery is off by default
   (ADR-0013 as amended by ADR-0031); exits are allowed while halted, always.
 - **One execution path:** backtest and paper differ only in feed and clock;
-  never fork strategy/broker/portfolio logic between them (ADR-0002).
+  never fork strategy/broker/portfolio logic between them (ADR-0002). A live paper
+  session's opening window of already-closed bars is **history to prime, not a range
+  to trade** — primed as data, with the strategy, sizer, guardrails and broker never
+  invoked and no equity point recorded (ADR-0042). `_step` stays the only code that
+  trades, in both modes.
 - **No implicit shorting; fractional-share quantities allowed** (ADR-0011).
 
 ## Layout
@@ -563,7 +609,9 @@ src/trading/
   types.py                 # core value types (implemented, tested)
   interfaces.py            # DI seams: DataAdapter, Broker, Strategy, RiskGuardrails
   config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps)
-  engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5)
+  engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5);
+                           #   prime_history: a live session's opening window is warmup, not
+                           #   orders — data only, no strategy/broker/curve (ADR-0042)
   broker.py                # SimulatedBroker + CostModel
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020);
                            #   refuses a duplicate while a same-side order is working (ADR-0036);
@@ -574,7 +622,7 @@ src/trading/
   divergence.py            # ShadowBroker: live-vs-modelled fill comparison + report (ADR-0038)
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
                            #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed,
-                           #    --divergence, --bootstrap);
+                           #    --divergence, --bootstrap, --lookback);
                            #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032)
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)

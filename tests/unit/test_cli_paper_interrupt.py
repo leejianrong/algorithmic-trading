@@ -8,6 +8,7 @@ import pytest
 from typer.testing import CliRunner, Result
 
 from trading.cli import app
+from trading.clock import WallClock
 from trading.engine import PaperSession
 
 runner = CliRunner()
@@ -50,10 +51,20 @@ class TestInterruptedLiveSessionFinalizes:
         real_run = PaperSession.run
 
         def run_then_interrupt(self: PaperSession, **kwargs: object) -> object:
-            # Process a couple of bars the normal way, then interrupt like a user.
+            # Warm up and poll exactly the way a live session does, then interrupt
+            # like a user. Since ADR-0042 a live session's opening poll is *warmup*
+            # -- history primed, nothing traded -- so this reaches the Ctrl-C path
+            # having built real state without having submitted a single order,
+            # which is precisely the shape a Monday-morning session is interrupted
+            # in.
             real_run(self, max_new_bars=2, max_empty_polls=1)
             raise KeyboardInterrupt
 
+        # A live session waits on the wall clock for the next bar boundary, and
+        # after the warmup poll there is nothing else to do until then. Left real,
+        # this test would block until the next UTC midnight; the wait is not what
+        # ADR-0033 is about.
+        monkeypatch.setattr(WallClock, "sleep_until", lambda self, when: None)
         monkeypatch.setattr(PaperSession, "run", run_then_interrupt)
 
     def test_writes_equity_csv_and_result_json(self, tmp_path: Path, interrupted: None) -> None:
@@ -72,3 +83,16 @@ class TestInterruptedLiveSessionFinalizes:
         assert "interrupted" in result.output.lower()
         # The normal end-of-run summary still prints.
         assert "Processed" in result.output
+
+    def test_reports_what_it_warmed_up_on(self, tmp_path: Path, interrupted: None) -> None:
+        """Even a session interrupted before its first live bar says what it primed.
+
+        A silent warmup is indistinguishable from a session that did nothing at all,
+        and the count is how an operator checks the strategy has its lookback before
+        it starts trading (ADR-0042).
+        """
+        result = self._invoke(tmp_path)
+
+        assert "Warmup:" in result.output
+        assert "no orders submitted" in result.output
+        assert "Warmup:" in (tmp_path / "paper_session.log").read_text()

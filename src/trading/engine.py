@@ -516,6 +516,42 @@ class Engine:
 DEFAULT_PAPER_LOOKBACK = 512
 
 
+def prime_history(state: _RunState, feed: Feed) -> None:
+    """Load ``feed``'s bars into ``state`` as *history only* — never as trades (ADR-0042).
+
+    This is the warmup half of a live paper session. It does exactly the part of
+    :meth:`Engine._step` that is pure bookkeeping — appending each bar to
+    ``state.history`` and marking ``state.last_close`` — and **nothing** else: the
+    strategy, the sizer, the guardrails and the broker are not invoked, and no
+    :class:`EquityPoint` is recorded.
+
+    Every one of those omissions is load-bearing:
+
+    * **No strategy call.** Strategies are stateful and transition-driven —
+      ``SmaCrossover`` and ``Momentum`` keep a per-symbol ``_long`` latch and emit
+      only when it flips. Running one over history while discarding its orders would
+      leave it believing it is long against a flat account, so the live session would
+      see no transition and sit out the day in silence. Priming as data leaves the
+      strategy pristine, and its first call lands on a genuinely live bar where it
+      transitions from flat exactly once.
+    * **No broker call.** The bars are already closed; an order sized from a
+      historical open fills at today's price, which is the ±1,100 bps noise that
+      swamped the fill-divergence sample (ADR-0038).
+    * **No equity point.** The account held nothing during the warmup, so a curve
+      over those timestamps is fabricated, and every metric derived from the curve —
+      return, Sharpe, drawdown, exposure — would be computed over a book that did
+      not exist.
+
+    It is a free function, not a method, so the boundary can be tested directly and
+    so nothing about it can be mistaken for a second execution path: ``_step``
+    remains the only code that trades, in both modes (ADR-0002).
+    """
+    for _ts, bars in feed:
+        for symbol, bar in bars.items():
+            state.history[symbol].append(bar)
+            state.last_close[symbol] = bar.close
+
+
 class PaperSession:
     """Drives the shared per-bar step over a completed-bar feed on a clock (ADR-0014).
 
@@ -530,6 +566,15 @@ class PaperSession:
     The loop is bounded for tests and offline demos: it stops once ``max_new_bars``
     have been processed, or after ``max_empty_polls`` consecutive polls that reveal
     nothing new, whichever comes first (with ``max_polls`` as a hard safety).
+
+    **Warmup vs. live (ADR-0042).** A completed-bar feed hands back a window of
+    *history* the moment a session opens — up to ``lookback`` bars that closed
+    before anyone pressed start. With ``warmup=True`` (the default, and the only
+    safe setting for a live session) those bars are loaded as history via
+    :func:`prime_history` and nothing is traded on them; the strategy's first call
+    is on the first bar to complete *after* the session opened. With
+    ``warmup=False`` every bar the feed reveals is stepped and traded, which is
+    what a bounded offline replay (``trading paper --once``) is for.
     """
 
     def __init__(
@@ -543,6 +588,7 @@ class PaperSession:
         lookback: int = DEFAULT_PAPER_LOOKBACK,
         poll_interval: timedelta | None = None,
         frequency: Frequency | None = None,
+        warmup: bool = True,
     ) -> None:
         self._engine = engine
         self._strategy = strategy
@@ -560,10 +606,45 @@ class PaperSession:
         self._seen: set[datetime] = set()
         # The session log: one BarOutcome per completed bar processed, in order.
         self.session_log: list[BarOutcome] = []
+        # Warmup bookkeeping (ADR-0042). ``_warmup_pending`` is the *boundary*: it
+        # stays True until the first poll that reveals bars, so a failed opening
+        # fetch (ADR-0035 returns an empty cross-section rather than raising) cannot
+        # hand the backfill to the live path one poll later.
+        self._warmup_pending = warmup
+        self._warmup_span: tuple[datetime, datetime] | None = None
+        self._warmup_bars = 0
 
     @property
     def state(self) -> _RunState:
         return self._state
+
+    @property
+    def warmup_bars(self) -> int:
+        """How many bar timestamps were primed as history rather than traded.
+
+        Zero before the warmup poll happens, and zero for the whole of a
+        ``warmup=False`` replay.
+        """
+        return self._warmup_bars
+
+    @property
+    def warmup_span(self) -> tuple[datetime, datetime] | None:
+        """``(first, last)`` timestamp of the primed window, or ``None`` if empty.
+
+        The operator-facing evidence that a session started from real history: a
+        live run that reports no span warmed up on nothing, and its first trades are
+        being made by a strategy that cannot see its own lookback yet.
+        """
+        return self._warmup_span
+
+    @property
+    def warmup_complete(self) -> bool:
+        """True once the warmup boundary has been crossed (or was never armed).
+
+        From this point on every bar the feed reveals is live and tradeable — a bar
+        arriving mid-session is never warmup.
+        """
+        return not self._warmup_pending
 
     def _next_due(self) -> datetime:
         """The next poll instant: the first ``poll_interval`` boundary after now.
@@ -596,6 +677,19 @@ class PaperSession:
         """
         return self._engine._finalize(self._symbols, self._state)
 
+    def _absorb_warmup(self, fresh: Feed) -> None:
+        """Take ``fresh`` as the session's opening history and close the boundary.
+
+        Called at most once per session, on the first poll that reveals bars. The
+        timestamps go into ``_seen`` so a later cumulative poll — ``RecentWindowFeed``
+        re-returns its whole window every time — cannot resurrect them as live bars.
+        """
+        prime_history(self._state, fresh)
+        self._seen.update(ts for ts, _ in fresh)
+        self._warmup_bars = len(fresh)
+        self._warmup_span = (fresh[0][0], fresh[-1][0])
+        self._warmup_pending = False
+
     def run(
         self,
         *,
@@ -603,6 +697,7 @@ class PaperSession:
         max_empty_polls: int = 2,
         max_polls: int = 100_000,
         reporter: object = None,
+        on_warmup: object = None,
     ) -> BacktestResult:
         """Poll → process new completed bars → sleep, until a stop condition.
 
@@ -610,13 +705,41 @@ class PaperSession:
         processed bar (the CLI uses it to print status and persist state). Returns
         the final :class:`BacktestResult`, assembled from the shared run state so it
         is identical in shape to a backtest's.
+
+        With ``warmup=True`` the first poll that reveals any bars is the *warmup*:
+        those bars are primed as history and none of them is traded, reported, or
+        marked to a curve (ADR-0042). Every poll after it is live. ``on_warmup``, if
+        callable, is invoked with no arguments the moment that happens — the session
+        then sleeps until the next bar boundary, so without it a live run would say
+        nothing at all for a whole interval after starting.
         """
         call_reporter = reporter if callable(reporter) else None
+        call_on_warmup = on_warmup if callable(on_warmup) else None
         empty_polls = 0
 
         for _ in range(max_polls):
             feed = self._feed.poll(self._symbols, self._lookback)
             fresh = [(ts, bars) for ts, bars in feed if ts not in self._seen]
+
+            if self._warmup_pending:
+                if not fresh:
+                    # Nothing revealed yet — the session has not really opened, so
+                    # the warmup boundary stays where it is and this counts as the
+                    # quiet poll it is.
+                    empty_polls += 1
+                    if empty_polls >= max_empty_polls:
+                        break
+                    self._clock.sleep_until(self._next_due())
+                    continue
+                self._absorb_warmup(fresh)
+                if call_on_warmup is not None:
+                    call_on_warmup()
+                # A poll that primed hundreds of bars is the opposite of quiet;
+                # counting it as empty would leave a default session one dull poll
+                # from stopping before it ever traded.
+                empty_polls = 0
+                self._clock.sleep_until(self._next_due())
+                continue
 
             for ts, bars in fresh:
                 outcome = self._engine._step(self._strategy, ts, bars, self._state)
