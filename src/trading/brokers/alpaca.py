@@ -51,9 +51,14 @@ class AlpacaBroker:
     venue's reported price and quantity; the portfolio is then reconciled from the
     account rather than mutated locally.
 
-    Rejections (an order the venue refuses, or one still unfilled at timeout) are
-    recorded on :attr:`rejections` / retried rather than raised, mirroring
-    :class:`~trading.broker.SimulatedBroker` so one bad order never aborts a run.
+    An order the venue *ends* without filling it -- ``rejected``, ``canceled``,
+    ``expired``, ``replaced`` -- is recorded on :attr:`rejections` rather than
+    raised, so one bad order never aborts a run; one still *working* at the poll
+    timeout is neither, it simply stays pending and is retried on the next bar.
+    :attr:`rejections` holds ``(Order, reason)`` exactly as
+    :class:`~trading.broker.SimulatedBroker` does, because
+    :class:`~trading.engine.Engine` merges both into the same
+    ``BacktestResult.rejections`` (ADR-0036).
     """
 
     def __init__(
@@ -71,7 +76,11 @@ class AlpacaBroker:
         self._poll_timeout = poll_timeout
         self._poll_interval = poll_interval
         self._pending: list[str] = []
-        self.rejections: list[tuple[str, str]] = []
+        # What each pending order id was asked to do, so a rejection can name the
+        # Order rather than the id (ADR-0036): BacktestResult.rejections and
+        # report.result_to_dict both read order.symbol / .qty / .side.
+        self._requested: dict[str, Order] = {}
+        self.rejections: list[tuple[Order, str]] = []
         # Reconcile once up front so the portfolio is valid before the first bar.
         self._portfolio = self._reconcile()
 
@@ -99,6 +108,7 @@ class AlpacaBroker:
         """
         placed = self._client.submit_order(order.symbol, order.qty, order.side)
         self._pending.append(placed.id)
+        self._requested[placed.id] = order
 
     def on_bar(self, bars: dict[str, Bar]) -> list[Fill]:
         """Poll pending orders, emit fills for settled ones, then reconcile.
@@ -130,13 +140,18 @@ class AlpacaBroker:
                 if fill is not None:
                     fills.append(fill)
                 self.rejections.append(
-                    (order_id, f"order {order_id} ended {settled.status} at the venue")
+                    (
+                        self._requested[order_id],
+                        f"order {order_id} ended {settled.status} at the venue",
+                    )
                 )
+                del self._requested[order_id]
                 continue
             if fill is None:
                 still_pending.append(order_id)  # filled flag but no price yet.
                 continue
             fills.append(fill)
+            del self._requested[order_id]
 
         self._pending = still_pending
         self._portfolio = self._reconcile()

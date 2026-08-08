@@ -123,11 +123,25 @@ An empty result now caches an empty CSV and is served from disk thereafter.
 - The negative cache means a genuinely-empty `(symbol, range)` is never re-fetched.
   If a provider later gains history for that window, the stale empty CSV must be
   deleted by hand — the same staleness the positive cache already has.
-- Still open: the CLI does not yet *print* `absent` (it lands in the next
-  integration commit), and a failing `--benchmark` symbol still aborts a
-  `backtest` command after the main run has already succeeded.
 - **Amended 2026-08-08:** `RecentWindowFeed.poll` used to fetch without a
   per-symbol guard, so one bad symbol aborted a paper poll. It now applies this
   same treatment, reusing these types and reason codes — plus a retry/escalation
   policy for the long-running case, since a session polls the same symbol
   hundreds of times rather than once. See ADR-0035.
+- **Amended 2026-08-08:** the two items this ADR left open are both closed.
+  `summarize()` now prints `absent` directly under `Symbols:` — deliberately not
+  down with the guardrail counters, because a shrunk universe is not an event that
+  happened *during* the run like a clamp, it is a caveat on every figure below it.
+  `result.json` carries the same list additively, so `RESULT_SCHEMA_VERSION` stays
+  1. And a failing `--benchmark` symbol now warns and continues instead of killing
+  a run that had already succeeded: the handler catches `EmptyUniverseError` only,
+  which is narrow *because* this ADR funnels every data-shaped failure — bad
+  ticker, transport error, not-listed-in-range — into exactly that type, while a
+  broken guardrail or sizing crash still aborts, since those make the strategy
+  numbers suspect too.
+- Still open: `cli.py`'s `paper --once` path fetches through a raw dict
+  comprehension and so still dies on one bad symbol — the last place this
+  treatment is missing, and the one an operator hits first because `--once` is the
+  default. A `paper` session also does not yet surface `feed.absent` /
+  `persistently_absent` in its summary or `result.json`, so a symbol dropped
+  mid-session reaches the operator through the log only.
