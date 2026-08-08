@@ -329,13 +329,38 @@ def _run_benchmark(
     bench_broker = SimulatedBroker(Portfolio(cash=cash))
     engine = Engine(adapter, bench_broker, Guardrails(RiskConfig.unlimited()))
     try:
-        return engine.run(get_strategy("buy_and_hold"), [symbol], start, end)
+        bench = engine.run(get_strategy("buy_and_hold"), [symbol], start, end)
     except EmptyUniverseError as exc:
         typer.echo(
             f"warning: benchmark {symbol} could not be run, continuing without it — {exc}",
             err=True,
         )
         return None
+    _warn_if_benchmark_never_invested(symbol, bench)
+    return bench
+
+
+def _warn_if_benchmark_never_invested(symbol: str, bench: BacktestResult) -> None:
+    """Warn on stderr when the benchmark ran fine but never held anything.
+
+    The other benchmark failure — no data — is an exception and is caught above. A
+    benchmark that *runs* and never takes a position is not: an underfunded entry
+    is recorded on ``rejections``, not raised (ADR-0004), so before this the run
+    printed ``+0.00%`` with total confidence. :func:`~trading.report.summarize`
+    carries the same fact into the summary body; this line exists as well because
+    stderr is where an operator watching a long run looks, and because the summary
+    scrolls past while a warning does not.
+    """
+    if any(point.exposure > 0.0 for point in bench.equity_curve):
+        return
+    detail = ""
+    if bench.rejections:
+        detail = f" — {len(bench.rejections)} order(s) rejected, first: {bench.rejections[0][1]}"
+    typer.echo(
+        f"warning: benchmark {symbol} never took a position, so its return is idle cash "
+        f"rather than a market return{detail}",
+        err=True,
+    )
 
 
 def _check_bootstrap_options(*, bootstrap: bool, resamples: int) -> None:
