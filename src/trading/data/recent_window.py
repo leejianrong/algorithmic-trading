@@ -23,6 +23,15 @@ the whole live session — down with it (ADR-0032 recorded this as a known gap).
 on :attr:`RecentWindowFeed.absent`. A symbol is never permanently dropped: every
 poll retries every requested symbol, because a paper session outlives the outage
 that broke it (ADR-0035).
+
+The third risk is a *request* no provider will answer. This feed used to ask for
+``[datetime.min, now]`` — year 1 to now — on the reasoning that a wide net cannot
+miss anything. Alpaca answers that with an **empty response** rather than an
+error, so every symbol read absent, ADR-0035 recorded a legitimate-looking
+``REASON_NO_BARS``, and a live session stopped on ``max_empty_polls`` having
+primed nothing and traded nothing (ADR-0047). A poll now asks for a **bounded**
+window sized from ``lookback`` and the bar interval — see :func:`fetch_span` —
+which is all a poll ever keeps anyway.
 """
 
 from __future__ import annotations
@@ -47,9 +56,85 @@ logger = logging.getLogger(__name__)
 # A pluggable completeness test: is ``bar`` finished given the current time?
 CompletenessPolicy = Callable[[Bar, datetime], bool]
 
-# Fetch far enough back to cover any reasonable lookback; timezone-aware so it
-# compares cleanly against a :class:`~trading.types.Bar`'s tz-aware timestamp.
-_FAR_PAST = datetime.min.replace(tzinfo=UTC)
+# --- How far back a poll asks (ADR-0047) -------------------------------------
+#
+# Converting "``lookback`` bars" into wall-clock time has to pay for the hours and
+# days the market is shut, or the window comes back short and the ADR-0042 warmup
+# is silently truncated.
+
+# US regular trading hours, 09:30-16:00 ET. Also `synthetic._SESSION_LENGTH`; kept
+# as a local constant so this module keeps its single-purpose import list.
+RTH_SESSION = timedelta(hours=6, minutes=30)
+
+# 365 calendar days hold ~252 trading sessions; weekends and the ~9 market
+# holidays a year are the whole difference. Sizing a daily window on `lookback`
+# *calendar* days would therefore come back ~30% short.
+CALENDAR_DAYS_PER_SESSION = 365.0 / 252.0
+
+# Slack on top of that exact conversion. Four means a window would have to be a
+# quarter as dense as a normal market calendar before it truncated a lookback —
+# and it costs almost nothing, because at every supported interval it lands near
+# 4x`lookback` bars, which is one page from any provider (Alpaca's limit is
+# 10,000). Over-asking is cheap here in a way that under-asking is not: a poll
+# discards everything past the newest `lookback` bars regardless, while a short
+# window quietly shortens the history a strategy warms up on.
+WINDOW_SLACK = 4.0
+
+# A floor, so a tiny lookback at a fine interval still spans a weekend.
+MIN_FETCH_SPAN = timedelta(days=5)
+
+# The hard floor on a window start. Measured against the live Alpaca paper API on
+# 2026-08-09: a 1900-01-01 start returns 1,516 daily AAPL bars while
+# ``datetime.min`` returns none, so this is a bound the provider demonstrably
+# answers — and no US equity series predates it. It also keeps `now - span` from
+# overflowing whatever a caller passes as ``lookback``.
+EARLIEST_START = datetime(1900, 1, 1, tzinfo=UTC)
+
+# Cap the computed span before it becomes a timedelta, so an absurd lookback
+# clamps to EARLIEST_START instead of raising OverflowError.
+_MAX_SPAN_DAYS = 200 * 365
+
+
+def fetch_span(lookback: int, interval: timedelta) -> timedelta:
+    """How far back a poll must reach to contain ``lookback`` bars of ``interval``.
+
+    Sub-daily bars pack into the 6.5-hour regular session, so a 5-minute bar is
+    one of ~78 in a day rather than one of 288: the wall-clock span of
+    ``lookback x interval`` understates the calendar reach by the ratio of the
+    closed day to the open one, and then again by the weekend/holiday ratio. Both
+    are paid here, and then :data:`WINDOW_SLACK` on top.
+
+    Worked, for the ``lookback=512`` default: daily -> ~2,967 days (~8 years,
+    ~2,050 bars); 1h -> ~456 days; 5m -> ~38 days; 1m -> ~7.6 days. Each lands
+    near four times the requested bars, which is one provider page.
+    """
+    if interval <= timedelta(0):
+        raise ValueError(f"interval must be positive, got {interval!r}")
+    if interval < timedelta(days=1):
+        bars_per_session = max(RTH_SESSION / interval, 1.0)
+    else:
+        bars_per_session = timedelta(days=1) / interval
+    sessions = max(lookback, 1) / bars_per_session
+    days = min(sessions * CALENDAR_DAYS_PER_SESSION * WINDOW_SLACK, _MAX_SPAN_DAYS)
+    return max(timedelta(days=days), MIN_FETCH_SPAN)
+
+
+class IntervalCompleteness:
+    """A completeness policy for fixed-``interval`` bars that *states* its interval.
+
+    Callable exactly as ADR-0022 specified (see :func:`interval_is_complete`, the
+    factory callers use), and additionally readable: the feed needs to know how
+    long a bar is to size its fetch window, and the completeness policy is already
+    the object that knows. Asking it beats threading the interval through a second
+    constructor argument every caller would have to remember to keep in sync.
+    """
+
+    def __init__(self, interval: timedelta) -> None:
+        self.interval = interval
+
+    def __call__(self, bar: Bar, now: datetime) -> bool:
+        return now.astimezone(UTC) >= bar.ts.astimezone(UTC) + self.interval
+
 
 # How many consecutive polls a symbol must be absent from before the feed calls it
 # persistent rather than a blip. One failed fetch is a network hiccup; three in a
@@ -69,7 +154,7 @@ def default_is_complete(bar: Bar, now: datetime) -> bool:
     return now.astimezone(UTC).date() > bar.ts.astimezone(UTC).date()
 
 
-def interval_is_complete(interval: timedelta) -> CompletenessPolicy:
+def interval_is_complete(interval: timedelta) -> IntervalCompleteness:
     """A completeness policy for bars of a fixed ``interval`` (ADR-0022).
 
     A bar with START ``ts`` covers ``[ts, ts + interval)`` and is complete exactly
@@ -78,12 +163,26 @@ def interval_is_complete(interval: timedelta) -> CompletenessPolicy:
     ``interval_is_complete(freq.delta)`` to :class:`RecentWindowFeed` for intraday
     paper trading. Comparisons are done in UTC so a naive-vs-aware mix can't slip
     through (a ``Bar.ts`` is always tz-aware).
+
+    Returns an :class:`IntervalCompleteness`, which behaves identically to the
+    closure this used to return and additionally carries ``interval`` so the feed
+    can size its fetch window from it (ADR-0047).
     """
+    return IntervalCompleteness(interval)
 
-    def _policy(bar: Bar, now: datetime) -> bool:
-        return now.astimezone(UTC) >= bar.ts.astimezone(UTC) + interval
 
-    return _policy
+def _policy_interval(policy: CompletenessPolicy) -> timedelta:
+    """The bar length ``policy`` implies, for window sizing (ADR-0047).
+
+    A policy that does not state one — :func:`default_is_complete`, or a custom
+    calendar policy someone injects later — is read as daily, which is the widest
+    (most forgiving) window of the supported set. Erring wide costs a larger fetch;
+    erring narrow costs history the strategy needed, so the fallback goes wide. A
+    caller who knows better passes ``interval=`` to :class:`RecentWindowFeed`.
+    """
+    if isinstance(policy, IntervalCompleteness):
+        return policy.interval
+    return timedelta(days=1)
 
 
 class RecentWindowFeed:
@@ -108,10 +207,15 @@ class RecentWindowFeed:
         is_complete: CompletenessPolicy = default_is_complete,
         *,
         adjusted: bool = False,
+        interval: timedelta | None = None,
     ) -> None:
         self._adapter = adapter
         self._clock = clock
         self._is_complete = is_complete
+        # How long one bar is, used only to size the fetch window (ADR-0047). It
+        # is *not* a second completeness rule: `is_complete` remains the sole judge
+        # of which bars a poll yields, so this cannot change what gets traded.
+        self._interval = interval if interval is not None else _policy_interval(is_complete)
         # Paper/live trades on RAW actual quotes, not adjusted total-return prices
         # (ADR-0021): the strategy must decide and the book must mark in the same
         # dollars the live broker reconciles from the real account, so this feed
@@ -120,6 +224,9 @@ class RecentWindowFeed:
         # What the most recent poll could not get, and for how long (ADR-0035).
         self._absent: list[AbsentSymbol] = []
         self._streaks: dict[str, int] = {}
+        # Whether the *whole* universe was silent on the last poll, so the alarm
+        # below fires once per outage instead of once per poll (ADR-0047).
+        self._universe_silent = False
 
     @property
     def absent(self) -> list[AbsentSymbol]:
@@ -173,12 +280,63 @@ class RecentWindowFeed:
             )
         return AbsentSymbol(symbol=symbol, reason=reason, detail=detail)
 
+    def window_start(self, now: datetime, lookback: int) -> datetime:
+        """The earliest timestamp this poll will ask for (ADR-0047).
+
+        :func:`fetch_span` back from ``now``, clamped at :data:`EARLIEST_START`.
+        Public because the request is the thing that was wrong: a test asserting on
+        a bar count would have passed throughout the KAN-714 outage.
+        """
+        span = fetch_span(lookback, self._interval)
+        if now - EARLIEST_START <= span:
+            return EARLIEST_START
+        return now - span
+
+    def _warn_if_the_whole_universe_went_quiet(
+        self, requested: int, absent: list[AbsentSymbol], start: datetime, end: datetime
+    ) -> None:
+        """Escalate a *universe-wide* clean-but-empty answer (ADR-0047).
+
+        Per symbol, "the source returned no bars" is an ordinary absence and
+        ADR-0035 handles it. All of them at once, with no fetch failing, is a
+        different claim: twenty mega-caps do not delist on the same poll, so the
+        request is the likelier suspect — which is exactly what KAN-714 was, and
+        exactly what nothing said out loud for months. Logged once per outage, not
+        per poll, on the same state-change discipline as an absence; the per-symbol
+        records are untouched, so this makes absence *louder*, never quieter.
+        """
+        silent = (
+            requested > 0
+            and len(absent) == requested
+            and all(a.reason == REASON_NO_BARS for a in absent)
+        )
+        if silent and not self._universe_silent:
+            logger.error(
+                "all %d requested symbols returned no bars for [%s, %s]: a whole "
+                "universe going quiet at once is far likelier to be a window this "
+                "source will not answer than %d simultaneous delistings — check the "
+                "request before believing the absence (ADR-0047)",
+                requested,
+                start.isoformat(),
+                end.isoformat(),
+                requested,
+            )
+        self._universe_silent = silent
+
     def poll(self, symbols: list[str], lookback: int) -> Feed:
         """Return the last ``lookback`` completed bars per symbol, merged & sorted.
 
         Fetches recent bars up to the clock's current time, discards any bar the
         completeness policy deems still forming, keeps the newest ``lookback`` per
         symbol, and merges them into one timestamp-ordered cross-section.
+
+        The fetch window is **bounded**: ``[self.window_start(now, lookback), now]``,
+        which is :func:`fetch_span` wide (ADR-0047). It used to start at
+        ``datetime.min``, and Alpaca answers that with an empty response rather
+        than an error — so every symbol read absent, forever. A poll discards
+        everything older than the newest ``lookback`` bars anyway, so the unbounded
+        request bought nothing; it also made a 1-minute synthetic poll fabricate
+        3.7 million bars per symbol.
 
         Each symbol is fetched inside its own guard (ADR-0035, mirroring
         :func:`trading.engine.load_series`): a symbol whose lookup raises, or which
@@ -201,6 +359,7 @@ class RecentWindowFeed:
         ``BaseException`` (``KeyboardInterrupt``, ``SystemExit``) is never caught.
         """
         now = self._clock.now()
+        start = self.window_start(now, lookback)
         series: dict[str, list[Bar]] = {}
         absent: list[AbsentSymbol] = []
         seen: set[str] = set()
@@ -210,7 +369,7 @@ class RecentWindowFeed:
                 continue
             seen.add(symbol)
             try:
-                bars = self._adapter.get_bars(symbol, _FAR_PAST, now, adjusted=self._adjusted)
+                bars = self._adapter.get_bars(symbol, start, now, adjusted=self._adjusted)
             except Exception as exc:  # one bad symbol must never abort the whole poll
                 absent.append(
                     self._note_absence(
@@ -236,4 +395,5 @@ class RecentWindowFeed:
             series[symbol] = completed[-lookback:]
 
         self._absent = absent
+        self._warn_if_the_whole_universe_went_quiet(len(seen), absent, start, now)
         return build_feed(series)
