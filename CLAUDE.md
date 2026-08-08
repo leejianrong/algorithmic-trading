@@ -323,15 +323,10 @@ As of this writing:
   while the venue is shut but is real intraday, and is one more argument for KAN-678.
   16 new fast tests + 5 live (double-gated, skip when the market is open). Account left
   flat and checked: no positions, no working orders, $100,000.06.
-  **Separately, and NOT fixed:** Alpaca has **stopped applying split adjustments**.
-  On 2026-08-04 AAPL 2020-08-25 came back 499.30 raw / 121.08 adjusted; on 2026-08-08
-  the same call returns 499.30 / **484.31** (ratio 1.031 = dividends only), and a
-  window spanning the 4:1 split shows the *adjusted* series still carrying a bare
-  price cliff (484.24 → 125.17). That is ADR-0008's phantom-split hazard arriving
-  through `--source alpaca` while the API still answers `adjustment=all` — ADR-0040's
-  lesson again. The two `TestRealBars` split tests are **left red on purpose**
-  (weakening them would hide an honesty regression; they skip in CI, so they gate
-  nothing). Needs its own slice.
+  **Separately:** an adjusted AAPL series came back carrying its 4:1 split. Recorded
+  here at the time as "Alpaca has stopped applying split adjustments" — **that
+  diagnosis was wrong in mechanism**, and ADR-0045 corrects it: the defect is one
+  symbol's data, not the provider's pipeline. See the split-guard bullet below.
 - **Fill divergence — is the modelled 5 bps real? (offline-verified, ADR-0038):**
   `divergence.py` answers the one question no backtest can. `ShadowBroker` is a
   **`Broker` decorator** (no engine change, no `if paper:` — ADR-0002 intact) that
@@ -506,6 +501,182 @@ As of this writing:
   `RESULT_SCHEMA_VERSION` stays **1**. Known gaps: the warmup is not in `result.json`
   or the dashboard, and nothing checks the primed history is actually long enough for
   the configured strategy's lookback.
+- **Pre-Monday hardening batch (2026-08-09, seven ADRs, six PRs):** everything below
+  landed in one day to make the 2026-08-10 live divergence run survivable
+  (`docs/monday-divergence-run.md`). Two of the seven were found *while verifying
+  something else*, and both would have silently ruined the run.
+- **A refusal reaches the bar it happened on (ADR-0044, KAN-679):** `Engine._step`
+  diffed `broker.rejections` around `on_bar` **only**, so a refusal recorded at
+  *settlement* reached that bar's `BarOutcome.broker_rejections` while one recorded at
+  *submit* did not — which is exactly the duplicate-order guard (ADR-0036) and the
+  venue's own veto (ADR-0041). Nothing was lost from the end-of-run artifacts
+  (`_finalize` merges the broker's whole list), which is why it was called cosmetic —
+  but **a `--live` session has no summary until it ends**, its per-bar status line is
+  the operator's only real-time signal, and `cli._format_bar` has rendered
+  `broker_rejections` since paper mode shipped. The field existed, the renderer
+  existed, the engine never filled it in. Second gap, same fix: a refused order was
+  still appended to `BarOutcome.submitted`, asserting that an order the venue never
+  received had been placed. `_step` now diffs the rejection list around each `submit`
+  too, **per order**, so a bar with one refusal and two acceptances reports exactly
+  that, recording `checked` (never `order`) for the ones that got through. Reporting
+  only — `_finalize` still merges the broker's list once. The backtest is untouched
+  *structurally*, not merely by measurement: `SimulatedBroker.submit` only queues and
+  has no rejection path, and `Engine.run` discards the `BarOutcome`. **`cli.py` needed
+  no change.** 12 new fast tests; reverting the fix turns exactly 7 red.
+- **A stopped session still writes its artifacts, and says what it did (ADR-0043,
+  KAN-681/682):** nothing in `src/trading/` handled a signal, so the only graceful exit
+  was `except KeyboardInterrupt` — i.e. SIGINT. `docker stop`, `systemd stop`, a reboot
+  and a plain `kill` all send **SIGTERM**, whose default disposition kills the
+  interpreter without unwinding, so `PaperSession.finalize()` never ran — the loss
+  ADR-0033 exists to prevent, arriving through the *deployment mechanism*. Reproduced
+  and then re-verified independently: `rc=-15` with only `paper_session.log` before,
+  `rc=0` with all three artifacts and finalize in **0.09 s** after (Docker's grace is
+  10 s). A handler raises `SessionTerminated`, a **`KeyboardInterrupt` subclass**, so
+  ADR-0033's except-path catches it unchanged — one exit route, two names for what
+  triggered it. **Raising, not a cooperative flag:** a live session sits inside
+  `Clock.sleep_until` for a whole bar interval (5 min on Monday, an hour at `1h`), so a
+  flag would be read long after SIGKILL landed. **A signal arriving during finalization
+  is dropped** — truncating the `result.json` the first signal was honoured to save is
+  strictly worse than taking a moment longer; `kill -9` remains the hard exit. Exit
+  code is **0**: a clean stop must not read as a crash to a supervisor (EPIC-86).
+  Installed by `trading paper` only, restored on exit, never at import. Alongside it,
+  **logging is configured once, by the CLI callback** (`logging_config.py`, global
+  `--log-level` / `--log-format text|json`): records to **stderr** in UTC while stdout
+  keeps the per-bar report untouched, and the level governs the `trading` logger while
+  the root stays at WARNING — **quieting is global, verbosity is ours**. Before this the
+  package had one logger (ADR-0035) and no configuration, so its escalation warnings
+  were unstamped and its recovery INFO line was invisible. Proved with a **real SIGTERM
+  to a real subprocess**, which found a genuine bug: `getLogger(__name__)` is
+  `"__main__"` under `python -m trading.cli`, outside the tree `--log-level` sets, so
+  every lifecycle record vanished in exactly the deployment shape being fixed. Known
+  gaps: **SIGHUP is unhandled** (closing the terminal still kills the run — use
+  `nohup`/`tmux`), and the engine/guardrails/broker have no loggers of their own.
+- **A phantom split reaches the bench through Alpaca (ADR-0045, KAN-694):** Alpaca's
+  `adjustment=all` serves AAPL's 2020-08-31 bars with the 4:1 split **not** backed out
+  — a bare **-74%** day inside the *adjusted* series, ADR-0008's oldest invariant broken
+  through `--source alpaca`. **The premise everyone started from was wrong:** it is
+  **one symbol's data, not the pipeline**. Measured independently, same day, same
+  account — AAPL 4:1 → factor **1.0000** (not applied) while TSLA 5:1 → 5.0003, NVDA
+  4:1 → 4.0001, AMZN 20:1 → 20.0001, GOOGL 20:1 → 20.0001. **TSLA split on the same
+  session as AAPL and is correct**, so it is neither provider-wide nor date-scoped. And
+  **Alpaca disagrees with itself**: its corporate-actions endpoint reports the split. So
+  detection is sound rather than heuristic, and a blanket refusal would have been a
+  permanent repo-wide tax for one ticker that sits in `blue20`. Every **adjusted** fetch
+  is now cross-checked: `applied = (raw[pre]/adj[pre]) / (raw[post]/adj[post])` — the
+  split ratio if applied, **1.0** if not, with the stock's own move **cancelling
+  exactly**, so a ±30% ex-date gives the same answer. A failure raises classified
+  `UnadjustedSplitError`, per symbol **and** per window, self-healing the day the
+  provider is fixed. **RAW is never verified and costs no extra request** — an
+  unapplied split is what raw *means* (ADR-0021) — which is why `paper --live` is
+  untouched, confirmed by fetching AAPL across the split window raw: **bars returned, no
+  raise, zero corporate-actions calls**. "We could not ask" (lookup failure) warns and
+  passes bars through (ADR-0028's third bucket). Escape hatch is
+  `AlpacaAdapter(verify_adjustments=False)`, a constructor param not a CLI flag. Seam
+  gains a 7th call, `get_splits` → our own `SplitEvent`. A backtest routes the refusal
+  through ADR-0032's guard into a loud caveat + `result.json`'s `absent`;
+  **`paper --once --source alpaca` is affected and fails as a raw traceback** (that
+  branch fetches unguarded — pre-existing, `cli.py`'s to fix). The two red `TestRealBars`
+  assertions are **not weakened**, just retargeted at TSLA's working split; the AAPL
+  state moved to a strict nightly `xfail`. Applying adjustments ourselves is feasible
+  (the endpoint has the rates) and deliberately **not built**. Not yet reported upstream.
+- **Alpaca is watched nightly, and CI holds its first live credentials (ADR-0046,
+  KAN-695):** ADR-0040 built the contract mechanism and pointed it at one provider; its
+  own closing line said Alpaca was uncovered. KAN-694 proved that real — the split
+  adjustment vanished and **nothing noticed**, because every Alpaca test sat behind a
+  credentials gate CI could never satisfy, so "skipped" and "passing" were
+  indistinguishable. `tests/integration/test_alpaca_contract.py` (marked `integration`
+  **and** `network`, so the required job never runs it) asserts adjusted-means-adjusted
+  on a **working** split, the AAPL defect as a **strict `xfail`** that turns the nightly
+  **RED the day Alpaca fixes it**, the corporate-actions endpoint ADR-0045 depends on,
+  and bar shape + `get_asset`. Absent secrets skip cleanly and emit a `::warning` saying
+  a green job means nothing. **Secrets are not yet added** — `ALPACA_API_KEY` /
+  `ALPACA_SECRET_KEY`, **paper only**; the whole layer is read-only. **Never add
+  `integration-network` to branch protection.**
+- **The live feed asked for a window no provider would answer (ADR-0047, KAN-714) —
+  THE Monday blocker:** `RecentWindowFeed.poll` asked for `[datetime.min, now]` — year 1
+  to now — on the reasoning that a wide net cannot miss anything. **Alpaca answers that
+  with an empty response**, not an error, so every symbol read absent, ADR-0035 recorded
+  a legitimate-looking `REASON_NO_BARS`, and a `--live` session stopped on
+  `max_empty_polls` having primed nothing and submitted nothing, while printing absence
+  warnings that read as a venue outage rather than as our own request. Measured live
+  (AAPL, IEX, raw): `datetime.min` → **0** bars at 1d and 5m, `1900-01-01` → 1,516 /
+  121,662, `now-5d` → 4 / 348 — so **not** a data-plan limit, and **not a regression**:
+  `_FAR_PAST = datetime.min` dates to V5 (PR #6) and only ever bit through Alpaca. Every
+  offline test was green because `SyntheticAdapter` **clips** a `datetime.min` start to
+  its 1990 epoch (ADR-0030 documents the clipping as deliberate) and `FakeAdapter`
+  filters any range — **the stand-ins were more forgiving than the provider**, so a
+  regression test written against them passes whether or not this is fixed (ADR-0040's
+  lesson, second sighting). The same request made a 1-minute synthetic poll fabricate
+  **3.7 M bars per symbol** (158.6 s → 0.1 s). `poll` now asks a bounded window sized by
+  `fetch_span`, which pays two conversions — the 6.5 h session inside the 24 h day (a 5m
+  bar is one of ~78/day, not 288) then `365/252` calendar days per session — and then
+  `WINDOW_SLACK = 4`, so a source must be a **quarter** as dense as a market calendar
+  before truncating the ADR-0042 warmup. The interval reaches the feed through the
+  completeness policy that already carried it; an unstated policy gets the **widest**
+  window (erring wide costs a fetch, erring narrow costs history). **A universe-wide
+  clean-but-empty answer is now loud** — one ERROR naming the window asked for; twenty
+  mega-caps do not delist on the same poll, and that silence is what hid this.
+  Per-symbol absence is untouched. Verified live on the real Monday command with the
+  venue shut: **`Warmup: primed 645 completed bar(s)`** where `main` said "no completed
+  bars were available", no symbol absent, account left flat. `--once` byte-identical
+  (four invocations hashed, including ADR-0042's golden); `cli.py` untouched. Known
+  gap: nothing yet checks the primed history is long enough for the strategy's lookback
+  (**KAN-702**) — this gives it a truthful number to check.
+- **A crashed session keeps its measurement (ADR-0048, KAN-711):**
+  `fill_divergence.csv` is the one artifact this bench produces that is **not**
+  reconstructible — `paper_session.log` has the realized fills but no counterfactual, no
+  reference price, no slippage — and every row lived in memory on the `ShadowBroker`
+  until `finalize()`. ADR-0043 fixed the *signalled* half; it cannot reach `kill -9`, an
+  OOM kill, power loss, or a suspending laptop (which the runbook warns about, there
+  being no supervision). Reproduced with a real SIGKILL: the file was **absent
+  entirely**; after, **227 rows on disk**. `DivergenceJournal` appends rows as they
+  close, from `_flush_journal` at the end of `_observe` over what `_harvest` has just
+  closed — and that placement **is** the late-settlement rule: a partial fill (ADR-0033)
+  is amended inside attribution, before harvest, so the intermediate never hits disk; an
+  order parked at the venue (ADR-0036) is not journaled at all and appears only if the
+  session finalizes. A crashed file **under-reports; it never misreports**. It is a
+  **byte prefix** of the finished file — independently confirmed, 177 surviving rows an
+  exact prefix of 837 — so the survivor needs no tooling and is readable mid-session
+  (what KAN-712 needs). `write_divergence_csv` and `_persist_state` now write a sibling
+  temp file and `os.replace`. Journal I/O obeys ADR-0038's rule — after the live call,
+  inside the same `try/except`, cursor advanced only on success — so a full disk
+  disables the shadow rather than costing an order, proved by a journal that raises on
+  every append producing an **equal** `BacktestResult`. A completed `--once` run is
+  `diff -r` identical across all five artifacts. Cost: `fsync` ~1.6 ms per settling bar.
+  Known gaps: `equity_curve.csv` is **not** incremental (deliberate — the session log
+  already carries per-bar equity, its writer is shared with the backtest, and its rows
+  gain a benchmark column at the end); the journal truncates the CSV at session *start*,
+  so re-running into an occupied `--out` loses the old file earlier than before.
+- **A live session tolerates silence in proportion to its interval (ADR-0049,
+  KAN-671):** `PaperSession.run` stops after `max_empty_polls` consecutive polls
+  revealing nothing new, the default is `2`, and `trading paper` overrode it only on the
+  `--once` path — so the mode that runs for *weeks unattended* inherited a default
+  written for a bounded offline replay, with no operator override. **A count is the
+  wrong unit:** `2` polls is **ten minutes at `--interval 5m` and two days at `1d`**,
+  which is why the card's two symptoms looked unrelated and were one bug. Measured on
+  the real live wiring assembled offline: a 5m session hitting a **20-minute** gap at
+  11:00 exited there with **17 live bars of a 77-bar day**, and a daily session started
+  on a Thursday exited **Monday 00:00 UTC**. It exited *cleanly*; what was lost is the
+  day. The tolerance is now a **duration** converted at the poll interval and floored in
+  polls: `LIVE_SILENCE_TOLERANCE = 60 min`, `MIN_LIVE_EMPTY_POLLS = 4` (`1m → 60`,
+  `5m → 12`, `30m/1h/1d → 4`). Tuned toward the **cheap error**: stopping late costs a
+  dozen polls of a shut venue, stopping early costs the whole day. The floor was checked
+  against the calendar rather than assumed — a normal weekend is **2** quiet daily polls
+  and a three-day weekend **3**, so 4 clears both; four consecutive non-trading days
+  would still end it, documented rather than handled. **The market calendar is
+  deliberately not built** — that is KAN-687, it needs a new provider dependency, and a
+  half-day it did not know about would end a session early, the exact failure being
+  fixed. Chosen at `cli.py` where the live/replay distinction lives; the **diff to the
+  shared `engine.py` is two hunks below `class Engine`** (a pure `silence_tolerance_polls`
+  plus docstring), with no executable line inside `Engine`/`_step`/`Engine.run`/
+  `_finalize`, and `Engine.run` has no empty-poll concept at all. New
+  `paper --max-empty-polls N` overrides either path; a live session **announces its stop
+  policy on startup** so an exit by policy is distinguishable from a hang. `--once`
+  byte-identical (one disclosed exception: the ADR-0043 stderr lifecycle line gains a
+  `max_empty_polls` field). `recent_window.py` untouched — an *empty poll* and an
+  *absent symbol* are different conditions. **Monday's run now self-terminates about
+  17:00–17:05 rather than 16:10–16:15, and is silent by design in between**; the runbook
+  says so. Known gap: nothing tells the operator *why* it stopped.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -601,6 +772,24 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   invoked and no equity point recorded (ADR-0042). `_step` stays the only code that
   trades, in both modes.
 - **No implicit shorting; fractional-share quantities allowed** (ADR-0011).
+- **A live session must survive being stopped:** SIGTERM takes the same finalizing
+  exit Ctrl-C does, and a signal arriving *during* finalization is ignored so the
+  artifacts are written whole (ADR-0033 as extended by ADR-0043). Signal handlers and
+  logging configuration are installed by the **CLI entry point only** — importing
+  `trading` as a library must change neither. Beyond that, the one artifact that
+  cannot be reconstructed (`fill_divergence.csv`) is written **as it settles**, never
+  held to the end, and a crashed file is a byte prefix that under-reports rather than
+  misreports (ADR-0048).
+- **Ask a provider for a window it will answer:** never `datetime.min`. A request is
+  bounded from `lookback × interval` with slack; an unbounded net does not catch more,
+  it catches nothing (Alpaca answers an absurd start with an *empty response*, not an
+  error — ADR-0047). And an offline stand-in that is more forgiving than the provider
+  cannot test this: `SyntheticAdapter` clips, `FakeAdapter` filters, so a regression
+  test written against either passes whether or not the bug exists (ADR-0040's lesson).
+- **A live session's stop policy is a duration, not a poll count** — the same count
+  means ten minutes at 5m and two days at 1d. Tune it toward the cheap error: stopping
+  late costs a few polls of a shut venue, stopping early costs the whole day's
+  measurement (ADR-0049).
 
 ## Layout
 
@@ -611,7 +800,9 @@ src/trading/
   config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps)
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5);
                            #   prime_history: a live session's opening window is warmup, not
-                           #   orders — data only, no strategy/broker/curve (ADR-0042)
+                           #   orders — data only, no strategy/broker/curve (ADR-0042);
+                           #   _step diffs broker.rejections around submit too (ADR-0044);
+                           #   silence_tolerance_polls: paper-only, below `class Engine` (ADR-0049)
   broker.py                # SimulatedBroker + CostModel
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020);
                            #   refuses a duplicate while a same-side order is working (ADR-0036);
@@ -619,11 +810,17 @@ src/trading/
   report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023);
                            #   absent-symbol caveat lines + additive `absent` key (ADR-0032);
                            #   flags a benchmark that never invested (ADR-0037 amended)
-  divergence.py            # ShadowBroker: live-vs-modelled fill comparison + report (ADR-0038)
+  divergence.py            # ShadowBroker: live-vs-modelled fill comparison + report (ADR-0038);
+                           #   DivergenceJournal: rows appended as they settle, atomic writes (ADR-0048)
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
                            #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed,
-                           #    --divergence, --bootstrap, --lookback);
-                           #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032)
+                           #    --divergence, --bootstrap, --lookback, --log-level, --log-format,
+                           #    --max-empty-polls);
+                           #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032);
+                           #   owns the SIGTERM handler + logging config — a library owns neither (ADR-0043);
+                           #   derives the live silence tolerance from the interval (ADR-0049)
+  logging_config.py        # the one logging configuration, called only by the CLI entry point (ADR-0043):
+                           #   stderr, UTC, text|json lines; --log-level governs `trading`, not the world
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
   frequency.py             # Frequency value: label/delta/periods_per_year — interval abstraction (ADR-0022)
@@ -637,9 +834,11 @@ src/trading/
                            #   terminal order statuses (ADR-0033) + feed choice (ADR-0034)
                            #   + cancel_order, the seam's 6th call (ADR-0036)
                            #   + OrderRejectedError: a submit-time venue refusal (ADR-0041)
-  data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
+  data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022);
+                           #   verifies an adjusted series really is adjusted; RAW never checked (ADR-0045)
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022);
-                           #   per-symbol fetch guard: retry forever, escalate, never quarantine (ADR-0035)
+                           #   per-symbol fetch guard: retry forever, escalate, never quarantine (ADR-0035);
+                           #   bounded fetch window — datetime.min is a request no provider answers (ADR-0047)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry
                            #   buy_and_hold retries its entry until the position exists (ADR-0037 amended)
   universe.py              # curated baskets (blue20) + @name expansion (ADR-0024) + broker verification (ADR-0028)
