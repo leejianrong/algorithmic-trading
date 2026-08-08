@@ -330,6 +330,34 @@ As of this writing:
   the winner's deflation is free arithmetic and prints under the ranking table always.
   `result.json` gains one additive top-level `significance` key (null when not requested),
   so `RESULT_SCHEMA_VERSION` stays **1**.
+- **CI's merge path no longer leaves the machine (2026-08-08, ADR-0040):** the
+  required `integration` job made live yfinance calls, so on 2026-08-08 an upstream
+  `YFRateLimitError` while landing PR #40 blocked a merge that had nothing to do with
+  the code — and a rate limit is likeliest exactly when the repo is busiest, since
+  every PR run spends more request budget. The job is now **entirely offline** and a
+  second job, `integration-network` (`pytest -m network`, nightly `schedule` +
+  `workflow_dispatch`, **never on `pull_request`, never a required check**), holds the
+  one test that is live by definition: the provider-contract check that yfinance still
+  returns the OHLCV columns the adapter parses. The boundary is a **marker**, not a
+  path — `network` layers tests by *what they can block*, and the fast gate deselects
+  it too. The ADR-0008 phantom-split guard runs off a committed 12 KB cache CSV
+  (`tests/fixtures/yfinance_cache/AAPL_20200601_20201201_adj.csv`; 2020-06..2020-12 is
+  five years past and immutable) with a stub fetcher that **raises if called**, so a
+  missing fixture cannot silently fall back to the network. Two worse problems fell
+  out. **(1)** ADR-0032's premise was wrong: `yf.download` catches *every* per-ticker
+  exception and returns an empty frame, so a 429 reached the engine as
+  `REASON_NO_BARS` — `EmptyUniverseError: … not listed in this window` — meaning a
+  provider refusal read as a data regression and, worse, a real break read as a flake
+  to re-run. `_default_fetch` now probes an empty response through `Ticker.history`
+  (which re-raises `YFRateLimitError` unconditionally while a genuine absence stays
+  empty) and raises `ProviderRefusedError` → `REASON_FETCH_FAILED`; classification is
+  by **exception type**, never by matching log text. **(2)** the split guard never
+  discriminated: with the default `max_position_pct = 0.25` an *unadjusted* series
+  bottoms out at −25.3%, inside the −35% floor it asserts, so the test passed on raw
+  prices. It now runs fully invested (−8.0% adjusted vs −73.9% unadjusted) and a
+  sibling test de-adjusts the same fixture by the known 4:1 ratio to prove the floor
+  trips. Verified in a network namespace with connectivity removed: the required layer
+  passes, the `network` layer fails.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -356,10 +384,11 @@ If code and prose disagree, the code wins — update the prose.
 make setup          # uv sync --frozen + install the pre-push hook (run once)
 make check          # FAST GATE: lint + type-check + no-infra tests (what pre-push runs)
 make test           # fast test layer only (no network)
-make test-integration  # integration layer (needs network / yfinance)
+make test-integration  # integration layer, OFFLINE (optional extras / broker creds; the required CI job)
+make test-network   # live provider-contract layer (hits yfinance). Nightly in CI; never gates a merge
 make test-all       # every layer
 make audit          # dependency vulnerability scan
-make ci-local       # everything CI runs, locally
+make ci-local       # everything on CI's merge path, locally (the six required checks)
 ```
 
 Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
@@ -385,6 +414,13 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   it. Bypass only with a scoped reason via `git push --no-verify`.
 - **Layer tests by cost.** Fast layer = no infra, runs everywhere. Integration
   (`@pytest.mark.integration`) and e2e are CI-only; never let them gate a push.
+- **A required check may not depend on a third party** (ADR-0040). `integration` is a
+  required check, so it is **offline**: anything that talks to a service we do not
+  control is marked `network` on top of `integration` and runs in the nightly,
+  non-required `integration-network` job. Never add `integration-network` to branch
+  protection — it does not run on PRs, so requiring it deadlocks every merge.
+  Immutable historical data belongs in a committed fixture
+  (`tests/fixtures/yfinance_cache/`), not in a live fetch on every run.
 - **Every bug and flake becomes a failing test first, then a fix.** A regression
   seen twice is a missing test.
 - **Prove a guard by watching it fail.** Break what a safety/compat test protects,
