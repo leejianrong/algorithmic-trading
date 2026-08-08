@@ -6,6 +6,10 @@ turnover — alongside the V3 guardrail lines (rejected/clamped orders, halt) an
 when the caller supplies the strategy's free-parameter count, the
 trades-per-parameter sample-size check with a warning when it is too thin to be
 evidence (ADR-0029).
+When a benchmark run is supplied it also renders the benchmark-relative block —
+beta, annualized alpha, correlation, information ratio, and the exposure-adjusted
+return of both sides (ADR-0037). Without a benchmark not one of those lines
+appears and the summary is byte-identical to what it has always been.
 ``write_equity_csv`` writes one
 row per trading day with an ``exposure`` column and, when a benchmark run is
 supplied, a ``benchmark_equity`` column aligned by timestamp. ``write_equity_png``
@@ -21,11 +25,12 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from trading.metrics import MIN_TRADES_PER_PARAMETER, compute
+from trading.frequency import TRADING_DAYS_PER_YEAR, Frequency
+from trading.metrics import MIN_TRADES_PER_PARAMETER, compare_to_benchmark, compute
 
 if TYPE_CHECKING:
     from trading.engine import BacktestResult, EquityPoint
-    from trading.metrics import PerformanceMetrics
+    from trading.metrics import BenchmarkComparison, PerformanceMetrics
 
 
 # Schema version of the canonical machine-readable run artifact emitted by
@@ -48,7 +53,11 @@ def summarize(
     """A human-readable run summary: the metrics block plus guardrail lines.
 
     When ``benchmark`` is supplied, appends a side-by-side total-return line
-    comparing the strategy to the (unconstrained) benchmark run. ``periods_per_year``
+    comparing the strategy to the (unconstrained) benchmark run, followed by the
+    benchmark-relative block: beta, annualized alpha, correlation, information
+    ratio, and the exposure-adjusted return of both sides (ADR-0037). Every one of
+    those lines is gated on the benchmark, so a run without one prints exactly the
+    block it always has. ``periods_per_year``
     scales the annualized figures (Sharpe/Sortino/Calmar/annualized return) to the
     run's bar frequency; the default of 252.0 keeps daily runs byte-identical.
 
@@ -91,11 +100,18 @@ def summarize(
             )
     if benchmark is not None:
         bench_symbol = ", ".join(benchmark.symbols)
-        bench_return = compute(benchmark, periods_per_year).total_return
+        bench_metrics = compute(benchmark, periods_per_year)
+        bench_return = bench_metrics.total_return
         delta = metrics.total_return - bench_return
         lines.append(
             f"Benchmark ({bench_symbol}): {bench_return * 100:+.2f}% "
             f"(strategy {delta * 100:+.2f}% vs benchmark)"
+        )
+        comparison = compare_to_benchmark(
+            result.equity_curve, benchmark.equity_curve, periods_per_year
+        )
+        lines.extend(
+            _benchmark_relative_lines(comparison, metrics, bench_metrics, len(result.equity_curve))
         )
     if result.rejections:
         lines.append(f"Rejected:      {len(result.rejections)} order(s)")
@@ -132,6 +148,66 @@ def _absent_lines(result: BacktestResult) -> list[str]:
         "contributed no bars; every figure below covers the reduced universe",
     ]
     lines.extend(f"    {entry.symbol} [{entry.reason}]: {entry.detail}" for entry in result.absent)
+    return lines
+
+
+def _stat(value: float | None) -> str:
+    """A ratio-shaped statistic, or ``n/a`` when it is undefined.
+
+    ``n/a`` rather than ``0.00``: a beta the data cannot support is not a beta of
+    zero, and the two must never look alike on the page (ADR-0037).
+    """
+    return "n/a" if value is None else f"{value:.2f}"
+
+
+def _stat_pct(value: float | None) -> str:
+    """A percentage-shaped statistic, or ``n/a`` when it is undefined."""
+    return "n/a" if value is None else f"{value * 100:+.2f}%"
+
+
+def _benchmark_relative_lines(
+    comparison: BenchmarkComparison,
+    metrics: PerformanceMetrics,
+    bench_metrics: PerformanceMetrics,
+    strategy_bars: int,
+) -> list[str]:
+    """The benchmark-relative block (ADR-0037), printed only when a benchmark ran.
+
+    Leads with the overlap caveat when the benchmark did not cover every strategy
+    bar, because every figure underneath then describes the shared span rather than
+    the run — the same "say what the numbers actually cover" rule ADR-0032 applies
+    to a shrunk universe. With fewer than two shared bars there is nothing to
+    compute and the block reduces to one line saying so, rather than four ``n/a``s.
+
+    The closing exposure-adjusted line is the point of the whole block: a strategy
+    that averaged 17% invested and a benchmark that is fully invested by
+    construction are not comparable on raw return, and this restates both per unit
+    of capital actually at risk.
+    """
+    if comparison.shared_bars < 2:
+        return [
+            f"Bench overlap: {comparison.shared_bars} shared bar(s) with the benchmark — "
+            "too few to compute beta, alpha, correlation, or information ratio"
+        ]
+    lines: list[str] = []
+    if comparison.shared_bars < strategy_bars:
+        lines.append(
+            f"Bench overlap: {comparison.shared_bars} of {strategy_bars} strategy bars; "
+            "the benchmark-relative figures below cover only the shared span"
+        )
+    lines.extend(
+        [
+            f"Beta:          {_stat(comparison.beta)}",
+            f"Alpha (ann.):  {_stat_pct(comparison.alpha)}",
+            f"Correlation:   {_stat(comparison.correlation)}",
+            f"Info ratio:    {_stat(comparison.information_ratio)}",
+            f"Ret/exposure:  {_stat_pct(metrics.return_per_unit_exposure)} vs benchmark "
+            f"{_stat_pct(bench_metrics.return_per_unit_exposure)} "
+            f"(annualized return per unit of avg exposure; "
+            f"{metrics.avg_exposure * 100:.2f}% vs "
+            f"{bench_metrics.avg_exposure * 100:.2f}% invested)",
+        ]
+    )
     return lines
 
 
@@ -238,6 +314,44 @@ def _equity_curve_to_list(curve: list[EquityPoint]) -> list[dict[str, Any]]:
     ]
 
 
+def _resolve_periods_per_year(frequency: str, override: float | None) -> float:
+    """Annualization factor for a run, from an explicit value or the interval label.
+
+    ``frequency`` is a free string in the schema, so an unrecognized label falls
+    back to the daily 252 basis rather than raising: this is a reporting detail,
+    and refusing to write ``result.json`` over it would be the wrong trade.
+    """
+    if override is not None:
+        return override
+    try:
+        return Frequency.parse(frequency).periods_per_year
+    except ValueError:
+        return TRADING_DAYS_PER_YEAR
+
+
+def _benchmark_metrics_block(
+    result: BacktestResult,
+    benchmark_curve: list[EquityPoint] | None,
+    benchmark_metrics: BenchmarkComparison | None,
+    periods_per_year: float,
+) -> dict[str, Any] | None:
+    """The serialized benchmark-relative block, or ``None`` when no benchmark ran.
+
+    ``result.json`` already holds both equity series, so a document with a
+    ``benchmark_curve`` but no comparison would be withholding a relation it had
+    every input for — the block is therefore derived here when the caller did not
+    supply one. An explicit ``benchmark_metrics`` always wins; with no benchmark
+    curve and no explicit block the value is ``null`` (ADR-0037).
+    """
+    if benchmark_metrics is None:
+        if benchmark_curve is None:
+            return None
+        benchmark_metrics = compare_to_benchmark(
+            result.equity_curve, benchmark_curve, periods_per_year
+        )
+    return asdict(benchmark_metrics)
+
+
 def result_to_dict(
     result: BacktestResult,
     *,
@@ -245,6 +359,8 @@ def result_to_dict(
     frequency: str = "1d",
     metrics: PerformanceMetrics | None = None,
     benchmark_curve: list[EquityPoint] | None = None,
+    benchmark_metrics: BenchmarkComparison | None = None,
+    periods_per_year: float | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
 
@@ -271,6 +387,11 @@ def result_to_dict(
           ],
           "benchmark_curve": same shape as equity_curve, or null,
           "metrics": dataclasses.asdict(metrics) or null,
+          "benchmark_metrics": {   # ADR-0037, additive; null when no benchmark ran
+            "shared_bars": int,          # timestamps the two curves had in common
+            "beta": float | null, "alpha": float | null,
+            "correlation": float | null, "information_ratio": float | null
+          } | null,
           "fills": [
             {"ts": iso8601 str, "symbol": str, "side": str,
              "qty": float, "price": float, "commission": float}, ...
@@ -297,11 +418,20 @@ def result_to_dict(
                    ]}
         }
 
-    The ``episode_count``/``episodes`` keys (ADR-0031) and the top-level ``absent``
-    list (ADR-0032) are purely additive: every pre-existing key keeps its exact
-    meaning and value — ``symbols`` is still the *requested* universe — so
+    The ``episode_count``/``episodes`` keys (ADR-0031), the top-level ``absent``
+    list (ADR-0032), and the top-level ``benchmark_metrics`` block plus the
+    ``metrics.return_per_unit_exposure`` field (ADR-0037) are purely additive:
+    every pre-existing key keeps its exact meaning and value — ``symbols`` is
+    still the *requested* universe, ``metrics`` is still exactly
+    ``dataclasses.asdict`` of what the caller passed — so
     ``RESULT_SCHEMA_VERSION`` does **not** move (see the constant's note). A v1
-    reader that ignores ``absent`` behaves exactly as it did.
+    reader that ignores them behaves exactly as it did.
+
+    ``benchmark_metrics`` sits at the top level rather than inside ``metrics``
+    because it describes a *relation between two runs*, not a property of this
+    one; it belongs beside ``benchmark_curve``. It is ``null`` whenever no
+    benchmark ran, and a ``null`` statistic inside a present block means
+    "undefined on this data" — which is not the same fact as "no benchmark".
 
     Parameters
     ----------
@@ -319,6 +449,16 @@ def result_to_dict(
         function never computes metrics itself.
     benchmark_curve:
         An optional aligned benchmark equity curve, or ``None`` (emits ``null``).
+        When present and ``benchmark_metrics`` is omitted, the benchmark-relative
+        block is derived here from the two curves this function already holds
+        (ADR-0037), so a caller gets it without a second computation.
+    benchmark_metrics:
+        An already-computed :class:`~trading.metrics.BenchmarkComparison`. Wins
+        over the derivation above when supplied.
+    periods_per_year:
+        Annualization factor for that derivation. ``None`` (the default) resolves
+        it from the ``frequency`` label, so a daily run keeps the 252 basis and an
+        intraday one scales correctly without the caller repeating itself.
     """
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -333,6 +473,15 @@ def result_to_dict(
             _equity_curve_to_list(benchmark_curve) if benchmark_curve is not None else None
         ),
         "metrics": asdict(metrics) if metrics is not None else None,
+        # The relation between the two curves above, additive under ADR-0037.
+        # ``null`` means no benchmark ran; a ``null`` *inside* it means the
+        # statistic is undefined on the shared span. Never a stand-in 0.0.
+        "benchmark_metrics": _benchmark_metrics_block(
+            result,
+            benchmark_curve,
+            benchmark_metrics,
+            _resolve_periods_per_year(frequency, periods_per_year),
+        ),
         "fills": [
             {
                 "ts": ts.isoformat(),
@@ -396,6 +545,8 @@ def write_result_json(
     frequency: str = "1d",
     metrics: PerformanceMetrics | None = None,
     benchmark_curve: list[EquityPoint] | None = None,
+    benchmark_metrics: BenchmarkComparison | None = None,
+    periods_per_year: float | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
 
@@ -408,6 +559,8 @@ def write_result_json(
         frequency=frequency,
         metrics=metrics,
         benchmark_curve=benchmark_curve,
+        benchmark_metrics=benchmark_metrics,
+        periods_per_year=periods_per_year,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:

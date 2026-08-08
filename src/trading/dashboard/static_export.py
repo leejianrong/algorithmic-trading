@@ -38,6 +38,9 @@ _PERCENT_METRICS = frozenset(
         "turnover",
         "avg_exposure",
         "peak_exposure",
+        # Annualized return per unit of average exposure — return-shaped, so it
+        # reads as a percentage like the other returns (ADR-0037).
+        "return_per_unit_exposure",
     }
 )
 
@@ -54,10 +57,24 @@ _METRIC_LABELS: dict[str, str] = {
     "peak_exposure": "Peak exposure",
     "trade_count": "Trades (entries)",
     "trades_per_parameter": "Trades / parameter",
+    "return_per_unit_exposure": "Return / exposure",
 }
 
 # Metrics that are plain counts, not ratios or percentages.
 _COUNT_METRICS = frozenset({"trade_count"})
+
+# The benchmark-relative block (ADR-0037), in display order. It is a top-level
+# key of the run document, not a metric field: it describes the relation between
+# two runs, so it renders in its own panel rather than the flat metric grid.
+_BENCHMARK_LABELS: dict[str, str] = {
+    "beta": "Beta",
+    "alpha": "Alpha (annualized)",
+    "correlation": "Correlation",
+    "information_ratio": "Information ratio",
+    "shared_bars": "Shared bars",
+}
+_BENCHMARK_PERCENT = frozenset({"alpha"})
+_BENCHMARK_COUNTS = frozenset({"shared_bars"})
 
 
 def _esc(value: Any) -> str:
@@ -131,6 +148,59 @@ def _metrics_panel(metrics: dict[str, Any] | None) -> str:
             f'<div class="tile-value">{_esc(rendered)}</div></div>'
         )
     return f'<div class="tiles">{"".join(tiles)}</div>'
+
+
+def _benchmark_panel(document: dict[str, Any]) -> str:
+    """The benchmark-relative panel (ADR-0037), or nothing at all.
+
+    Three distinct states, deliberately not collapsed into one:
+
+    * the ``benchmark_metrics`` key is missing — a ``result.json`` written before
+      this feature existed. The page says nothing rather than inventing an absence.
+    * the key is present and ``null`` — this run had no benchmark. Said plainly,
+      so the reader knows the figures were not merely omitted from the render.
+    * a block is present — beta, alpha, correlation, and the information ratio,
+      each ``n/a`` when undefined on the shared span, never ``0.00``.
+    """
+    if "benchmark_metrics" not in document:
+        return ""
+    comparison = document["benchmark_metrics"]
+    if comparison is None:
+        body = (
+            '<p class="muted">No benchmark ran for this result, so beta, alpha, '
+            "correlation and information ratio are undefined. Re-run with "
+            "<code>--benchmark SYMBOL</code> to compare.</p>"
+        )
+        return f'<section class="panel"><h2>Benchmark-relative</h2>{body}</section>'
+
+    tiles: list[str] = []
+    ordered = list(_BENCHMARK_LABELS) + [k for k in comparison if k not in _BENCHMARK_LABELS]
+    for key in ordered:
+        if key not in comparison:
+            continue
+        value = comparison[key]
+        if value is None:
+            rendered = "n/a"
+        elif key in _BENCHMARK_PERCENT:
+            rendered = _pct(value)
+        elif key in _BENCHMARK_COUNTS:
+            rendered = _num(value)
+        else:
+            rendered = _ratio(value)
+        label = _BENCHMARK_LABELS.get(key, key.replace("_", " ").title())
+        tiles.append(
+            f'<div class="tile"><div class="tile-label">{_esc(label)}</div>'
+            f'<div class="tile-value">{_esc(rendered)}</div></div>'
+        )
+    note = (
+        '<p class="muted" style="margin:12px 0 0;font-size:0.85rem;">Computed on the '
+        "timestamps the two equity curves share; a zero risk-free rate, and the run's "
+        "own annualization factor.</p>"
+    )
+    return (
+        '<section class="panel"><h2>Benchmark-relative</h2>'
+        f'<div class="tiles">{"".join(tiles)}</div>{note}</section>'
+    )
 
 
 def _chart_svg(chart: dict[str, Any]) -> str:
@@ -417,6 +487,7 @@ def render_html(payload: dict[str, Any]) -> str:
   <h2>Performance metrics</h2>
   {_metrics_panel(document.get("metrics"))}
 </section>
+{_benchmark_panel(document)}
 <section class="panel">
   <h2>Fills</h2>
   {_fills_table(document.get("fills", []))}
