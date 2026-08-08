@@ -23,18 +23,20 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from typing import Any, cast
 
 import pytest
 
 from trading.broker import SimulatedBroker
 from trading.brokers.alpaca import AlpacaBroker
 from trading.clock import FakeClock, ImmediateClock
-from trading.config import CostConfig
+from trading.config import CostConfig, RiskConfig
 from trading.data.alpaca_client import AlpacaOrder, FakeAlpacaClient
 from trading.data.fake import FakeAdapter
 from trading.engine import BarOutcome, Engine, Feed, PaperSession, build_feed
 from trading.interfaces import StrategyContext
 from trading.report import result_to_dict
+from trading.risk import Guardrails
 from trading.types import Bar, Order, Portfolio, Side, TargetWeight
 
 CASH = 10_000.0
@@ -58,6 +60,12 @@ def _series(symbol: str, bars: int) -> list[Bar]:
 
 def _clock() -> FakeClock:
     return FakeClock(datetime(2026, 1, 2, 21, 0, tzinfo=UTC))
+
+
+def _reasons(document: dict[str, Any]) -> list[str]:
+    """The ``reason`` of every rejection in a ``result_to_dict`` document."""
+    rejections = cast("list[dict[str, Any]]", document["rejections"])
+    return [str(entry["reason"]) for entry in rejections]
 
 
 class _ScriptedOrders:
@@ -281,17 +289,19 @@ class TestBacktestIsByteIdentical:
 
     :class:`~trading.broker.SimulatedBroker` queues on ``submit`` and rejects only
     inside ``on_bar``, so the submit-loop diff this change adds is empty on every
-    backtest bar. The golden below is the SHA-256 of the canonical ``result.json``
-    document for a run that exercises fills, an underfunded rejection, and a
-    guardrail clamp — computed on ``origin/main`` @ b6399f0 *before* the fix.
+    backtest bar. The golden below is the SHA-256 over the canonical
+    ``result_to_dict`` documents of **two** runs — one under the default guardrails
+    (fills, a clamp, capped-out rejections) and one unconstrained with an order
+    that cannot be funded, which is the only way to reach ``SimulatedBroker``'s own
+    rejection path with the caps on. Computed on ``origin/main`` @ b6399f0, i.e.
+    with the fix reverted.
     """
 
-    GOLDEN = "12377a36385fe947fed6b95c36340575620890954970bfc2bba3143a035df71d"
+    GOLDEN = "c5a97cfc012baa1a7e56174a55e463ffdfccfb7b06928943974dd53045a02012"
 
-    def _document(self) -> dict[str, object]:
-        # A rising series, a target that overshoots the cash on purpose, and the
-        # default guardrails: fills, one clamp, and one funding rejection.
-        bars = [
+    def _bars(self) -> list[Bar]:
+        # Rising, so a repeated fixed-quantity buy eventually runs out of room.
+        return [
             Bar(
                 symbol="AAA",
                 ts=datetime(2026, 1, 2, tzinfo=UTC) + timedelta(days=i),
@@ -303,26 +313,39 @@ class TestBacktestIsByteIdentical:
             )
             for i in range(8)
         ]
+
+    def _run(self, qty: float, *, guardrails: Guardrails | None) -> dict[str, Any]:
+        bars = self._bars()
         broker = SimulatedBroker(Portfolio(cash=CASH), CostConfig())
-        engine = Engine(FakeAdapter(bars), broker)
+        engine = Engine(FakeAdapter(bars), broker, guardrails)
         result = engine.run(
-            _ScriptedOrders([Order("AAA", Side.BUY, qty=20)]),
+            _ScriptedOrders([Order("AAA", Side.BUY, qty=qty)]),
             ["AAA"],
             bars[0].ts,
             bars[-1].ts,
         )
         return result_to_dict(result, mode="backtest")
 
-    def test_the_canonical_document_matches_the_pre_change_golden(self) -> None:
-        raw = json.dumps(self._document(), sort_keys=True).encode()
+    def _documents(self) -> tuple[dict[str, Any], dict[str, Any]]:
+        guarded = self._run(20, guardrails=None)  # default enforced caps
+        unguarded = self._run(1_000, guardrails=Guardrails(RiskConfig.unlimited()))
+        return guarded, unguarded
+
+    def test_the_canonical_documents_match_the_pre_change_golden(self) -> None:
+        raw = json.dumps(self._documents(), sort_keys=True).encode()
         assert hashlib.sha256(raw).hexdigest() == self.GOLDEN
 
-    def test_the_run_really_exercised_the_broker_reject_path(self) -> None:
-        # A golden over a run that never rejects would prove nothing about this
-        # change, so assert the fixture is not vacuous.
-        document = self._document()
-        assert document["rejections"], "fixture must produce at least one rejection"
-        assert document["fills"], "fixture must produce at least one fill"
+    def test_the_fixture_really_exercises_both_reject_paths(self) -> None:
+        # A golden over a run that never rejects or clamps would prove nothing
+        # about this change, so assert the fixture is not vacuous.
+        guarded, unguarded = self._documents()
+
+        assert guarded["fills"], "guarded run must fill something"
+        assert guarded["clamps"], "guarded run must clamp"
+        assert all("cap" in reason for reason in _reasons(guarded))
+        # The broker's own path, unreachable while the caps veto first.
+        assert _reasons(unguarded), "unguarded run must be rejected by the broker"
+        assert all("insufficient cash" in reason for reason in _reasons(unguarded))
 
 
 def test_bar_outcome_shape_is_unchanged() -> None:
