@@ -34,6 +34,13 @@ jobs:
           enable-cache: true
       - run: uv sync --frozen
       - run: uv run mypy
+      # ...and again with the optional live-trading SDK installed. Extras are NOT
+      # part of `uv sync --frozen`, so without this step alpaca-py's real
+      # signatures are never checked and the lazily-imported wrapper is typed
+      # against a missing import. That is exactly how 8 strict-mode errors in
+      # RealAlpacaClient survived to the first live run (ADR-0018 amendment).
+      - run: uv sync --frozen --extra alpaca
+      - run: uv run mypy
 
   unit:
     runs-on: ubuntu-latest

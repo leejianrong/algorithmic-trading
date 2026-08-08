@@ -8,6 +8,8 @@ from __future__ import annotations
 
 from datetime import UTC, datetime, timedelta
 
+import pytest
+
 from trading.data.alpaca_adapter import AlpacaAdapter
 from trading.data.alpaca_client import FakeAlpacaClient
 from trading.interfaces import DataAdapter
@@ -181,3 +183,19 @@ def test_fake_get_bars_serves_intraday_bars_in_range() -> None:
     end = datetime(2026, 1, 2, 15, 30, tzinfo=UTC)
     got = client.get_bars("AAPL", start, end, adjusted=True, interval=timedelta(hours=1))
     assert [b.close for b in got] == [101.0, 102.0]
+
+
+class TestDataFeed:
+    """The market-data tape is a construction property of the client (ADR-0034)."""
+
+    def test_feed_with_an_injected_client_is_rejected(self) -> None:
+        # An injected client already carries its own feed; accepting one here too
+        # would silently ignore it, which is how a live run ends up on a tape the
+        # operator did not pick.
+        client = FakeAlpacaClient({"AAA": []})
+        with pytest.raises(ValueError, match="only when AlpacaAdapter builds its own client"):
+            AlpacaAdapter(client=client, feed="iex")
+
+    def test_no_feed_with_an_injected_client_is_fine(self) -> None:
+        client = FakeAlpacaClient({"AAA": []})
+        assert AlpacaAdapter(client=client) is not None

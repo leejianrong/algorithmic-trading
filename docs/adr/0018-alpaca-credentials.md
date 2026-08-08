@@ -1,8 +1,15 @@
 # ADR-0018: Alpaca credentials via env, and the SDK as an optional lazy dependency
 
-- Status: Accepted
+- Status: Accepted, amended 2026-08-04 (the SDK is now locked as an optional extra)
 - Date: 2026-08-04
 - Deciders: strategy developer (project owner)
+
+> **Amendment (2026-08-04) — the SDK is locked, as an extra.** The decision below
+> that `alpaca-py` is "**not** added to `[project.dependencies]` or
+> `[project.optional-dependencies]`, and `uv.lock` is untouched" was correct for an
+> offline sandbox and is **superseded**. The credentials-from-environment decision,
+> the lazy-import rule, and the `alpaca.*` mypy override all stand unchanged. See
+> "Amendment: locking the SDK" at the end of this file.
 
 ## Context
 
@@ -43,7 +50,10 @@ response into our own `Bar`/DTOs, so despite the SDK being untyped nothing leaks
 **The fake sidesteps secrets entirely.** `FakeAlpacaClient` needs no key, no SDK,
 and no network, so the whole fast test layer (and the coming adapter/broker lanes)
 exercises the seam offline. `RealAlpacaClient` is verified by inspection and types
-only; it is never constructed in this sandbox.
+only; it is never constructed in this sandbox. *(Superseded 2026-08-04 — it is now
+verified by execution against a paper account. Inspection-and-types turned out to
+catch neither of the three runtime bugs nor the eight type errors that first
+execution found; see the amendment below.)*
 
 ## Alternatives considered
 
@@ -67,3 +77,76 @@ only; it is never constructed in this sandbox.
 - The `alpaca.*` mypy override is a deliberate, narrow hole: it silences missing
   imports for that package only, matching the yfinance precedent, and the wrapper
   still returns our concrete types so the hole does not widen into the callers.
+
+## Amendment: locking the SDK (2026-08-04)
+
+### What changed
+
+The build machine has a working network. The sole reason `alpaca-py` was left
+unlocked — "cannot resolve or install in this offline sandbox" — no longer holds,
+and leaving it unlocked had a cost that came due immediately (below).
+
+**`alpaca-py` is now an optional extra**, not a core dependency:
+
+```toml
+[project.optional-dependencies]
+alpaca = ["alpaca-py>=0.33"]
+```
+
+locked additively into `uv.lock` (`alpaca-py` 0.43.5 + `sseclient-py`; no existing
+pin moved). It follows the exact pattern of the `plot` and `dashboard` extras, for
+the same reason those are extras: an offline-first bench must not force a
+live-trading SDK on every install. `uv sync --frozen` does not install extras, so
+the fast gate and every offline path are untouched; a real run needs
+`uv sync --extra alpaca`.
+
+**What is unchanged:** credentials still come only from `ALPACA_API_KEY` /
+`ALPACA_SECRET_KEY` in the environment, never the repo; every `import alpaca...`
+still lives inside `RealAlpacaClient`'s methods, so importing the module still
+never requires the SDK; and a missing install still fails loudly at construction.
+A committed, key-free `.env.example` documents the two variables. `.env` stays
+gitignored.
+
+**The `alpaca.*` mypy override stays.** The SDK still ships no stubs for our
+purposes and is still absent from a default install, so the override still earns
+its place. Only half its rationale changed: "not installed" is now "not installed
+*by default*".
+
+### Why the "verified by inspection and types only" clause had to go
+
+The original decision closed with: "`RealAlpacaClient` is verified by inspection
+and types only; it is never constructed in this sandbox." That was honest about the
+constraint but it quietly became a load-bearing gap. On first execution the wrapper
+had **eight `mypy --strict` errors and three genuine runtime bugs** (ADR-0033,
+ADR-0034) — every one of them reachable on a normal paper run, none of them
+detectable by the gate as configured.
+
+The mechanism is worth recording, because it generalises to every optional
+dependency: CI's `typecheck` job runs `uv sync --frozen`, which installs no extras,
+so mypy resolved `import alpaca...` through the `ignore_missing_imports` override
+and typed the entire SDK surface as `Any`. "Type-checked" therefore meant
+"type-checked against nothing". With the SDK installed, the real signatures show
+that every alpaca-py client method returns `Model | Dict[str, Any]` and that
+`TradeAccount.cash` / `.equity` are `Optional[str]` — so `float(account.cash)`
+was a crash waiting for an omitted field.
+
+So the CI `typecheck` job now runs mypy **twice**: once bare, once after
+`uv sync --frozen --extra alpaca`. An optional dependency that is never installed
+in CI is not type-checked at all, and an untyped seam is exactly where a
+never-executed path hides.
+
+### Consequences of the amendment
+
+- Reproducible installs for live trading: the SDK version is pinned in `uv.lock`
+  rather than being whatever `pip install alpaca-py` happened to fetch.
+- `mypy --strict` now passes in *both* configurations (extra present and absent),
+  and the second is enforced in CI, so the wrapper's types cannot silently rot back
+  to `Any`.
+- The credential-gated integration layer (`tests/integration/test_alpaca_live.py`)
+  replaces "verified by inspection" with "verified by execution". It skips cleanly
+  in CI — no SDK and no credentials there — which is the same property the original
+  decision wanted, now without the blind spot.
+- One residual asymmetry, accepted: CI's `unit` and `integration` jobs still run
+  without the extra, so the *runtime* Alpaca paths remain unexercised in CI. They
+  are exercised by a developer with paper credentials. Automating that would mean
+  putting live credentials in CI secrets, which is not worth it for a paper bench.

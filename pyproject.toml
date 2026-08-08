@@ -19,6 +19,11 @@ plot = ["matplotlib>=3.8"]
 # and uvicorn are imported lazily by trading.dashboard.server (ADR-0023), so the
 # fast gate stays green without them.
 dashboard = ["fastapi>=0.110", "uvicorn>=0.29"]
+# Optional live-trading SDK. Imported lazily inside RealAlpacaClient (ADR-0018),
+# so an offline install never needs it and the fast gate stays green without it;
+# `uv sync --extra alpaca` (plus ALPACA_API_KEY / ALPACA_SECRET_KEY in the
+# environment) is what a real paper/live run requires.
+alpaca = ["alpaca-py>=0.33"]
 
 [project.scripts]
 trading = "trading.cli:app"

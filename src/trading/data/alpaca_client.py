@@ -92,10 +92,25 @@ class AssetInfo:
 
 
 # Order lifecycle statuses we use. Kept as strings (not an enum) so a real
-# Alpaca status string round-trips unchanged through :class:`AlpacaOrder`.
+# Alpaca status string round-trips unchanged through :class:`AlpacaOrder`. The
+# literals below are alpaca-py's ``OrderStatus`` *values*, verified against the
+# installed SDK (0.43.5) rather than assumed -- see ADR-0033.
 STATUS_NEW = "new"
 STATUS_FILLED = "filled"
 STATUS_REJECTED = "rejected"
+STATUS_CANCELED = "canceled"
+STATUS_EXPIRED = "expired"
+STATUS_REPLACED = "replaced"
+
+# Statuses from which an order will never fill any further. Alpaca's other 13
+# statuses (``accepted``, ``new``, ``partially_filled``, ``done_for_day``,
+# ``held``, ``pending_*``, ...) are *working* states: the order may still fill,
+# so a poll must keep waiting rather than give up (ADR-0020, ADR-0033).
+#
+# ``filled`` and ``rejected`` are terminal too, but the broker handles each
+# specially (emit a fill / record a rejection), so they are named separately.
+TERMINAL_UNFILLED_STATUSES = frozenset({STATUS_CANCELED, STATUS_EXPIRED, STATUS_REPLACED})
+TERMINAL_STATUSES = frozenset({STATUS_FILLED, STATUS_REJECTED}) | TERMINAL_UNFILLED_STATUSES
 
 # Exchange string :class:`FakeAlpacaClient` stamps on the assets it invents. It is
 # a placeholder, not a claim about where a symbol really lists.
@@ -244,6 +259,35 @@ class FakeAlpacaClient:
         self._asset_failures.pop(symbol, None)
         return asset
 
+    def set_order_status(
+        self,
+        order_id: str,
+        status: str,
+        *,
+        filled_qty: float | None = None,
+        filled_avg_price: float | None = None,
+    ) -> AlpacaOrder:
+        """Script what the venue *reports* for an order, with no account effects.
+
+        Unlike :meth:`fill_order` (which moves cash and positions), this only
+        rewrites the reported :class:`AlpacaOrder`, because that is exactly what a
+        real venue does when it cancels or expires a working order -- and, for a
+        partially-filled-then-canceled order, the reported quantity legitimately
+        differs from what the order asked for. It is how the broker's terminal
+        status handling gets tested offline (ADR-0033).
+        """
+        order = self._state.orders[order_id]
+        updated = replace(
+            order,
+            status=status,
+            filled_qty=order.filled_qty if filled_qty is None else filled_qty,
+            filled_avg_price=(
+                order.filled_avg_price if filled_avg_price is None else filled_avg_price
+            ),
+        )
+        self._state.orders[order_id] = updated
+        return updated
+
     def set_asset_failure(self, symbol: str, message: str = "asset lookup failed") -> None:
         """Make :meth:`get_asset` raise for ``symbol`` (an unknown ticker or API error)."""
         self._asset_failures[symbol] = message
@@ -390,7 +434,81 @@ class FakeAlpacaClient:
         return total
 
 
-# --- Real: the live SDK wrapper (guarded, lazy, never runs in the sandbox) -----
+# --- Real: reading the SDK's responses safely ---------------------------------
+# Every alpaca-py client method is annotated ``Model | Dict[str, Any]``: the dict
+# arm is what a client constructed with ``raw_data=True`` returns. We never do
+# that, so the dict arm is unreachable -- but it is unreachable by *our*
+# construction, not by the SDK's type, so we assert it loudly instead of
+# assuming it away (ADR-0033).
+
+
+def _require_model[Model](response: Model | dict[str, Any], what: str) -> Model:
+    """Return the SDK model arm of a ``Model | dict`` response, or fail loudly.
+
+    A dict here means the underlying client was built with ``raw_data=True``,
+    which :class:`RealAlpacaClient` never does; getting one back means the SDK's
+    contract changed under us, and reading fields off a dict with ``getattr``
+    would silently produce empty/False values instead (ADR-0028's "absent
+    permission is not permission" would then mislabel every asset).
+    """
+    if isinstance(response, dict):
+        raise TypeError(
+            f"Alpaca returned raw dict data for {what}; RealAlpacaClient expects "
+            "SDK models (it never sets raw_data=True)"
+        )
+    return response
+
+
+class DataSubscriptionError(RuntimeError):
+    """Alpaca refused the request because the account's data plan forbids it.
+
+    Distinct from a transport failure or an unknown symbol: the request was well
+    formed and authenticated, the plan simply does not cover that data. Raised so
+    the paper/live feed fails with an actionable message naming ``--data-feed``
+    instead of a raw SDK traceback (ADR-0034).
+    """
+
+
+# What a data-plan refusal looks like in the API's error body. Alpaca answers
+# HTTP 403 with e.g. ``{"message":"subscription does not permit querying recent
+# SIP data"}``; the free plan hits this for anything inside the last ~15 minutes
+# on the SIP feed, which is exactly what the live paper feed asks for (ADR-0034).
+_SUBSCRIPTION_MARKER = "subscription does not permit"
+
+
+def _classify_data_error(exc: Exception, symbol: str, feed: str | None) -> Exception:
+    """Map an SDK bar-fetch failure to our own error type, or pass it through.
+
+    A data-plan refusal (HTTP 403 + "subscription does not permit") becomes a
+    :class:`DataSubscriptionError` naming the feed that would work; everything
+    else -- auth, rate limit, transport -- propagates unchanged, mirroring how
+    ``get_asset`` keeps "the broker said no" apart from "we could not ask"
+    (ADR-0028).
+    """
+    if _SUBSCRIPTION_MARKER not in str(exc):
+        return exc
+    return DataSubscriptionError(
+        f"Alpaca's data plan does not cover this request for {symbol!r} "
+        f"(feed={feed or 'sip (SDK default)'}): {exc}. "
+        "The free plan serves recent bars only on the IEX feed — pass "
+        "--data-feed iex (paper/live default) or request an older window."
+    )
+
+
+def _require_float(value: str | float | None, what: str) -> float:
+    """Coerce an Alpaca numeric field (often a string) to float, or fail loudly.
+
+    Alpaca sends most numbers as JSON strings and types many of them
+    ``Optional``, so a silent ``float(None)`` crash with no context is a real
+    possibility on a field the venue chose to omit (``TradeAccount.cash`` and
+    ``.equity`` are both ``Optional[str]`` in alpaca-py 0.43.5).
+    """
+    if value is None:
+        raise ValueError(f"Alpaca omitted {what}; cannot use the account without it")
+    return float(value)
+
+
+# --- Real: the live SDK wrapper (guarded, lazy) --------------------------------
 
 
 class RealAlpacaClient:
@@ -403,6 +521,13 @@ class RealAlpacaClient:
     (optionally overridden by constructor arguments); ``paper`` selects the
     paper-trading endpoint. Every method converts SDK responses into our own
     :class:`~trading.types.Bar` and DTOs, so no SDK type escapes this class.
+
+    ``feed`` picks the market-data feed for bar requests (ADR-0034). ``None``
+    leaves the SDK's default (the consolidated SIP tape), which is what a
+    historical backtest wants; a data plan that does not cover recent SIP bars
+    needs ``"iex"`` for anything inside the last ~15 minutes, which is exactly
+    what the live paper feed asks for. The feed is a *construction* property, like
+    the interval (ADR-0022): one client serves one tape.
     """
 
     def __init__(
@@ -411,6 +536,7 @@ class RealAlpacaClient:
         secret_key: str | None = None,
         *,
         paper: bool = True,
+        feed: str | None = None,
     ) -> None:
         key = api_key or os.environ.get("ALPACA_API_KEY")
         secret = secret_key or os.environ.get("ALPACA_SECRET_KEY")
@@ -428,6 +554,25 @@ class RealAlpacaClient:
             ) from exc
         self._data = StockHistoricalDataClient(key, secret)
         self._trading = TradingClient(key, secret, paper=paper)
+        self._feed = feed
+
+    @property
+    def feed(self) -> str | None:
+        """The market-data feed bar requests use (``None`` = the SDK default tape)."""
+        return self._feed
+
+    def _feed_kwargs(self) -> dict[str, Any]:
+        """The ``feed=`` keyword for a bars request, empty when unset (ADR-0034).
+
+        Omitting the keyword entirely -- rather than passing ``None`` -- keeps a
+        default-constructed client's request bytes identical to before this
+        parameter existed, so the historical/backtest path is unchanged.
+        """
+        if self._feed is None:
+            return {}
+        from alpaca.data.enums import DataFeed
+
+        return {"feed": DataFeed(self._feed)}
 
     def get_daily_bars(
         self, symbol: str, start: datetime, end: datetime, *, adjusted: bool = True
@@ -442,9 +587,14 @@ class RealAlpacaClient:
             start=start,
             end=end,
             adjustment=Adjustment.ALL if adjusted else Adjustment.RAW,
+            **self._feed_kwargs(),
         )
-        response = self._data.get_stock_bars(request)
-        rows: list[Any] = response.data.get(symbol, [])
+        try:
+            response = self._data.get_stock_bars(request)
+        except Exception as exc:
+            raise _classify_data_error(exc, symbol, self._feed) from exc
+        barset = _require_model(response, "daily bars")
+        rows: list[Any] = barset.data.get(symbol, [])
         return self._rows_to_bars(symbol, rows)
 
     def get_bars(
@@ -465,9 +615,14 @@ class RealAlpacaClient:
             start=start,
             end=end,
             adjustment=Adjustment.ALL if adjusted else Adjustment.RAW,
+            **self._feed_kwargs(),
         )
-        response = self._data.get_stock_bars(request)
-        rows: list[Any] = response.data.get(symbol, [])
+        try:
+            response = self._data.get_stock_bars(request)
+        except Exception as exc:
+            raise _classify_data_error(exc, symbol, self._feed) from exc
+        barset = _require_model(response, "intraday bars")
+        rows: list[Any] = barset.data.get(symbol, [])
         return self._rows_to_bars(symbol, rows)
 
     @staticmethod
@@ -515,23 +670,29 @@ class RealAlpacaClient:
             side=OrderSide.BUY if side is Side.BUY else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
-        return self._to_order(self._trading.submit_order(request))
+        return self._to_order(_require_model(self._trading.submit_order(request), "submit_order"))
 
     def get_order(self, order_id: str) -> AlpacaOrder:
-        return self._to_order(self._trading.get_order_by_id(order_id))
+        return self._to_order(
+            _require_model(self._trading.get_order_by_id(order_id), "get_order_by_id")
+        )
 
     def get_account(self) -> AccountSnapshot:
-        account = self._trading.get_account()
-        return AccountSnapshot(cash=float(account.cash), equity=float(account.equity))
+        account = _require_model(self._trading.get_account(), "get_account")
+        return AccountSnapshot(
+            cash=_require_float(account.cash, "TradeAccount.cash"),
+            equity=_require_float(account.equity, "TradeAccount.equity"),
+        )
 
     def list_positions(self) -> list[PositionSnapshot]:
+        positions = _require_model(self._trading.get_all_positions(), "get_all_positions")
         return [
             PositionSnapshot(
                 symbol=str(position.symbol),
-                qty=float(position.qty),
-                avg_price=float(position.avg_entry_price),
+                qty=_require_float(position.qty, "Position.qty"),
+                avg_price=_require_float(position.avg_entry_price, "Position.avg_entry_price"),
             )
-            for position in self._trading.get_all_positions()
+            for position in positions
         ]
 
     def get_asset(self, symbol: str) -> AssetInfo:  # pragma: no cover - needs the SDK
@@ -551,7 +712,7 @@ class RealAlpacaClient:
             raise
         if raw is None:
             raise LookupError(f"unknown Alpaca asset {symbol!r}")
-        return self._to_asset(symbol, raw)
+        return self._to_asset(symbol, _require_model(raw, "get_asset"))
 
     @staticmethod
     def _to_asset(symbol: str, raw: Any) -> AssetInfo:  # pragma: no cover - SDK only

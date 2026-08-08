@@ -175,11 +175,44 @@ As of this writing:
   `halted`/`halt_ts`/`halt_reason` (first halt) and adds `halt_episodes`
   (`(halt_ts, reason, resume_ts)`); `result.json`'s `halt` gains `episode_count` +
   `episodes` additively, so `RESULT_SCHEMA_VERSION` stays **1**. Fast gate green.
-- **NOT yet built:** tick frequency and other asset classes (each its own ADR); and
-  locking `alpaca-py` into the dependency set (deferred while the build sandbox is
-  offline). Real Alpaca paper/live-quote runs need `pip install alpaca-py` plus
-  `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment; the dashboard server
-  needs the `dashboard` extra (`uv sync --extra dashboard`). Also open: a
+- **Alpaca live verification — the paper path actually runs now (2026-08-04):** the
+  whole Alpaca path had been merged **without ever being executed** (ADR-0018:
+  "verified by inspection and types only"). It has now been driven against a real
+  paper account. `alpaca-py` is locked as the optional **`alpaca` extra**
+  (`uv sync --extra alpaca`; ADR-0018 amended) — and installing it immediately
+  exposed **8 `mypy --strict` errors**, because CI's `typecheck` job runs
+  `uv sync --frozen` (no extras) so the SDK was typed as `Any`: every client method
+  returns `Model | Dict[str, Any]` (`_require_model` narrows it, failing loudly on
+  the raw-dict arm) and `TradeAccount.cash`/`.equity` are `Optional[str]`
+  (`_require_float` names the field instead of crashing in `float(None)`). CI now
+  type-checks **twice**, the second time with the extra installed. Three real bugs
+  followed, each a failing test then a fix: **(1)** only 2 of Alpaca's 5 terminal
+  order statuses were recognised, so a `canceled`/`expired`/`replaced` order leaked
+  into `_pending` forever and burned the full 30s poll timeout every bar
+  (`TERMINAL_STATUSES`, public `pending_order_ids`, partial fills still emitted —
+  ADR-0033); **(2)** `paper --broker alpaca --live` could not fetch one bar — the
+  live feed polls to `now` and a free data plan answers **HTTP 403** on the SIP tape
+  inside ~15 min, so the feed is now a client construction property with
+  `--data-feed` (live Alpaca defaults to `iex`) and a plan refusal is a classified
+  `DataSubscriptionError`, not a raw traceback (ADR-0034); **(3)** `--live` sessions
+  lost their artifacts, since Ctrl-C is the only exit and it skipped past the
+  equity CSV / `result.json` / summary (`PaperSession.finalize` + a CLI
+  `KeyboardInterrupt` path — ADR-0033). Verified live: account/positions,
+  `get_asset` (the 404→`LookupError` branch really fires; the `AssetExchange.`
+  prefix really needs stripping), daily + 1h bars, raw-vs-adjusted across AAPL's
+  4:1 split (499.30 raw vs 121.08 adjusted), a real fractional fill through
+  `AlpacaBroker`, and a 377-bar live paper session. **Both curated baskets came back
+  100% clean** — `blue20` 20/20, `core10` 10/10 tradable+fractionable (ADR-0024/0028
+  amended; it is a snapshot against one account, not a permanent fact). 23 new
+  integration tests, double-gated on creds **and** SDK, skip cleanly in CI.
+  Still unverified: the market-closed pending/timeout branch against the real venue
+  (covered offline under `FakeClock`; the first live run happened during market
+  hours and took the fill branch).
+- **NOT yet built:** tick frequency and other asset classes (each its own ADR).
+  Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
+  `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
+  the dashboard server needs the `dashboard` extra (`uv sync --extra dashboard`).
+  Also open: a
   **survivorship-bias-free point-in-time universe** (ADR-0027 records the gap; the
   `--source csv` path is the hook), **per-bar rolling liquidity** (the ADV screen is
   point-in-time, judged once before the run), **parameter-stability / heatmap output**
@@ -208,10 +241,17 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   branches `claude/<slice>`. Parallel lanes get their own git worktree so
   in-flight branches never collide, and the landing is serialized through one
   integration commit so `main` stays reviewable.
-  **Caveat, verified 2026-08-05:** GitHub branch protection on `main` is *not*
-  actually enabled (`gh api repos/:owner/:repo/branches/main/protection` → 404).
-  PR-only is honored by convention here, not enforced by the platform — do not
-  rely on the platform to stop a direct push.
+  **Now platform-enforced, as of 2026-08-04.** Branch protection on `main` is on
+  and `enforce_admins` is **true**, so a direct push is rejected for everyone
+  including the repo owner — the previous caveat ("not actually enabled … do not
+  rely on the platform") is obsolete. Required to merge: all six CI checks
+  (`lint`, `typecheck`, `unit`, `integration`, `build`, `security`), a PR (0
+  approvals, so a solo maintainer can self-merge), a branch up to date with `main`
+  (`strict`), linear history, and resolved conversations. Force-pushes and branch
+  deletion are blocked. Inspect with
+  `gh api repos/:owner/:repo/branches/main/protection`; the escape hatch, if a
+  required check can never pass, is to edit protection — an admin can still do
+  that, which is what keeps `enforce_admins: true` from deadlocking a solo repo.
 - **Fast gate before every push.** `make check` must pass; the pre-push hook runs
   it. Bypass only with a scoped reason via `git push --no-verify`.
 - **Layer tests by cost.** Fast layer = no infra, runs everywhere. Integration
@@ -257,7 +297,7 @@ src/trading/
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020)
   report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023)
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
-                           #   (--source, --broker, --interval, @basket, --min-adv, --folds)
+                           #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed)
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
   frequency.py             # Frequency value: label/delta/periods_per_year — interval abstraction (ADR-0022)
@@ -267,7 +307,8 @@ src/trading/
   data/synthetic.py        # deterministic GBM adapter, daily+intraday — offline (ADR-0012/0022);
                            #   range-independent: one canonical series from EPOCH (ADR-0030)
   data/csv_adapter.py      # bring-your-own-data OHLCV CSV DataAdapter (--source csv)
-  data/alpaca_client.py    # AlpacaClient seam + Fake/Real clients (ADR-0017/0018)
+  data/alpaca_client.py    # AlpacaClient seam + Fake/Real clients (ADR-0017/0018);
+                           #   terminal order statuses (ADR-0033) + feed choice (ADR-0034)
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry
@@ -282,4 +323,6 @@ tests/
 docs/adr/         # one decision per file
 ```
 
-Optional extras: `plot` (matplotlib PNG), `dashboard` (fastapi/uvicorn — `uv sync --extra dashboard`).
+Optional extras: `plot` (matplotlib PNG), `dashboard` (fastapi/uvicorn — `uv sync
+--extra dashboard`), `alpaca` (alpaca-py, the live-trading SDK — `uv sync --extra
+alpaca`, plus paper credentials in the environment; ADR-0018).

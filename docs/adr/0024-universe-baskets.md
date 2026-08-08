@@ -109,3 +109,34 @@ drifting map, duplicate tickers, or a single bucket.
   registry — `blue20` becomes their candidate seed, validated live before use.
   More baskets are additive registry entries behind the same two getters and the
   same `@name` CLI sigil.
+
+## Amendment (2026-08-04): both baskets verified against a real broker, once
+
+The decision above says twice that basket tradability is "a **curation, not a
+broker fact**" and "must be verified against the broker before any live use, not
+assumed". ADR-0028 built the `get_asset` seam so that verification could exist;
+`alpaca-py` being locked (ADR-0018 amendment) is what let it finally run.
+
+**Result, 2026-08-04, against one Alpaca paper account:**
+
+| Basket | Usable | Unusable | Unverified |
+|--------|--------|----------|------------|
+| `blue20` | **20 / 20** | 0 | 0 |
+| `core10` | **10 / 10** | 0 | 0 |
+
+Every symbol in both baskets reported `tradable` **and** `fractionable`. The
+curation was right; no basket member needs changing. This closes the ADR-0024 debt
+as *checked*, where before it was *checkable*.
+
+What this does **not** mean, and the docstring is careful to say so: a
+verification is a snapshot against one account at one moment, not a property of
+these lists. Halts, delistings, corporate actions, changes in Alpaca's
+fractional-share coverage, and account tier can each flip a flag without any code
+change here, and results are deliberately not cached (ADR-0028) precisely so a
+stale pass cannot masquerade as a current one. `trading verify-universe --symbols
+@blue20` stays the thing to run before trusting a universe; being clean once is
+evidence, not a guarantee.
+
+Unchanged by this: **survivorship bias (ADR-0027) remains the headline limitation**
+of any curated basket, and broker verification does nothing about it. A universe
+that is 100% tradable today is still 100% today's winners.

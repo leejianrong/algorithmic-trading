@@ -38,6 +38,12 @@ class AlpacaAdapter:
     :meth:`AlpacaClient.get_bars` (ADR-0022). Either way the returned bars satisfy
     the daily-shaped :class:`~trading.interfaces.DataAdapter` protocol — the
     interval is an adapter property, never a ``get_bars`` argument.
+
+    ``feed`` selects the market-data tape for a client this adapter builds itself
+    (ADR-0034); it is rejected alongside an injected ``client``, which carries its
+    own feed. ``None`` keeps the SDK's consolidated-SIP default, which is what a
+    historical backtest wants; the live paper feed passes ``"iex"`` because a free
+    data plan refuses recent SIP bars.
     """
 
     def __init__(
@@ -46,11 +52,14 @@ class AlpacaAdapter:
         *,
         adjusted: bool = True,
         interval: timedelta = timedelta(days=1),
+        feed: str | None = None,
     ) -> None:
         if client is None:
             from trading.data.alpaca_client import RealAlpacaClient
 
-            client = RealAlpacaClient()
+            client = RealAlpacaClient(feed=feed)
+        elif feed is not None:
+            raise ValueError("feed applies only when AlpacaAdapter builds its own client")
         self._client = client
         self._adjusted = adjusted
         self._interval = interval

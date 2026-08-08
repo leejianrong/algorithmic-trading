@@ -51,3 +51,42 @@ def test_bad_date_is_reported() -> None:
     )
     assert result.exit_code == 2
     assert "yyyy-mm-dd" in result.output.lower()
+
+
+class TestDataFeedOption:
+    """``--data-feed`` is an Alpaca-only notion (ADR-0034)."""
+
+    def test_rejected_for_a_non_alpaca_source(self) -> None:
+        # Silently ignoring it would let an operator believe they picked a tape.
+        result = runner.invoke(
+            app,
+            [
+                "paper",
+                "--strategy",
+                "buy_and_hold",
+                "--symbols",
+                "AAA",
+                "--from",
+                "2024-01-02",
+                "--to",
+                "2024-01-10",
+                "--source",
+                "synthetic",
+                "--data-feed",
+                "iex",
+            ],
+        )
+        assert result.exit_code == 2
+        assert "--data-feed applies only to --source alpaca" in result.output
+
+    def test_declared_as_a_paper_option(self) -> None:
+        # Introspect the declared parameter rather than scraping rendered --help:
+        # with colour enabled, rich splits an option name across ANSI escapes
+        # (reproducible locally with FORCE_COLOR=1 COLUMNS=80), so a substring
+        # match on the help text passes on a plain terminal and fails in CI.
+        import typer.main
+
+        command = typer.main.get_command(app)
+        paper_cmd = command.commands["paper"]  # type: ignore[attr-defined]
+        option_names = {name for param in paper_cmd.params for name in param.opts}
+        assert "--data-feed" in option_names
