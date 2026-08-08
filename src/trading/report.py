@@ -58,23 +58,26 @@ def summarize(
     an explicit warning (ADR-0029). Omitted, the block is unchanged.
     """
     metrics = compute(result, periods_per_year, free_parameters=free_parameters)
-    lines = [
-        f"Symbols:       {', '.join(result.symbols)}",
-        f"Starting cash: ${result.starting_cash:,.2f}",
-        f"Final equity:  ${result.final_equity:,.2f}",
-        f"Total return:  {metrics.total_return * 100:+.2f}%",
-        f"Annualized:    {metrics.annualized_return * 100:+.2f}%",
-        f"Sharpe:        {metrics.sharpe:.2f}",
-        f"Sortino:       {metrics.sortino:.2f}",
-        f"Calmar:        {metrics.calmar:.2f}",
-        f"Max drawdown:  {metrics.max_drawdown * 100:.2f}%",
-        f"Avg exposure:  {metrics.avg_exposure * 100:.2f}%",
-        f"Peak exposure: {metrics.peak_exposure * 100:.2f}%",
-        f"Win rate:      {metrics.win_rate * 100:.2f}%",
-        f"Turnover:      {metrics.turnover * 100:.2f}%",
-        f"Trades:        {metrics.trade_count} entry/entries",
-        f"Bars:          {len(result.equity_curve)}",
-    ]
+    lines = [f"Symbols:       {', '.join(result.symbols)}"]
+    lines.extend(_absent_lines(result))
+    lines.extend(
+        [
+            f"Starting cash: ${result.starting_cash:,.2f}",
+            f"Final equity:  ${result.final_equity:,.2f}",
+            f"Total return:  {metrics.total_return * 100:+.2f}%",
+            f"Annualized:    {metrics.annualized_return * 100:+.2f}%",
+            f"Sharpe:        {metrics.sharpe:.2f}",
+            f"Sortino:       {metrics.sortino:.2f}",
+            f"Calmar:        {metrics.calmar:.2f}",
+            f"Max drawdown:  {metrics.max_drawdown * 100:.2f}%",
+            f"Avg exposure:  {metrics.avg_exposure * 100:.2f}%",
+            f"Peak exposure: {metrics.peak_exposure * 100:.2f}%",
+            f"Win rate:      {metrics.win_rate * 100:.2f}%",
+            f"Turnover:      {metrics.turnover * 100:.2f}%",
+            f"Trades:        {metrics.trade_count} entry/entries",
+            f"Bars:          {len(result.equity_curve)}",
+        ]
+    )
     if metrics.trades_per_parameter is not None:
         lines.append(
             f"Trades/param:  {metrics.trades_per_parameter:.1f} "
@@ -103,6 +106,33 @@ def summarize(
         lines.append(f"Halt:          fired at {result.halt_ts.isoformat()} ({reason})")
         lines.extend(_halt_episode_lines(result))
     return "\n".join(lines)
+
+
+def _absent_lines(result: BacktestResult) -> list[str]:
+    """The shrunk-universe caveat: which requested symbols contributed no bars.
+
+    Empty for a run where every symbol had data, so those summaries stay
+    byte-identical. When it is not empty, it sits directly under the ``Symbols:``
+    line rather than with the guardrail counters at the bottom: absence is not an
+    event that happened *during* the run like a clamp or a rejection, it is a
+    correctness caveat on every figure below it — the numbers describe
+    :attr:`~trading.engine.BacktestResult.traded_symbols`, not the universe the
+    operator asked for (ADR-0032).
+
+    Each symbol prints its machine-readable reason code alongside the human
+    detail, because "had not listed yet" and "we could not ask" call for
+    different responses.
+    """
+    if not result.absent:
+        return []
+    traded = result.traded_symbols
+    lines = [
+        f"Traded:        {', '.join(traded) if traded else '(none)'}",
+        f"  ⚠ {len(result.absent)} of {len(result.symbols)} requested symbol(s) "
+        "contributed no bars; every figure below covers the reduced universe",
+    ]
+    lines.extend(f"    {entry.symbol} [{entry.reason}]: {entry.detail}" for entry in result.absent)
+    return lines
 
 
 def _halt_episode_lines(result: BacktestResult) -> list[str]:
@@ -252,6 +282,9 @@ def result_to_dict(
           "rejections": [             # orders a guardrail/broker vetoed
             {"symbol": str, "qty": float, "side": str, "reason": str}, ...
           ],
+          "absent": [                 # requested symbols that contributed no bars
+            {"symbol": str, "reason": str, "detail": str}, ...   # ADR-0032, additive
+          ],
           "halt": {"halted": bool,          # a halt occurred during the run
                    "halt_ts": iso8601 str | null,     # the FIRST halt
                    "halt_reason": str | null,
@@ -264,9 +297,11 @@ def result_to_dict(
                    ]}
         }
 
-    The ``episode_count``/``episodes`` keys are purely additive: every pre-existing
-    key keeps its exact meaning and value, so ``RESULT_SCHEMA_VERSION`` does **not**
-    move (see the constant's note, and ADR-0031).
+    The ``episode_count``/``episodes`` keys (ADR-0031) and the top-level ``absent``
+    list (ADR-0032) are purely additive: every pre-existing key keeps its exact
+    meaning and value — ``symbols`` is still the *requested* universe — so
+    ``RESULT_SCHEMA_VERSION`` does **not** move (see the constant's note). A v1
+    reader that ignores ``absent`` behaves exactly as it did.
 
     Parameters
     ----------
@@ -327,6 +362,12 @@ def result_to_dict(
                 "reason": reason,
             }
             for order, reason in result.rejections
+        ],
+        # A shrunk universe is a caveat on every number in this document, so it is
+        # machine-readable too rather than only in the text summary (ADR-0032).
+        "absent": [
+            {"symbol": entry.symbol, "reason": entry.reason, "detail": entry.detail}
+            for entry in result.absent
         ],
         "halt": {
             "halted": result.halted,
