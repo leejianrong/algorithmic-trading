@@ -227,9 +227,17 @@ class BarOutcome:
     ts: datetime
     fills: list[Fill]
     intents: list[Order | TargetWeight]
+    # Orders the broker actually accepted this bar, at the quantity it was handed
+    # (post-clamp). An order the broker refused at submit is *not* here — it is in
+    # ``broker_rejections`` instead (ADR-0044).
     submitted: list[Order]
     clamps: list[tuple[Order, Order, str]]
     guardrail_rejections: list[tuple[Order, str]]
+    # Everything the broker rejected on this bar, in the order it happened:
+    # settlement rejections first (last bar's orders, ended by the venue), then
+    # submit-time refusals (the duplicate guard, ADR-0036; a venue veto, ADR-0041).
+    # Reporting only — ``Engine._finalize`` merges the broker's own list into
+    # ``BacktestResult.rejections``, so these are copies, never a second tally.
     broker_rejections: list[tuple[Order, str]]
     halted_now: bool
     halted: bool
@@ -389,8 +397,18 @@ class Engine:
         survivors (they fill no earlier than the next bar), and finally mark equity
         and exposure to this close. It mutates ``state`` and returns a per-bar
         :class:`BarOutcome`; a backtest discards the return, paper logs it.
+
+        The broker's rejections are diffed twice — around ``on_bar`` and around each
+        ``submit`` — because a broker can say no at either end of an order's life
+        and the per-bar record is the only real-time view a live session has
+        (ADR-0044).
         """
         # 1. Execute orders queued on the previous bar at this bar's open.
+        #    A broker rejects at two distinct moments and this bar owns both: at
+        #    *settlement* here (an underfunded buy, an order the venue ended —
+        #    ADR-0033) and at *submit* in step 4 below. ``rejections`` is read
+        #    through ``getattr`` because the ``Broker`` protocol does not require it
+        #    (KAN-670); both brokers that have it append ``(Order, reason)``.
         broker_rej_before = len(getattr(self._broker, "rejections", []))
         fills = self._broker.on_bar(bars)
         state.blotter.extend((ts, fill) for fill in fills)
@@ -439,7 +457,23 @@ class Engine:
                 clamp = (order, checked, reason or "clamped by guardrails")
                 state.clamps.append(clamp)
                 bar_clamps.append(clamp)
+            # A broker may refuse an order at *submit* time — the duplicate-order
+            # guard (ADR-0036) and the venue's own veto (ADR-0041) both record a
+            # rejection here rather than raising. Diffing per order rather than per
+            # bar is what keeps the two lists below honest: on a bar with one
+            # refusal and two acceptances, only the refused order is missing from
+            # ``submitted``, and only its reason is reported.
+            submit_rej_before = len(getattr(self._broker, "rejections", []))
             self._broker.submit(checked)
+            refused = list(getattr(self._broker, "rejections", [])[submit_rej_before:])
+            if refused:
+                # Reporting only. ``_finalize`` merges the broker's whole list into
+                # BacktestResult.rejections exactly once, so appending here as well
+                # would count every refusal twice.
+                broker_rejections.extend(refused)
+                continue
+            # ``checked`` — never ``order`` — because the clamped quantity is what
+            # the broker was actually handed.
             submitted.append(checked)
 
         # 5. Mark equity — and gross exposure — to this bar's close.
