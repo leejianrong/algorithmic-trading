@@ -55,6 +55,7 @@ import contextlib
 import csv
 import json
 import logging
+import os
 import signal
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -80,6 +81,7 @@ from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
 from trading.divergence import (
     NOTION_ADJUSTED,
     NOTION_RAW,
+    DivergenceJournal,
     ShadowBroker,
     render_report,
     write_divergence_csv,
@@ -827,7 +829,16 @@ def _format_intent(intent: object) -> str:
 
 
 def _persist_state(path: Path, outcome: BarOutcome, portfolio: Portfolio) -> None:
-    """Overwrite the running-state file with the latest equity and positions."""
+    """Overwrite the running-state file with the latest equity and positions.
+
+    Written to a sibling temp file and moved into place with :func:`os.replace`
+    (ADR-0048). This runs on **every** bar of a live session, so the odds of a
+    crash landing inside the write are not negligible over a day — and a plain
+    ``write_text`` truncates first, which means the failure mode is a *truncated*
+    state file: the one artifact of a killed session that survived, replaced by
+    half of itself. ``os.replace`` is atomic within a filesystem on POSIX, so a
+    reader sees either the previous bar's state or this one's, never neither.
+    """
     state = {
         "ts": outcome.ts.isoformat(),
         "equity": round(outcome.equity, 6),
@@ -839,7 +850,13 @@ def _persist_state(path: Path, outcome: BarOutcome, portfolio: Portfolio) -> Non
             for symbol, pos in portfolio.positions.items()
         },
     }
-    path.write_text(json.dumps(state, indent=2) + "\n")
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        tmp.write_text(json.dumps(state, indent=2) + "\n")
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 @app.command()
@@ -1009,10 +1026,22 @@ def paper(
     # asks for RAW quotes, matching the raw dollars the venue fills in. The --once
     # replay materializes the range through the adapter's default *adjusted* fetch
     # above, so it is labelled as such and never silently mixed with a raw fill.
+    #
+    # The rows are journaled as they settle (ADR-0048). fill_divergence.csv *is*
+    # the measurement a live session exists to collect and nothing else the run
+    # leaves behind can reconstruct it, so it is written incrementally rather than
+    # only after finalize(): a session that dies without unwinding — kill -9, power
+    # loss, a suspended laptop, an unhandled exception — keeps every settled row.
+    divergence_csv = out / "fill_divergence.csv"
     tracked_broker = broker
     shadow: ShadowBroker | None = None
     if divergence:
-        shadow = ShadowBroker(broker, clock, price_notion=NOTION_RAW if live else NOTION_ADJUSTED)
+        shadow = ShadowBroker(
+            broker,
+            clock,
+            price_notion=NOTION_RAW if live else NOTION_ADJUSTED,
+            journal=DivergenceJournal(divergence_csv),
+        )
         tracked_broker = shadow
     engine = Engine(adapter, tracked_broker, Guardrails(risk))
 
@@ -1156,7 +1185,9 @@ def paper(
 
         if shadow is not None:
             records = shadow.divergences
-            divergence_csv = out / "fill_divergence.csv"
+            # Replaces the journal atomically with the canonical file: same rows in
+            # the same order, plus the ones still open at the end (an order parked
+            # at the venue, ADR-0036), which are deliberately never journaled early.
             write_divergence_csv(records, divergence_csv)
             typer.echo("\n" + render_report(shadow.summary, records))
             artifacts.append(f"Fill divergence: {divergence_csv}")
