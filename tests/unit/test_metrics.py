@@ -15,18 +15,26 @@ from typing import ClassVar
 
 import pytest
 
-from trading.engine import EquityPoint
+from trading.engine import BacktestResult, EquityPoint
 from trading.metrics import (
     MIN_TRADES_PER_PARAMETER,
     PerformanceMetrics,
+    align_curves,
+    aligned_returns,
+    alpha,
     annualized_return,
     avg_exposure,
+    beta,
     calmar,
+    compare_to_benchmark,
     compute,
+    correlation,
     daily_returns,
     entry_count,
+    information_ratio,
     max_drawdown,
     peak_exposure,
+    return_per_unit_exposure,
     sharpe,
     sortino,
     total_return,
@@ -34,7 +42,7 @@ from trading.metrics import (
     turnover,
     win_rate,
 )
-from trading.types import Fill, Side
+from trading.types import Fill, Portfolio, Side
 
 
 def _ts(day: int) -> datetime:
@@ -43,6 +51,18 @@ def _ts(day: int) -> datetime:
 
 def _curve(equities: list[float]) -> list[EquityPoint]:
     return [EquityPoint(_ts(i + 1), e) for i, e in enumerate(equities)]
+
+
+def _curve_from(day: int, equities: list[float]) -> list[EquityPoint]:
+    """An equity curve whose first point sits on ``day`` (for misalignment tests)."""
+    return [EquityPoint(_ts(day + i), e) for i, e in enumerate(equities)]
+
+
+def _curve_with_exposure(equities: list[float], exposures: list[float]) -> list[EquityPoint]:
+    return [
+        EquityPoint(_ts(i + 1), e, x)
+        for i, (e, x) in enumerate(zip(equities, exposures, strict=True))
+    ]
 
 
 class TestMonotonicUpCurve:
@@ -427,3 +447,192 @@ class TestComputeSignificance:
         metrics = compute(self._result(60), free_parameters=2)  # type: ignore[arg-type]
         assert metrics.trades_per_parameter == pytest.approx(30.0)
         assert not metrics.underpowered
+
+
+# --- Benchmark-relative metrics (ADR-0037) -----------------------------------
+
+
+def _bench_result(curve: list[EquityPoint]) -> BacktestResult:
+    """A minimal :class:`BacktestResult` wrapper around a hand-built curve."""
+    return BacktestResult(
+        symbols=["AAA"],
+        starting_cash=curve[0].equity,
+        equity_curve=curve,
+        final_portfolio=Portfolio(cash=curve[-1].equity),
+        fills=[],
+    )
+
+
+class TestReturnPerUnitExposure:
+    """Annualized return divided by average gross exposure — the comparability lens."""
+
+    def test_divides_annualized_return_by_average_exposure(self) -> None:
+        curve = _curve_with_exposure([100.0, 110.0, 120.0], [0.5, 0.5, 0.5])
+        expected = annualized_return(curve) / 0.5
+        assert return_per_unit_exposure(curve) == pytest.approx(expected)
+
+    def test_never_invested_is_none_not_zero(self) -> None:
+        # A book that never held anything has no "per unit of exposure" to report;
+        # 0.0 would read as a *bad* result rather than an undefined one.
+        assert return_per_unit_exposure(_curve_with_exposure([100.0, 110.0], [0.0, 0.0])) is None
+
+    def test_reranks_a_lightly_invested_strategy_above_a_fully_invested_one(self) -> None:
+        # The ticket's finding: the 17%-invested book earns less in raw terms but
+        # far more per dollar actually at risk, and only the second view compares.
+        # periods_per_year == the number of return periods, so the annualized
+        # figure equals the total return and the arithmetic stays hand-checkable:
+        # 3% / 0.17 = 17.6% beats 8% / 0.90 = 8.9%.
+        light = _curve_with_exposure([100.0, 101.0, 102.0, 103.0], [0.17] * 4)
+        heavy = _curve_with_exposure([100.0, 103.0, 105.0, 108.0], [0.90] * 4)
+        assert total_return(light) < total_return(heavy)
+        light_per_unit = return_per_unit_exposure(light, periods_per_year=3.0)
+        heavy_per_unit = return_per_unit_exposure(heavy, periods_per_year=3.0)
+        assert light_per_unit == pytest.approx(0.03 / 0.17)
+        assert heavy_per_unit == pytest.approx(0.08 / 0.90)
+        assert light_per_unit is not None and heavy_per_unit is not None
+        assert light_per_unit > heavy_per_unit
+
+
+class TestAlignment:
+    """Curves are paired by timestamp, never positionally (the whole problem)."""
+
+    def test_only_shared_timestamps_survive(self) -> None:
+        own = _curve([100.0, 101.0, 102.0, 103.0])  # days 1-4
+        bench = _curve_from(3, [50.0, 51.0, 52.0])  # days 3-5
+        rows = align_curves(own, bench)
+        assert [row[0] for row in rows] == [_ts(3), _ts(4)]
+        assert [row[1] for row in rows] == [102.0, 103.0]
+        assert [row[2] for row in rows] == [50.0, 51.0]
+
+    def test_offset_curves_are_not_zipped_positionally(self) -> None:
+        # A benchmark that is the strategy's own series shifted two days forward.
+        # Zipping by index would pair every bar with an identical value and report
+        # a perfect correlation; aligning by timestamp finds only two shared days.
+        equities = [100.0, 120.0, 90.0, 130.0, 95.0, 140.0]
+        own = _curve(equities)
+        bench = _curve_from(3, equities)
+        rows = align_curves(own, bench)
+        assert len(rows) == 4  # days 3-6 of the strategy vs days 3-6 of the benchmark
+        assert correlation(own, bench) != pytest.approx(1.0)
+        # Sanity: zipped positionally the two series *are* identical.
+        assert [p.equity for p in own] == [p.equity for p in bench]
+
+    def test_a_gap_in_the_benchmark_bridges_the_step_on_both_sides(self) -> None:
+        own = _curve([100.0, 110.0, 121.0, 133.1])
+        bench = [EquityPoint(_ts(1), 10.0), EquityPoint(_ts(2), 11.0), EquityPoint(_ts(4), 13.31)]
+        own_rets, bench_rets = aligned_returns(own, bench)
+        # Three shared timestamps -> two return periods; the second spans days 2->4
+        # on *both* sides, so the same calendar span is measured either way.
+        assert len(own_rets) == len(bench_rets) == 2
+        assert own_rets[1] == pytest.approx(133.1 / 110.0 - 1.0)
+        assert bench_rets[1] == pytest.approx(13.31 / 11.0 - 1.0)
+
+    def test_disjoint_curves_share_nothing(self) -> None:
+        own = _curve([100.0, 101.0, 102.0])
+        bench = _curve_from(10, [50.0, 51.0, 52.0])
+        comparison = compare_to_benchmark(own, bench)
+        assert comparison.shared_bars == 0
+        assert comparison.beta is None
+        assert comparison.alpha is None
+        assert comparison.correlation is None
+        assert comparison.information_ratio is None
+
+    def test_a_single_shared_bar_yields_no_statistics(self) -> None:
+        own = _curve([100.0, 101.0, 102.0])
+        bench = _curve_from(3, [50.0, 51.0])
+        comparison = compare_to_benchmark(own, bench)
+        assert comparison.shared_bars == 1
+        assert (comparison.beta, comparison.correlation) == (None, None)
+        assert (comparison.alpha, comparison.information_ratio) == (None, None)
+
+
+class TestBenchmarkStatistics:
+    """Beta / alpha / correlation / information ratio against known values."""
+
+    own: ClassVar[list[EquityPoint]] = _curve([100.0, 104.0, 101.0, 107.0, 106.0, 112.0])
+    bench: ClassVar[list[EquityPoint]] = _curve([50.0, 51.0, 50.0, 52.0, 51.5, 53.0])
+
+    def test_beta_matches_an_independent_covariance_reference(self) -> None:
+        own_rets, bench_rets = aligned_returns(self.own, self.bench)
+        expected = statistics.covariance(own_rets, bench_rets) / statistics.variance(bench_rets)
+        assert beta(self.own, self.bench) == pytest.approx(expected)
+
+    def test_correlation_matches_an_independent_reference(self) -> None:
+        own_rets, bench_rets = aligned_returns(self.own, self.bench)
+        expected = statistics.correlation(own_rets, bench_rets)
+        assert correlation(self.own, self.bench) == pytest.approx(expected)
+
+    def test_alpha_is_the_annualized_unexplained_mean_excess(self) -> None:
+        own_rets, bench_rets = aligned_returns(self.own, self.bench)
+        slope = beta(self.own, self.bench)
+        assert slope is not None
+        expected = (statistics.fmean(own_rets) - slope * statistics.fmean(bench_rets)) * 252.0
+        assert alpha(self.own, self.bench) == pytest.approx(expected)
+
+    def test_alpha_scales_linearly_with_periods_per_year(self) -> None:
+        daily = alpha(self.own, self.bench, 252.0)
+        hourly = alpha(self.own, self.bench, 1638.0)
+        assert daily is not None and hourly is not None
+        assert hourly == pytest.approx(daily * (1638.0 / 252.0))
+
+    def test_information_ratio_is_the_sharpe_of_the_active_return(self) -> None:
+        own_rets, bench_rets = aligned_returns(self.own, self.bench)
+        active = [s - b for s, b in zip(own_rets, bench_rets, strict=True)]
+        expected = statistics.fmean(active) / statistics.stdev(active) * sqrt(252.0)
+        assert information_ratio(self.own, self.bench) == pytest.approx(expected)
+
+    def test_identical_curves_give_unit_beta_and_correlation(self) -> None:
+        curve = _curve([100.0, 104.0, 101.0, 107.0])
+        assert beta(curve, curve) == pytest.approx(1.0)
+        assert correlation(curve, curve) == pytest.approx(1.0)
+        assert alpha(curve, curve) == pytest.approx(0.0)
+        # No active return at all: the ratio is undefined, not zero.
+        assert information_ratio(curve, curve) is None
+
+    def test_doubled_returns_give_a_beta_of_two(self) -> None:
+        bench = _curve([100.0, 110.0, 99.0, 108.9])  # +10%, -10%, +10%
+        own = _curve([100.0, 120.0, 96.0, 115.2])  # +20%, -20%, +20%
+        assert beta(own, bench) == pytest.approx(2.0)
+        assert correlation(own, bench) == pytest.approx(1.0)
+
+    def test_flat_benchmark_leaves_the_slope_undefined_but_not_the_info_ratio(self) -> None:
+        # A zero-variance benchmark has no slope to regress against — beta and
+        # correlation are undefined (None), yet the active return still exists.
+        bench = _curve([50.0, 50.0, 50.0, 50.0])
+        comparison = compare_to_benchmark(self.own[:4], bench)
+        assert comparison.beta is None
+        assert comparison.correlation is None
+        assert comparison.alpha is None
+        assert comparison.information_ratio is not None
+
+
+class TestComputeSeparation:
+    """``compute`` describes one run; the comparison is a separate value object."""
+
+    @staticmethod
+    def _result(curve: list[EquityPoint]) -> BacktestResult:
+        return _bench_result(curve)
+
+    def test_performance_metrics_carries_no_benchmark_field(self) -> None:
+        # A benchmark comparison is a relation between two runs, so it is not a
+        # property of this run's metrics (ADR-0037).
+        assert not hasattr(compute(self._result(_curve([100.0, 101.0]))), "benchmark")
+
+    def test_zero_beta_is_a_measurement_absence_is_a_missing_object(self) -> None:
+        # Strategy and benchmark returns are exactly uncorrelated, so beta is 0.0 —
+        # a real measurement. "No benchmark" is the *absence of a
+        # BenchmarkComparison*, which no float can be mistaken for.
+        bench = _curve([100.0, 110.0, 99.0, 108.9, 98.01])  # +10, -10, +10, -10
+        own = _curve([100.0, 110.0, 121.0, 108.9, 98.01])  # +10, +10, -10, -10
+        comparison = compare_to_benchmark(own, bench)
+        assert comparison.beta == pytest.approx(0.0, abs=1e-12)
+        assert comparison.shared_bars == 5
+
+    def test_return_per_unit_exposure_needs_no_benchmark(self) -> None:
+        curve = _curve_with_exposure([100.0, 110.0], [0.5, 0.5])
+        metrics = compute(self._result(curve))
+        assert metrics.return_per_unit_exposure == pytest.approx(annualized_return(curve) / 0.5)
+
+    def test_return_per_unit_exposure_is_none_when_never_invested(self) -> None:
+        metrics = compute(self._result(_curve([100.0, 110.0])))  # exposure defaults to 0.0
+        assert metrics.return_per_unit_exposure is None
