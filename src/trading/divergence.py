@@ -57,15 +57,31 @@ Because the wrapper is a plain :class:`~trading.interfaces.Broker` decorator, th
 engine is untouched and there is no ``if paper:`` anywhere: ADR-0002's one execution
 path stays one path. Wrapping a ``SimulatedBroker`` in a backtest is legal and
 reports zero divergence, which is the mechanism's own null test.
+
+**The rows are written as they settle** (ADR-0048). The comparison is the whole
+point of a live session and it is not reconstructible from anything else the run
+leaves behind, so :class:`DivergenceJournal` appends each row to
+``fill_divergence.csv`` the moment both sides have answered, and the end-of-run
+:func:`write_divergence_csv` replaces that file atomically with the canonical one.
+A session that dies without finalizing — ``SIGKILL``, power loss, a suspended
+laptop, an unhandled exception — therefore keeps every settled row instead of all
+of them. A row is journaled only from :meth:`ShadowBroker._harvest`, i.e. only once
+*neither side can change it again*: an order still parked at the venue (ADR-0036)
+and a fill the venue is about to amend into a partial (ADR-0033) are both still
+open at that point, so the file never contains a row it will later contradict.
+Journal I/O is shadow work like any other — it runs after the live call, inside the
+same ``try/except``, and a full disk or an unwritable path disables the shadow
+rather than costing an order.
 """
 
 from __future__ import annotations
 
 import csv
+import os
 import statistics
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, cast
+from typing import IO, TYPE_CHECKING, Protocol, cast
 
 from trading.broker import SimulatedBroker
 from trading.config import CostConfig
@@ -313,6 +329,20 @@ def summarize(
     )
 
 
+class DivergenceSink(Protocol):
+    """Where settled rows go as they close (ADR-0048).
+
+    Narrow on purpose: :class:`ShadowBroker` hands over rows and learns nothing
+    about files. :class:`DivergenceJournal` is the implementation the CLI uses; a
+    test injects one that raises, which is the only way to prove that adding file
+    I/O to the shadow path still cannot perturb the live one.
+    """
+
+    def append(self, records: Sequence[FillDivergence]) -> None:
+        """Persist ``records``. May raise; the caller treats that as shadow failure."""
+        ...
+
+
 @dataclass(slots=True)
 class _Tracked:
     """One in-flight order and whatever each side has said about it so far."""
@@ -338,6 +368,9 @@ class ShadowBroker:
     portfolio; it defaults to ``SimulatedBroker(snapshot, costs)`` and exists so a
     test can inject a broker that misbehaves (and prove the guard) without
     monkeypatching.
+
+    ``journal``, when given, receives each row the moment it settles (ADR-0048), so
+    a session killed without finalizing keeps the measurement it has already made.
     """
 
     def __init__(
@@ -348,12 +381,18 @@ class ShadowBroker:
         costs: CostConfig | None = None,
         price_notion: str = NOTION_RAW,
         shadow_factory: Callable[[Portfolio], Broker] | None = None,
+        journal: DivergenceSink | None = None,
     ) -> None:
         self._live = live
         self._clock = clock
         self._costs = costs or CostConfig()
         self._price_notion = price_notion
         self._shadow_factory = shadow_factory
+        self._journal = journal
+        # How much of ``_closed`` the journal has already been handed. Advanced only
+        # after a successful append, so a writer that raises re-offers the same rows
+        # rather than losing them (the shadow is disabled by then, so it never does).
+        self._journaled = 0
         self._tracked: list[_Tracked] = []
         self._closed: list[FillDivergence] = []
         self._last_bar_ts: datetime | None = None
@@ -489,6 +528,11 @@ class ShadowBroker:
         self._attribute_live(live_fills, live_rejections, ts, now)
         self._harvest()
         self._last_bar_ts = ts
+        # Last, and only on rows ``_harvest`` has closed: a closed row is final, so
+        # the file on disk never contradicts itself (ADR-0048). Bookkeeping above is
+        # already consistent if this raises, so the disabled shadow still reports
+        # every row it measured through ``divergences``.
+        self._flush_journal()
 
     def _run_shadow(
         self,
@@ -626,6 +670,21 @@ class ShadowBroker:
                 still_open.append(tracked)
         self._tracked = still_open
 
+    def _flush_journal(self) -> None:
+        """Hand every newly closed row to the journal, in settlement order.
+
+        Only closed rows: an order the venue has not answered (ADR-0036's parked
+        order) and a fill that is about to be amended into a partial (ADR-0033) are
+        both still in ``_tracked``, so neither can reach the file as a row that a
+        later bar contradicts. Rows that are still open when the session ends are
+        written by the final :func:`write_divergence_csv` instead.
+        """
+        if self._journal is None or self._journaled == len(self._closed):
+            return
+        fresh = self._closed[self._journaled :]
+        self._journal.append(fresh)
+        self._journaled = len(self._closed)
+
     @staticmethod
     def _close(tracked: _Tracked) -> FillDivergence:
         return FillDivergence(
@@ -721,13 +780,90 @@ def divergence_rows(records: Sequence[FillDivergence]) -> list[dict[str, str]]:
     return rows
 
 
+class DivergenceJournal:
+    """Append settled divergence rows to ``path`` as they close (ADR-0048).
+
+    The file this writes is the same ``fill_divergence.csv`` the end of the run
+    replaces: same header, same columns, same rendering, rows in the same
+    settlement order :attr:`ShadowBroker.divergences` reports them in. So a crashed
+    session's file is a **prefix** of the file it would have finished with, not a
+    different artifact needing different tooling — and it is readable while the
+    session is still running.
+
+    Each :meth:`append` opens, writes, flushes, ``fsync``s and closes. No handle is
+    held between bars, so there is nothing to leak on an exception path and nothing
+    to reopen after a crash; and the ``fsync`` is what separates surviving a killed
+    *process* (a flush would do) from surviving a killed *machine*. The cost is one
+    open/fsync per bar that settled something — on the order of 90 for a session
+    the Monday runbook describes.
+
+    Not atomic per row, and it does not need to be: each row is written with a
+    single small ``write`` to a regular file, which a dying process cannot tear in
+    half, and the final :func:`write_divergence_csv` replaces the whole file anyway.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._rows = 0
+        path.parent.mkdir(parents=True, exist_ok=True)
+        # The header lands immediately, so a session that settles nothing still
+        # leaves a well-formed (empty) CSV rather than a missing file.
+        with path.open("w", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=CSV_COLUMNS).writeheader()
+            _sync(handle)
+
+    @property
+    def path(self) -> Path:
+        return self._path
+
+    @property
+    def rows(self) -> int:
+        """How many rows have been persisted so far."""
+        return self._rows
+
+    def append(self, records: Sequence[FillDivergence]) -> None:
+        """Append ``records`` and make them durable before returning."""
+        if not records:
+            return
+        with self._path.open("a", newline="") as handle:
+            csv.DictWriter(handle, fieldnames=CSV_COLUMNS).writerows(divergence_rows(records))
+            _sync(handle)
+        self._rows += len(records)
+
+
+def _sync(handle: IO[str]) -> None:
+    """Flush Python's buffer *and* the OS's, so the bytes survive the machine.
+
+    ``flush`` alone is enough to survive a killed process — the bytes are already
+    the kernel's. ``fsync`` is what carries them past a lost machine, which is the
+    case ADR-0048 exists for that no signal handler can cover.
+    """
+    handle.flush()
+    os.fsync(handle.fileno())
+
+
 def write_divergence_csv(records: Sequence[FillDivergence], path: Path) -> None:
-    """Write one row per tracked order — including the ones that never filled."""
+    """Write one row per tracked order — including the ones that never filled.
+
+    Written to a sibling temp file and moved into place with :func:`os.replace`,
+    which is atomic within a filesystem on POSIX (ADR-0048). Two reasons, both
+    about the incremental journal this may be replacing: a crash part-way through
+    the final write must not truncate rows that were already safely on disk, and a
+    reader watching the file while the session finishes must never see a partial
+    one.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("w", newline="") as handle:
-        writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
-        writer.writeheader()
-        writer.writerows(divergence_rows(records))
+    tmp = path.with_name(path.name + ".tmp")
+    try:
+        with tmp.open("w", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=CSV_COLUMNS)
+            writer.writeheader()
+            writer.writerows(divergence_rows(records))
+            _sync(handle)
+        os.replace(tmp, path)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def _bps(value: float | None) -> str:
