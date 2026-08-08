@@ -17,15 +17,11 @@ from typing import Any, ClassVar
 
 import pytest
 
-from trading.broker import SimulatedBroker
-from trading.config import RiskConfig
-from trading.data.synthetic import SyntheticAdapter
 from trading.engine import (
     REASON_FETCH_FAILED,
     REASON_NO_BARS,
     AbsentSymbol,
     BacktestResult,
-    Engine,
     EquityPoint,
     HaltEpisode,
 )
@@ -40,9 +36,7 @@ from trading.report import (
     write_equity_png,
     write_result_json,
 )
-from trading.risk import Guardrails
-from trading.strategies import get_strategy
-from trading.types import Fill, Portfolio, Side
+from trading.types import Fill, Order, Portfolio, Side
 
 
 def _ts(day: int) -> datetime:
@@ -609,79 +603,71 @@ class TestResultJsonBenchmarkBlock:
         assert loaded["benchmark_metrics"]["shared_bars"] == 4
 
 
-class TestBenchmarkSilentlyFlat:
-    """The `--benchmark` run can end 100% in cash, and report `+0.00%` (ADR-0037).
+class TestABenchmarkThatNeverInvested:
+    """``+0.00%`` from a benchmark stuck in cash is now labelled, not printed bare.
 
-    Mechanism, not speculation: the benchmark runs `buy_and_hold` under
-    ``RiskConfig.unlimited()``, so nothing clamps its entry. `buy_and_hold` targets
-    ``INVESTED_WEIGHT = 0.998`` and sizes from bar *t*'s **close**, but
-    :class:`~trading.broker.SimulatedBroker` fills at bar *t+1*'s **open** plus 5 bps
-    slippage. An overnight gap up of more than ~25 bps on that one entry bar
-    overshoots the cash, the broker rejects for insufficient funds, and
-    `buy_and_hold` has already set ``_invested`` so it never retries.
+    The bug that produced such a benchmark (an entry sized on bar *t*'s close,
+    filled at bar *t+1*'s open, rejected for insufficient cash, and never retried)
+    is fixed in ``strategies/buy_and_hold.py`` and covered by
+    ``tests/unit/test_benchmark_funding.py``. The *reporting* guarantee lives here
+    and is deliberately independent of that fix: whatever the reason a benchmark
+    ends up flat — a future strategy change, a hand-built curve, a broker that
+    refuses every order — the summary must never present idle cash as a market
+    return (ADR-0037 as amended, KAN-672).
 
-    Scope is data-dependent, not universal — 22 of 50 synthetic seeds over 2018 hit
-    it, which is why it went unnoticed. Under default guardrails the position cap
-    clamps the entry to ~25% of equity and it cannot happen.
-
-    An insufficient-cash rejection is not an exception, so `cli._run_benchmark`'s
-    ``except EmptyUniverseError`` cannot catch it: the run reports a confident
-    ``Benchmark (SPY): +0.00%``.
-
-    The fix belongs in ``strategies/buy_and_hold.py`` / ``broker.py`` / ``cli.py``,
-    outside this slice — so the repro is pinned here as ``xfail(strict=True)``. It
-    stays green in the fast gate and converts to a hard failure the moment the
-    sizing is fixed, which is the signal to move this test next to the fix.
+    The flat benchmark below is constructed directly rather than produced by a
+    run, precisely so this test cannot go quiet the way the old ``xfail`` did.
     """
 
-    SEED = 7
-    START = datetime(2018, 1, 1, tzinfo=UTC)
-    END = datetime(2018, 12, 31, tzinfo=UTC)
-
-    @classmethod
-    def _benchmark_run(cls) -> BacktestResult:
-        """Exactly what ``cli._run_benchmark`` does, on an offline adapter."""
-        adapter = SyntheticAdapter(seed=cls.SEED)
-        broker = SimulatedBroker(Portfolio(cash=1000.0))
-        engine = Engine(adapter, broker, Guardrails(RiskConfig.unlimited()))
-        return engine.run(get_strategy("buy_and_hold"), ["SPY"], cls.START, cls.END)
-
-    def test_the_entry_is_rejected_for_insufficient_cash(self) -> None:
-        """Characterization: this is the observed behaviour today."""
-        result = self._benchmark_run()
-        reasons = [reason for _order, reason in result.rejections]
-        assert any("insufficient cash" in reason for reason in reasons), reasons
-        assert result.fills == []
-
-    @pytest.mark.xfail(
-        strict=True,
-        reason="ADR-0037: entry sized on the close overshoots the next-open fill; "
-        "buy_and_hold never retries, so the benchmark stays in cash. Fix lives in "
-        "buy_and_hold/broker/cli — remove this marker when it lands.",
-    )
-    def test_the_benchmark_actually_invests(self) -> None:
-        """What the benchmark is *supposed* to do: buy once and hold."""
-        result = self._benchmark_run()
-        assert result.fills != []
-        assert max(point.exposure for point in result.equity_curve) > 0.9
-
-    def test_the_new_metrics_make_the_flat_benchmark_loud(self) -> None:
-        """The honesty guarantee this slice does own.
-
-        A flat benchmark has zero variance, so beta / alpha / correlation are
-        undefined and print ``n/a``. Before ADR-0037 the only signal was a bare
-        ``+0.00%``, which reads as a real market that happened to go nowhere.
-        """
-        bench = self._benchmark_run()
-        strat = _result([100.0, 104.0, 101.0, 107.0], exposures=[0.5] * 4)
-        # Align the benchmark onto the strategy's timestamps so the comparison has
-        # a shared span; only the flatness matters here.
-        bench.equity_curve = [
-            EquityPoint(_ts(i + 1), point.equity, point.exposure)
-            for i, point in enumerate(bench.equity_curve[:4])
+    @staticmethod
+    def _flat_benchmark(bars: int = 4) -> BacktestResult:
+        """A benchmark that ran, held nothing, and finished exactly where it began."""
+        bench = _result([1_000.0] * bars, exposures=[0.0] * bars, symbols=["SPY"])
+        bench.rejections = [
+            (
+                Order("SPY", Side.BUY, 0.287874),
+                "insufficient cash: need 1001.54, have 1000.00",
+            )
         ]
-        summary = summarize(strat, bench)
+        return bench
+
+    def test_the_flat_return_is_labelled_as_idle_cash(self) -> None:
+        summary = summarize(
+            _result([100.0, 104.0, 101.0, 107.0], exposures=[0.5] * 4), self._flat_benchmark()
+        )
         assert "Benchmark (SPY): +0.00%" in summary
+        assert "the benchmark never took a position" in summary
+        assert "idle cash" in summary
+
+    def test_the_benchmarks_own_rejection_is_quoted(self) -> None:
+        """``summarize`` counted only the *strategy's* rejections before this."""
+        summary = summarize(
+            _result([100.0, 104.0, 101.0, 107.0], exposures=[0.5] * 4), self._flat_benchmark()
+        )
+        assert "1 benchmark order(s) rejected" in summary
+        assert "insufficient cash: need 1001.54, have 1000.00" in summary
+
+    def test_a_late_entry_says_which_bar_it_started_holding(self) -> None:
+        """Not flat, but idle for a while — the return still understates the market."""
+        bench = _result([1_000.0] * 5, exposures=[0.0, 0.0, 0.0, 0.998, 0.998], symbols=["SPY"])
+        summary = summarize(_result([100.0] * 5, exposures=[0.5] * 5), bench)
+        assert "the benchmark held nothing until bar 4 of 5" in summary
+
+    def test_a_benchmark_that_entered_at_the_first_opportunity_is_silent(self) -> None:
+        """Bar 0 is never exposed (an order placed there fills at bar 1's open)."""
+        bench = _result([1_000.0] * 4, exposures=[0.0, 0.998, 0.998, 0.998], symbols=["SPY"])
+        summary = summarize(_result([100.0] * 4, exposures=[0.5] * 4), bench)
+        assert "⚠" not in summary
+
+    def test_the_undefined_statistics_still_print_n_a(self) -> None:
+        """A flat benchmark has zero variance, so beta/alpha/correlation are n/a.
+
+        ``n/a`` rather than ``0.00`` is ADR-0037's rule; the caveat line above is
+        the amendment's addition, not a replacement for it.
+        """
+        summary = summarize(
+            _result([100.0, 104.0, 101.0, 107.0], exposures=[0.5] * 4), self._flat_benchmark()
+        )
         assert "Beta:          n/a" in summary
         assert "Correlation:   n/a" in summary
 

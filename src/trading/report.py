@@ -131,6 +131,7 @@ def summarize(
             f"Benchmark ({bench_symbol}): {bench_return * 100:+.2f}% "
             f"(strategy {delta * 100:+.2f}% vs benchmark)"
         )
+        lines.extend(_benchmark_deployment_lines(benchmark, bench_metrics))
         comparison = compare_to_benchmark(
             result.equity_curve, benchmark.equity_curve, periods_per_year
         )
@@ -175,6 +176,63 @@ def _absent_lines(result: BacktestResult) -> list[str]:
     ]
     lines.extend(f"    {entry.symbol} [{entry.reason}]: {entry.detail}" for entry in result.absent)
     return lines
+
+
+def _benchmark_rejection_lines(benchmark: BacktestResult) -> list[str]:
+    """The benchmark's own rejected orders — invisible before ADR-0037's amendment.
+
+    ``summarize`` counts the *strategy's* rejections and has never looked at the
+    benchmark's, which is what let a benchmark that could not fund its entry print
+    a confident ``+0.00%``. The first rejection carries the diagnosis (almost
+    always an insufficient-cash entry), so it is quoted verbatim rather than
+    summarized into a count.
+    """
+    if not benchmark.rejections:
+        return []
+    order, reason = benchmark.rejections[0]
+    return [
+        f"    {len(benchmark.rejections)} benchmark order(s) rejected; first: "
+        f"{order.symbol} {order.side.value} {order.qty:g} — {reason}"
+    ]
+
+
+def _benchmark_deployment_lines(
+    benchmark: BacktestResult, bench_metrics: PerformanceMetrics
+) -> list[str]:
+    """Say so when the benchmark did not actually hold the market (ADR-0037 amended).
+
+    A benchmark that never took a position still has an equity curve, a total
+    return, and a tidy ``+0.00%`` — the return on idle cash, printed in the slot
+    where a market return belongs. That is the exact failure mode this bench exists
+    to prevent, and it is worse than a wrong number because the paired bootstrap
+    (ADR-0039) reads the same curve and turns "beats buy-and-hold" into "beats
+    cash" without changing a word of its output.
+
+    Two conditions, both derived from the run rather than from a threshold:
+    zero peak exposure means it never held anything at all, and a first exposed bar
+    later than the first fillable one (index 1 — an order placed on bar 0 fills at
+    bar 1's open, ADR-0001) means it sat in cash for a while first. Neither line
+    appears for a benchmark that entered on the first opportunity and held, so
+    every healthy run's summary is byte-identical.
+    """
+    if bench_metrics.peak_exposure <= 0.0:
+        return [
+            "  ⚠ the benchmark never took a position — the figure above is the return on "
+            "idle cash, not a market return, and every benchmark-relative figure below "
+            "describes a flat line",
+            *_benchmark_rejection_lines(benchmark),
+        ]
+    entered = next(
+        (i for i, point in enumerate(benchmark.equity_curve) if point.exposure > 0.0), None
+    )
+    if entered is not None and entered > 1:
+        return [
+            f"  ⚠ the benchmark held nothing until bar {entered + 1} of "
+            f"{len(benchmark.equity_curve)} — the earlier bars are idle cash, so its "
+            "return understates buy-and-hold over the full span",
+            *_benchmark_rejection_lines(benchmark),
+        ]
+    return []
 
 
 def _stat(value: float | None) -> str:

@@ -154,11 +154,10 @@ thing it compares to. A golden-text regression test pins the no-benchmark summar
   cannot see it and the run reports a confident `+0.00%`.
 
   The new metrics make it loud — a zero-variance benchmark yields `Beta: n/a` and
-  `Correlation: n/a` — where the old single line just said `+0.00%`. The fix is in
-  `strategies/buy_and_hold.py` / `broker.py` / `cli.py`, outside this slice;
-  `tests/unit/test_report.py::TestBenchmarkSilentlyFlat` pins the reproduction as
-  an `xfail(strict=True)` so it converts to a hard failure the moment the fix
-  lands.
+  `Correlation: n/a` — where the old single line just said `+0.00%`. The fix was
+  outside this slice; **it has since landed — see the KAN-672 amendment below**,
+  which also retires the `xfail(strict=True)` reproduction this ADR left behind in
+  `tests/unit/test_report.py::TestBenchmarkSilentlyFlat`.
 - The exposure-adjusted number invites over-reading. It is a comparability lens,
   not a claim about what a levered version would earn; the docstring and this ADR
   say so, but a reader in a hurry will still take it as a return forecast.
@@ -176,3 +175,98 @@ thing it compares to. A golden-text regression test pins the no-benchmark summar
 - Survivorship bias (ADR-0027) and sample size (ADR-0029) still apply to every one
   of these numbers. A beta computed over a curated basket of today's winners is a
   beta of a survivorship-inflated series.
+
+---
+
+## Amendment (2026-08-08, KAN-672): the flat benchmark is fixed, and can no longer be silent
+
+- Status: Accepted
+- Deciders: strategy developer (project owner)
+
+### What changed
+
+The latent bug this ADR *recorded* is now closed. Two changes, and the second is
+independent of the first on purpose.
+
+**1. `buy_and_hold` retries the entry instead of latching it.** The defect was
+never the sizing arithmetic — it was a one-shot entry that could not recover.
+`self._invested = True` was set *before* the intents were returned, so a single
+rejected order ended the strategy's trading life. The strategy now freezes the
+universe and the weights on the first bar exactly as before, and keeps the entry
+intent alive until the position actually exists, latching `_established` only
+then. A leg that *is* held is never re-targeted, so this is a retry of the same
+allocation, never a rebalance: buy-and-hold does not become constant-mix.
+
+The retry has one wrinkle worth stating. Re-asserting a weight of *equity* works
+while the book is flat (equity is the cash), but not once some legs have filled:
+the filled legs have spent the money, so a weight of equity demands cash that is
+gone, and the order is rejected on every remaining bar of the run. Measured on a
+5-symbol synthetic universe over 50 seeds, that naive form produced **260
+rejections** in a single run and still never established the last leg. So a
+retry on a partly-established book is funded from the cash that actually remains
+— the same intent ("split the money equally across the universe"), expressed
+against the money that is actually there, carrying the same `INVESTED_WEIGHT`
+headroom rather than a new constant. When no cash is left the quantity rounds to
+zero and nothing is submitted, so an unfundable leg costs **one** rejection, not
+one per bar. With that, the worst run across the same 50 seeds has 5 rejections
+and every leg established.
+
+The first bar is untouched: on a flat book the weight path is taken and the
+emitted `TargetWeight`s are identical to what they always were, which is why
+every existing golden and e2e expectation stayed green.
+
+**2. A benchmark that fails to invest says so — regardless of the cause.** This
+half is deliberately not conditional on the fix above. `summarize` counted only
+the *strategy's* rejections, so the benchmark's were invisible; it now prints,
+directly under the `Benchmark (…)` line, a caveat when the benchmark's peak
+exposure is zero ("the figure above is the return on idle cash, not a market
+return") or when it held nothing until later than the first fillable bar, quoting
+the benchmark's first rejection verbatim in either case. `cli._run_benchmark`
+additionally warns on stderr for the zero-exposure case, because that is where an
+operator watching a long run looks and a summary scrolls past. Both conditions
+are derived from the run — zero exposure, and an entry later than bar index 1
+(an order placed on bar 0 fills at bar 1's open, ADR-0001) — not from a
+threshold, so a healthy benchmark's summary is byte-identical.
+
+### Measurement
+
+Same 50 synthetic seeds over 2018 that measured the bug: **22 of 50 flat before,
+0 of 50 after.** The worst entry delay is 7 bars of 261 and the worst run has 6
+rejected attempts; the reproduction in the ticket (seed 7) goes from
+`Benchmark (SPY): +0.00%` at 0.00% invested to `+4.48%` at 98.98% invested, with
+the one-bar delay and its rejection printed rather than swallowed.
+
+### Alternatives considered
+
+| Option | Why not |
+|--------|---------|
+| Size the entry with more headroom (lower `INVESTED_WEIGHT`) | A magic number that covers "most" gaps is not a fix. A larger gap still fails, silently, exactly as before — and the headroom is a permanent drag on every healthy run to buy off a rare one. It also leaves the real defect (a one-shot entry) in place. |
+| Run the benchmark under the default guardrails | A 25%-invested buy-and-hold is not a benchmark; it is a different, worse strategy. It would hide the bug by making the entry small enough to fund, and it would make `--benchmark` incomparable with the unconstrained buy-and-hold every reader assumes. Q24's "run it unconstrained" stands. |
+| Let `SimulatedBroker` partially fill an underfunded buy | Changes the execution model for every run to fix one strategy's sizing, and quietly turns a rejection — a fact the operator should see — into a fill of a different size than was ordered. ADR-0004's conservative "reject, record, continue" is right; the strategy is what should react. |
+| Have the strategy read `rejections` off the broker | There is no such seam, and adding one would let every strategy couple to broker internals. The portfolio already tells the strategy what it needs: whether the position exists. |
+| Bound the retry to N attempts | Another magic number, and unnecessary — with the cash-funded retry the loop terminates by itself when the money runs out. |
+| Only fix the reporting, leave `buy_and_hold` alone | Leaves the benchmark wrong 44% of the time on synthetic data and reduces the bench to apologizing for it. |
+| Only fix `buy_and_hold`, skip the reporting | A future change could reintroduce a flat benchmark and it would again print `+0.00%` as a market return. The reporting guard is tested against a hand-built flat benchmark so it cannot go quiet when the strategy improves — the failure mode the original `xfail(strict=True)` was written to avoid. |
+| A new top-level `result.json` key for benchmark health | `benchmark_curve` already carries the truth machine-readably and `benchmark_metrics` already returns `null` statistics for a flat benchmark. The lie was in the *rendered* line, so that is where the correction belongs. Revisit if a consumer needs to branch on it. |
+
+### Consequences for the rest of the bench
+
+- **Existing `buy_and_hold` baseline backtests change only where they were
+  already broken.** A run whose entry cleared on the first attempt produces
+  byte-identical orders, fills, and equity — the whole fast suite (846 tests,
+  including the exact-equity-curve e2e golden and the raw-vs-adjusted
+  backtest/paper parity test) passed unmodified. A run whose entry was rejected
+  now invests a bar or a few later instead of holding cash for the whole span,
+  which is a *correction*, not a regression: the old number was the return on
+  cash. On the 50-seed synthetic panel this moves 22 of 50 benchmark runs.
+- ADR-0039's paired bootstrap now compares against buy-and-hold rather than
+  against cash on those runs, which was the reason this became urgent.
+- The strategy emits a concrete `Order` (not a `TargetWeight`) on a
+  partly-established retry. That is within the `Strategy` seam — both are allowed
+  return types — and the order still passes through sizing, the guardrails, and
+  the broker unchanged.
+- `RESULT_SCHEMA_VERSION` stays **1**: nothing was added to `result.json`.
+- The entry delay is now visible but unbounded. Nothing caps how late a benchmark
+  may enter, and beyond a few bars the comparison is measurably unfair; the
+  summary says which bar it started holding on so a reader can judge, and that is
+  the whole of the guarantee.

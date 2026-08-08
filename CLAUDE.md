@@ -390,6 +390,36 @@ As of this writing:
   sibling test de-adjusts the same fixture by the known 4:1 ratio to prove the floor
   trips. Verified in a network namespace with connectivity removed: the required layer
   passes, the `network` layer fails.
+- **The benchmark stops sitting in cash (2026-08-08, ADR-0037 amended, KAN-672):**
+  `--benchmark` runs `buy_and_hold` unconstrained, and `buy_and_hold` sized its one
+  allocation from bar *t*'s close while the fill lands at bar *t+1*'s open plus 5 bps
+  (ADR-0001/0004). An overnight gap up beyond the ~20 bps of `INVESTED_WEIGHT` headroom
+  overshot the cash, the broker rejected — **recorded, not raised**, so
+  `_run_benchmark`'s `except EmptyUniverseError` could not see it — and the strategy had
+  already latched `_invested`, so **one unlucky bar left the benchmark 100% in cash for
+  the whole run**, printed as a confident `Benchmark (SPY): +0.00%`. Measured: **22 of
+  50** synthetic seeds over 2018. Newly urgent because ADR-0039's paired bootstrap reads
+  that curve, silently turning "beats buy-and-hold" into "beats cash". The defect was the
+  *one-shot entry*, not the arithmetic: the strategy now freezes the universe and weights
+  on the first bar exactly as before but keeps the entry intent alive until the position
+  exists, latching only then. A held leg is never re-targeted, so it stays buy-and-hold
+  rather than becoming constant-mix, and **the first bar is byte-identical** (on a flat
+  book equity *is* the cash, so the same `TargetWeight`s go out) — the entire fast suite
+  passed unmodified. One wrinkle: on a *partly* established book, re-asserting a weight
+  of equity demands cash the filled legs already spent, which measured **260 rejections
+  in one 5-symbol run** and still never established the last leg; a retry there is
+  therefore funded from the cash that actually remains, with the same headroom constant,
+  and rounds to zero — submitting nothing — when the cash is gone. Worst case across the
+  same 50 seeds: 5 rejections, every leg held. **22/50 flat → 0/50**, worst entry delay 7
+  bars of 261. Separately and *independently of that fix*, `summarize` now prints a
+  caveat under the `Benchmark (…)` line when the benchmark's peak exposure is zero ("the
+  return on idle cash, not a market return") or when it held nothing until later than the
+  first fillable bar, quoting the benchmark's own first rejection — which `summarize` had
+  never looked at, counting only the strategy's — and `cli._run_benchmark` warns on
+  stderr for the zero-exposure case. That guard is tested against a hand-built flat
+  benchmark so it cannot go quiet as the strategy improves. `RESULT_SCHEMA_VERSION` stays
+  **1** (nothing added). Known gap: nothing caps *how late* a benchmark may enter — the
+  summary names the bar and leaves the judgement to the reader.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -494,7 +524,8 @@ src/trading/
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020);
                            #   refuses a duplicate while a same-side order is working (ADR-0036)
   report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023);
-                           #   absent-symbol caveat lines + additive `absent` key (ADR-0032)
+                           #   absent-symbol caveat lines + additive `absent` key (ADR-0032);
+                           #   flags a benchmark that never invested (ADR-0037 amended)
   divergence.py            # ShadowBroker: live-vs-modelled fill comparison + report (ADR-0038)
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
                            #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed,
@@ -516,6 +547,7 @@ src/trading/
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022);
                            #   per-symbol fetch guard: retry forever, escalate, never quarantine (ADR-0035)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry
+                           #   buy_and_hold retries its entry until the position exists (ADR-0037 amended)
   universe.py              # curated baskets (blue20) + @name expansion (ADR-0024) + broker verification (ADR-0028)
   liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029)
   metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure,
