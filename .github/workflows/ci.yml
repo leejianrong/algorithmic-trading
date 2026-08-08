@@ -4,10 +4,16 @@ on:
   push:
     branches: [main]
   pull_request:
+  # Nightly, for `integration-network` only — the live provider-contract test that
+  # must not sit on the merge path (ADR-0040). 07:10 UTC, off the top of the hour.
+  schedule:
+    - cron: "10 7 * * *"
+  workflow_dispatch:
 
-# Cancel superseded runs on the same ref (dev-playbook principle 7).
+# Cancel superseded runs on the same ref (dev-playbook principle 7). Keyed on the
+# event too, so a nightly cron on `main` cannot cancel a push run on `main`.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -52,6 +58,12 @@ jobs:
       - run: uv sync --frozen
       - run: uv run pytest # fast layer only (pyproject deselects integration/e2e)
 
+  # REQUIRED check — and therefore offline (ADR-0040). A required check that calls a
+  # third-party API hands that API a veto over every merge: on 2026-08-08 this job
+  # failed with YFRateLimitError while landing PR #40, no code involved, and a bare
+  # re-run cleared it. Nothing here may reach the open internet; the split-guard test
+  # runs off a committed fixture, and the live provider-contract test moved to
+  # `integration-network` below.
   integration:
     runs-on: ubuntu-latest
     steps:
@@ -60,7 +72,23 @@ jobs:
         with:
           enable-cache: true
       - run: uv sync --frozen
-      - run: uv run pytest -m integration
+      - run: uv run pytest -m "integration and not network"
+
+  # NOT a required check, and it does not run on pull requests — every PR run would
+  # spend more of the provider's request budget, which is what makes a rate limit
+  # most likely exactly when the repo is busiest. Nightly + on demand.
+  # DO NOT add this job to branch protection: it never runs on a PR, so requiring it
+  # would deadlock every merge.
+  integration-network:
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --frozen
+      - run: uv run pytest -m network
 
   build:
     runs-on: ubuntu-latest

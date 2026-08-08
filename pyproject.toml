@@ -49,11 +49,17 @@ packages = ["src/trading"]
 # --- Tests: layer by cost (dev-playbook principle 1) --------------------------
 # The default run is the FAST layer only: no network, no external infra.
 # Heavier layers opt in by marker and run in CI (see .github/workflows/ci.yml).
+#
+# `integration` and `network` are layered by *who they can block* (ADR-0040), not
+# only by cost: `integration` runs in CI's required job, so nothing in it may depend
+# on a third-party service we do not control. `network` is that dependency, and it
+# runs nightly in a job that is deliberately NOT a required check.
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = "-ra --strict-markers -m 'not integration and not e2e'"
+addopts = "-ra --strict-markers -m 'not integration and not e2e and not network'"
 markers = [
-    "integration: needs external infra (network / yfinance). CI-only, not in the fast gate.",
+    "integration: needs external infra (broker creds, optional extras) but NOT the open internet. CI-only, not in the fast gate.",
+    "network: talks to a third-party service we do not control (yfinance). Nightly only — never a required check (ADR-0040).",
     "e2e: boots the full stack end to end. CI-only.",
 ]
 

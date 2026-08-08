@@ -1,7 +1,7 @@
 # One-command dev loop (dev-playbook principle 17). Every target is stack-aware
 # via `uv run`, so a newcomer needs only `make setup` then `make check`.
 
-.PHONY: setup install-hooks check lint format typecheck test test-integration test-all audit ci-local
+.PHONY: setup install-hooks check lint format typecheck test test-integration test-network test-all audit ci-local
 
 setup:  ## Install locked deps and the pre-push hook.
 	uv sync --frozen
@@ -29,16 +29,22 @@ test:  ## Fast test layer only (no network, no infra).
 	uv run pytest
 
 # --- Heavier layers: CI-only, opt-in ----------------------------------------
-test-integration:  ## Integration layer (needs network / yfinance).
-	uv run pytest -m integration
+# Split by what can block a merge (ADR-0040): `test-integration` is the REQUIRED
+# CI job and must stay offline; `test-network` is the nightly, non-required one.
+test-integration:  ## Integration layer, offline (needs optional extras / broker creds; no internet).
+	uv run pytest -m "integration and not network"
 
-test-all:  ## Every layer, including integration and e2e.
+test-network:  ## Live provider-contract layer (hits yfinance). Nightly in CI; never gates a merge.
+	uv run pytest -m network
+
+test-all:  ## Every layer, including integration, network and e2e.
 	uv run pytest -o addopts="-ra --strict-markers"
 
 audit:  ## Vulnerability scan of locked dependencies.
 	uv run pip-audit
 
-ci-local:  ## Everything CI runs, locally.
+ci-local:  ## Everything on CI's merge path, locally (the six required checks).
 	$(MAKE) check
 	$(MAKE) test-integration
 	$(MAKE) audit
+	@echo "Merge-path checks done. The nightly live-provider job is: make test-network"
