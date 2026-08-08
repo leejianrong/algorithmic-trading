@@ -151,17 +151,56 @@ second widening ADR-0017 anticipated, after `cancel_order` (ADR-0036).
 ## Consequences
 
 - **`--source alpaca` backtests spanning 2020-08-31 with AAPL in the universe now
-  fail loudly** instead of silently reporting a wrecked Sharpe. That is the point,
-  and it is a behaviour change an operator will notice.
-- **`trading paper --once --source alpaca` is affected.** The `--once` replay
-  materialises `[from, to]` through the adapter's default *adjusted* fetch, so a
-  replay across 2020-08-31 including AAPL now raises. Accepted and stated here
-  rather than discovered: replaying a corrupt series is not a better outcome.
+  report loudly** instead of silently reporting a wrecked Sharpe. The refusal is
+  *not* a traceback: `engine.load_series`'s per-symbol guard (ADR-0032) catches it
+  and turns it into an `AbsentSymbol(reason="fetch_failed")`, so the run continues
+  on the rest of the universe and `report.summarize` prints the whole explanation
+  as a caveat directly under `Symbols:` — where a shrunk universe belongs, because
+  it qualifies every figure below it (ADR-0035). Measured:
+
+  ```
+  Symbols:       AAPL, MSFT
+  Traded:        MSFT
+    ⚠ 1 of 2 requested symbol(s) contributed no bars; every figure below covers the reduced universe
+      AAPL [fetch_failed]: data lookup failed (UnadjustedSplitError: ... 4:1 split of 2020-08-31 ...)
+  ```
+
+  The same text lands in `result.json`'s `absent` list. `RESULT_SCHEMA_VERSION`
+  stays **1** (nothing added). If the corrupt symbol is the *only* symbol, the run
+  ends as the pre-existing `EmptyUniverseError` — a Rich traceback and exit 1,
+  exactly as a mistyped ticker already does on this path (verified against
+  `--symbols ZZZZNOTREAL`); that is unchanged CLI behaviour, not something this
+  guard introduced.
+- **`trading paper --once --source alpaca` IS affected, and less gracefully.** The
+  `--once` replay materialises `[from, to]` through the adapter's default
+  *adjusted* fetch, so a replay across 2020-08-31 including AAPL now fails. It
+  fails as a **raw traceback**, because `cli.py`'s `--once` branch fetches with a
+  bare `{s: adapter.get_bars(s, start, end) for s in tickers}` and has no
+  equivalent of `load_series`'s per-symbol guard — a pre-existing gap that any
+  adapter error already hits on that path (`DataSubscriptionError` from ADR-0034
+  behaves identically there). Accepted and stated here rather than left to be
+  discovered: replaying a corrupt series is not a better outcome, and routing that
+  branch through the same guard belongs to `cli.py`, which is out of this slice's
+  scope. Recorded as a follow-up.
+- **A window with no split in it is untouched.** `backtest --symbols AAPL
+  --from 2023-01-01 --to 2023-06-01 --source alpaca` runs normally (103 bars,
+  +10.16%) with no caveat: the guard is scoped to the corrupt *window*, not the
+  symbol.
 - **`trading paper --live` is untouched.** The live feed is `RecentWindowFeed`,
   whose `adjusted` defaults to `False` (ADR-0021). Verified by driving the exact
   live object graph (5m interval, `@blue20`, IEX feed) against the real provider
   with a counting client: **20 raw bar requests, 0 adjusted requests, 0
   corporate-actions requests**. The guard cannot engage on that path.
+- **Found while verifying that, and NOT part of this slice:**
+  `RecentWindowFeed._FAR_PAST` is `datetime.min`, and Alpaca answers a request
+  starting there with **zero bars** — for both daily and 5m, raw and adjusted.
+  The same request starting at 1900-01-01 returns 121,662 5m bars, and
+  `now - 5d` returns 353. So a live Alpaca poll currently reports every symbol as
+  absent (ADR-0035) on every poll. This is independent of this ADR (it is on the
+  raw path, which this change does not touch, and it reproduces through the
+  unmodified `RealAlpacaClient.get_bars`), but it would stop the Monday run
+  trading. `data/recent_window.py` was outside this slice's file scope; flagged
+  for whoever owns it.
 - **The check self-heals.** When Alpaca reapplies the split, the measured factor
   becomes 4.0, nothing refuses, and the only cost left is one corporate-actions
   request per (symbol, window).
@@ -229,6 +268,10 @@ the market-data adjustment pipeline is not a GitHub-issue surface, so
 - **Apply split adjustments ourselves from the corporate-actions endpoint**
   (option (b)). Now known feasible; deliberately not built in this slice. Would
   turn the refusal into a repair, and would also fix the price-level issue above.
+- **`cli.py`'s `--once` paper branch should fetch through a per-symbol guard**
+  like `engine.load_series` does, so an adapter error there is a reported absence
+  rather than a traceback. Pre-existing (it predates this guard) but newly
+  reachable; `cli.py` was owned by a sibling lane this batch.
 - **Nothing re-checks a cached refusal within a run**: the split cache is
   per-adapter-instance and never expires, which is correct for a single run and
   irrelevant across runs.
