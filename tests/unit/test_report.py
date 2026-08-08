@@ -14,8 +14,21 @@ from typing import Any
 
 import pytest
 
-from trading.engine import BacktestResult, EquityPoint, HaltEpisode
-from trading.report import summarize, write_equity_csv, write_equity_png
+from trading.engine import (
+    REASON_FETCH_FAILED,
+    REASON_NO_BARS,
+    AbsentSymbol,
+    BacktestResult,
+    EquityPoint,
+    HaltEpisode,
+)
+from trading.report import (
+    RESULT_SCHEMA_VERSION,
+    result_to_dict,
+    summarize,
+    write_equity_csv,
+    write_equity_png,
+)
 from trading.types import Fill, Portfolio, Side
 
 
@@ -132,6 +145,87 @@ class TestBenchmarkSummary:
         assert "Benchmark (SPY): +10.00%" in line
         # strategy +30% vs benchmark +10% → +20% delta.
         assert "strategy +20.00% vs benchmark" in line
+
+
+class TestAbsentSymbolLines:
+    """A shrunk universe is a caveat on every number below it, so say so (ADR-0032).
+
+    ``BacktestResult.absent`` was populated but never rendered, so a run whose
+    universe silently lost members read exactly like a clean one.
+    """
+
+    @staticmethod
+    def _shrunk() -> BacktestResult:
+        result = _result([100.0, 101.0], symbols=["AAA", "GHOST", "BOOM"])
+        result.absent = [
+            AbsentSymbol(
+                symbol="GHOST",
+                reason=REASON_NO_BARS,
+                detail="no bars in 2024-01-01..2024-01-31 — not listed in this window",
+            ),
+            AbsentSymbol(
+                symbol="BOOM",
+                reason=REASON_FETCH_FAILED,
+                detail="data lookup failed (ConnectionError: upstream reset)",
+            ),
+        ]
+        return result
+
+    def test_every_absent_symbol_is_named_with_its_machine_readable_reason(self) -> None:
+        text = summarize(self._shrunk())
+        assert "GHOST" in text
+        assert REASON_NO_BARS in text
+        assert "BOOM" in text
+        assert REASON_FETCH_FAILED in text
+
+    def test_absent_details_are_shown_verbatim(self) -> None:
+        text = summarize(self._shrunk())
+        assert "not listed in this window" in text
+        assert "ConnectionError: upstream reset" in text
+
+    def test_requested_and_traded_universes_are_both_visible(self) -> None:
+        text = summarize(self._shrunk())
+        assert "Symbols:       AAA, GHOST, BOOM" in text  # what was asked for
+        assert "Traded:        AAA" in text  # what the numbers actually cover
+
+    def test_it_warns_that_the_figures_cover_the_reduced_universe(self) -> None:
+        text = summarize(self._shrunk())
+        assert "2 of 3 requested symbol(s) contributed no bars" in text
+
+    def test_the_caveat_sits_with_the_universe_not_at_the_bottom(self) -> None:
+        """It qualifies every figure, so it must precede them, not trail them."""
+        lines = summarize(self._shrunk()).splitlines()
+        assert lines[0].startswith("Symbols:")
+        warning = next(i for i, ln in enumerate(lines) if "contributed no bars" in ln)
+        total_return = next(i for i, ln in enumerate(lines) if ln.startswith("Total return:"))
+        assert warning < total_return
+
+    def test_a_full_universe_summary_is_byte_identical(self) -> None:
+        """The backward-compatibility guard: a run with no gaps gains no lines."""
+        text = summarize(_result([100.0, 101.0], symbols=["AAA", "BBB"]))
+        assert "Traded:" not in text
+        assert "contributed no bars" not in text
+
+
+class TestResultJsonAbsent:
+    """``absent`` in result.json — additive, so the schema version does not move."""
+
+    def test_absent_symbols_are_serialized(self) -> None:
+        result = _result([100.0, 101.0], symbols=["AAA", "GHOST"])
+        result.absent = [
+            AbsentSymbol(symbol="GHOST", reason=REASON_NO_BARS, detail="no bars in range")
+        ]
+        document = result_to_dict(result, mode="backtest")
+        assert document["absent"] == [
+            {"symbol": "GHOST", "reason": REASON_NO_BARS, "detail": "no bars in range"}
+        ]
+        # The requested universe keeps its exact old meaning; absence is a new key.
+        assert document["symbols"] == ["AAA", "GHOST"]
+        assert document["schema_version"] == RESULT_SCHEMA_VERSION == 1
+
+    def test_absent_is_an_empty_list_when_nothing_was_missing(self) -> None:
+        document = result_to_dict(_result([100.0, 101.0]), mode="backtest")
+        assert document["absent"] == []
 
 
 class TestEquityCsv:
