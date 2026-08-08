@@ -131,15 +131,34 @@ thing it compares to. A golden-text regression test pins the no-benchmark summar
 
 - `--benchmark` finally pays for itself: the flag now feeds five figures, the
   `result.json`, and a dashboard panel instead of one CSV column and one line.
-- **A latent bug surfaced immediately.** The benchmark run in `cli.py` uses
-  `RiskConfig.unlimited()`, so `buy_and_hold` targets weight 1.0 and the resulting
-  order needs *slightly more* than the full starting cash once slippage and
-  commission are added — `insufficient cash: need 1001.54, have 1000.00`. The
-  order is rejected, and the benchmark stays 100% in cash for the entire run. Every
-  `--benchmark` comparison to date has been against a flat line. The new metrics
-  make this loud (`Beta: n/a`, `Correlation: n/a` — a zero-variance benchmark), where
-  the old single line just said `+0.00%`. The fix is in `cli.py`/`strategies`,
-  outside this slice; it is recorded here and reported for scheduling.
+- **A latent bug surfaced, and its scope is measured rather than asserted.** The
+  benchmark runs `buy_and_hold` under `RiskConfig.unlimited()`, so nothing clamps
+  its entry. `buy_and_hold` targets `INVESTED_WEIGHT = 0.998` — 20 bps of headroom
+  — and sizes the order from **bar `t`'s close**, but `SimulatedBroker` fills it at
+  **bar `t+1`'s open** plus 5 bps slippage (ADR-0001, ADR-0004). When the overnight
+  gap on that one entry bar exceeds roughly 25 bps, the notional overshoots the
+  cash and the broker rejects for insufficient funds. Worked example, synthetic
+  `SPY` seed 7 from 2018-01-01: close 3466.79 → qty 0.287874; open 3477.35 (+0.3045%)
+  × 1.0005 → notional 1001.54 against 1000.00 cash →
+  `insufficient cash: need 1001.54, have 1000.00`. `buy_and_hold` sets
+  `self._invested = True` before returning, so it never retries: **one unlucky
+  entry bar leaves the benchmark 100% in cash for the whole run**, reported as
+  `Benchmark (SPY): +0.00%`.
+
+  Scope, measured on this branch: **22 of 50 synthetic seeds** over 2018 leave the
+  unconstrained benchmark entirely in cash. It is data-dependent, not universal —
+  a run whose second bar happens to gap down or sideways is fine, which is why it
+  went unnoticed. The default-guardrails path is unaffected: the position cap
+  clamps the entry to ~25% of equity, far inside the cash. An insufficient-cash
+  rejection is **not an exception**, so `_run_benchmark`'s `except EmptyUniverseError`
+  cannot see it and the run reports a confident `+0.00%`.
+
+  The new metrics make it loud — a zero-variance benchmark yields `Beta: n/a` and
+  `Correlation: n/a` — where the old single line just said `+0.00%`. The fix is in
+  `strategies/buy_and_hold.py` / `broker.py` / `cli.py`, outside this slice;
+  `tests/unit/test_report.py::TestBenchmarkSilentlyFlat` pins the reproduction as
+  an `xfail(strict=True)` so it converts to a hard failure the moment the fix
+  lands.
 - The exposure-adjusted number invites over-reading. It is a comparability lens,
   not a claim about what a levered version would earn; the docstring and this ADR
   say so, but a reader in a hurry will still take it as a return forecast.

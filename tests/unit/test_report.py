@@ -16,11 +16,15 @@ from typing import Any, ClassVar
 
 import pytest
 
+from trading.broker import SimulatedBroker
+from trading.config import RiskConfig
+from trading.data.synthetic import SyntheticAdapter
 from trading.engine import (
     REASON_FETCH_FAILED,
     REASON_NO_BARS,
     AbsentSymbol,
     BacktestResult,
+    Engine,
     EquityPoint,
     HaltEpisode,
 )
@@ -33,6 +37,8 @@ from trading.report import (
     write_equity_png,
     write_result_json,
 )
+from trading.risk import Guardrails
+from trading.strategies import get_strategy
 from trading.types import Fill, Portfolio, Side
 
 
@@ -598,3 +604,80 @@ class TestResultJsonBenchmarkBlock:
         with path.open() as fh:
             loaded = json.load(fh)
         assert loaded["benchmark_metrics"]["shared_bars"] == 4
+
+
+class TestBenchmarkSilentlyFlat:
+    """The `--benchmark` run can end 100% in cash, and report `+0.00%` (ADR-0037).
+
+    Mechanism, not speculation: the benchmark runs `buy_and_hold` under
+    ``RiskConfig.unlimited()``, so nothing clamps its entry. `buy_and_hold` targets
+    ``INVESTED_WEIGHT = 0.998`` and sizes from bar *t*'s **close**, but
+    :class:`~trading.broker.SimulatedBroker` fills at bar *t+1*'s **open** plus 5 bps
+    slippage. An overnight gap up of more than ~25 bps on that one entry bar
+    overshoots the cash, the broker rejects for insufficient funds, and
+    `buy_and_hold` has already set ``_invested`` so it never retries.
+
+    Scope is data-dependent, not universal — 22 of 50 synthetic seeds over 2018 hit
+    it, which is why it went unnoticed. Under default guardrails the position cap
+    clamps the entry to ~25% of equity and it cannot happen.
+
+    An insufficient-cash rejection is not an exception, so `cli._run_benchmark`'s
+    ``except EmptyUniverseError`` cannot catch it: the run reports a confident
+    ``Benchmark (SPY): +0.00%``.
+
+    The fix belongs in ``strategies/buy_and_hold.py`` / ``broker.py`` / ``cli.py``,
+    outside this slice — so the repro is pinned here as ``xfail(strict=True)``. It
+    stays green in the fast gate and converts to a hard failure the moment the
+    sizing is fixed, which is the signal to move this test next to the fix.
+    """
+
+    SEED = 7
+    START = datetime(2018, 1, 1, tzinfo=UTC)
+    END = datetime(2018, 12, 31, tzinfo=UTC)
+
+    @classmethod
+    def _benchmark_run(cls) -> BacktestResult:
+        """Exactly what ``cli._run_benchmark`` does, on an offline adapter."""
+        adapter = SyntheticAdapter(seed=cls.SEED)
+        broker = SimulatedBroker(Portfolio(cash=1000.0))
+        engine = Engine(adapter, broker, Guardrails(RiskConfig.unlimited()))
+        return engine.run(get_strategy("buy_and_hold"), ["SPY"], cls.START, cls.END)
+
+    def test_the_entry_is_rejected_for_insufficient_cash(self) -> None:
+        """Characterization: this is the observed behaviour today."""
+        result = self._benchmark_run()
+        reasons = [reason for _order, reason in result.rejections]
+        assert any("insufficient cash" in reason for reason in reasons), reasons
+        assert result.fills == []
+
+    @pytest.mark.xfail(
+        strict=True,
+        reason="ADR-0037: entry sized on the close overshoots the next-open fill; "
+        "buy_and_hold never retries, so the benchmark stays in cash. Fix lives in "
+        "buy_and_hold/broker/cli — remove this marker when it lands.",
+    )
+    def test_the_benchmark_actually_invests(self) -> None:
+        """What the benchmark is *supposed* to do: buy once and hold."""
+        result = self._benchmark_run()
+        assert result.fills != []
+        assert max(point.exposure for point in result.equity_curve) > 0.9
+
+    def test_the_new_metrics_make_the_flat_benchmark_loud(self) -> None:
+        """The honesty guarantee this slice does own.
+
+        A flat benchmark has zero variance, so beta / alpha / correlation are
+        undefined and print ``n/a``. Before ADR-0037 the only signal was a bare
+        ``+0.00%``, which reads as a real market that happened to go nowhere.
+        """
+        bench = self._benchmark_run()
+        strat = _result([100.0, 104.0, 101.0, 107.0], exposures=[0.5] * 4)
+        # Align the benchmark onto the strategy's timestamps so the comparison has
+        # a shared span; only the flatness matters here.
+        bench.equity_curve = [
+            EquityPoint(_ts(i + 1), point.equity, point.exposure)
+            for i, point in enumerate(bench.equity_curve[:4])
+        ]
+        summary = summarize(strat, bench)
+        assert "Benchmark (SPY): +0.00%" in summary
+        assert "Beta:          n/a" in summary
+        assert "Correlation:   n/a" in summary
