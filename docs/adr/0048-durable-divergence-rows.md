@@ -245,6 +245,14 @@ rather than an early `equity_curve.csv`.
 - **`fill_divergence.csv` is now readable while the session runs**, which is what
   KAN-712's live dashboard needs. It is not "eventually consistent": the rows in it
   are final.
+- **Two small behaviour changes, both stated rather than discovered later.** The
+  journal truncates `fill_divergence.csv` when the session *starts* rather than when
+  it finishes, so re-running into an `--out` that already holds a run now destroys
+  the old file immediately instead of at finalize. The runbook already says to use a
+  distinct `--out` per session (they overwrite either way); this only moves the
+  moment. And `paper_state.json` is replaced atomically but **not** `fsync`ed: it is
+  rewritten every bar, so syncing it would be a per-bar cost for a convenience
+  snapshot, where the journal syncs only on bars that settled something.
 - **Still open.** `equity_curve.csv` is not incremental (see above). Nothing
   supervises or restarts a session — durability makes a crash cheap, it does not
   make a restart happen, and a restarted session would start a *new* journal rather
