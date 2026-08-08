@@ -205,6 +205,34 @@ As of this writing:
   100% clean** — `blue20` 20/20, `core10` 10/10 tradable+fractionable (ADR-0024/0028
   amended; it is a snapshot against one account, not a permanent fact). 23 new
   integration tests, double-gated on creds **and** SDK, skip cleanly in CI.
+- **A run keeps its information (2026-08-08, offline-verified):** two lanes closing
+  gaps ADR-0032 had recorded against itself. **Paper feed per-symbol guard**
+  (`data/recent_window.py`, ADR-0035) — `RecentWindowFeed.poll` used to fetch in an
+  unguarded loop, so one bad ticker killed a whole paper poll; it now guards each
+  symbol exactly the way `load_series` does, reusing `AbsentSymbol` and the same two
+  reason codes rather than re-declaring them. The asymmetry is the point: a dead
+  backtest is re-runnable, a dead **live session is gone** (it is the one
+  survivorship-free evidence this bench has, ADR-0027), and a session polls the same
+  symbol hundreds of times so a transient failure is a certainty, not an edge case.
+  A symbol is **never quarantined** — every poll retries every requested symbol, so
+  the traded universe cannot silently shrink mid-session; persistence changes the
+  *loudness* only (`absence_streaks`, `persistently_absent` at 3 consecutive misses,
+  log escalating WARNING→ERROR on state change, INFO on recovery). A still-forming
+  bar is not an absence, and a poll where everything fails returns an empty feed
+  rather than raising — the existing `max_empty_polls` still stops a real outage
+  cleanly, with artifacts finalized. **Absent symbols and benchmarks are reported**
+  (`report.py`, `cli.py`) — `summarize` prints a `Traded:` line plus a per-symbol
+  `⚠ … contributed no bars` caveat *directly under* `Symbols:`, because a shrunk
+  universe is a caveat on every figure below it rather than an event like a clamp;
+  `result_to_dict` gains a top-level `absent` list, additive, so
+  `RESULT_SCHEMA_VERSION` stays **1**. And a failing `--benchmark` symbol now costs
+  one warning line instead of the whole command: `cli._run_benchmark` catches
+  `EmptyUniverseError` only — after ADR-0032 every way the benchmark's *data* can
+  fail arrives as that one type, while a broken guardrail or sizing crash still
+  propagates, because that would make the strategy numbers suspect too. Still open
+  from ADR-0035: `trading paper` does not yet surface `feed.absent` /
+  `persistently_absent` in the session summary or `result.json` — a dropped symbol
+  reaches the operator through the log record only.
 - **Market-closed order branch verified live (2026-08-08, ADR-0036):** the one path
   PR #34 could not execute. With the venue shut, a fractional `TimeInForce.DAY`
   market order is **parked at status `accepted`** — not filled, not rejected — which
@@ -315,9 +343,11 @@ src/trading/
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5)
   broker.py                # SimulatedBroker + CostModel
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020)
-  report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023)
+  report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023);
+                           #   absent-symbol caveat lines + additive `absent` key (ADR-0032)
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
-                           #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed)
+                           #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed);
+                           #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032)
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
   frequency.py             # Frequency value: label/delta/periods_per_year — interval abstraction (ADR-0022)
@@ -331,7 +361,8 @@ src/trading/
                            #   terminal order statuses (ADR-0033) + feed choice (ADR-0034)
                            #   + cancel_order, the seam's 6th call (ADR-0036)
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
-  data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022)
+  data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022);
+                           #   per-symbol fetch guard: retry forever, escalate, never quarantine (ADR-0035)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry
   universe.py              # curated baskets (blue20) + @name expansion (ADR-0024) + broker verification (ADR-0028)
   liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029)

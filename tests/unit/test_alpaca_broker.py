@@ -284,7 +284,12 @@ class TestRejectionShape:
 
     def test_rejections_survive_the_result_document(self) -> None:
         # The end-to-end shape check: this is the call that crashed, on the
-        # canonical artifact the dashboard reads (ADR-0023).
+        # canonical artifact the dashboard reads (ADR-0023). Serializing the whole
+        # document -- not just reading the one key -- is deliberate: that is what
+        # `write_result_json` actually does, so a later additive key (ADR-0032's
+        # `absent`, say) stays covered by this test rather than around it.
+        import json
+
         from trading.engine import BacktestResult
         from trading.report import result_to_dict
         from trading.types import Portfolio
@@ -303,6 +308,7 @@ class TestRejectionShape:
         assert document["rejections"] == [
             {"symbol": "AAA", "qty": 2.5, "side": "buy", "reason": broker.rejections[0][1]}
         ]
+        assert json.loads(json.dumps(document))["rejections"] == document["rejections"]
 
     def test_rejection_shape_matches_the_simulated_broker(self) -> None:
         # One execution path (ADR-0002): both brokers feed the same field, so the
