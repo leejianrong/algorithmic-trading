@@ -26,6 +26,17 @@ Three honesty knobs sit on top of that, all opt-in and all off by default:
   broker and reports where the venue's fills differ from the modelled ones —
   price, slippage in bps, latency, and rejections (ADR-0038). Off by default; a
   run without it is byte-identical to before the flag existed.
+- ``backtest --bootstrap`` puts a stationary-block-bootstrap confidence interval
+  around the Sharpe, a paired beats-the-benchmark win rate when ``--benchmark``
+  ran, and the trial-count deflation (ADR-0039). Off by default because the
+  bootstrap is the most expensive thing in the report by an order of magnitude —
+  ~2.7 s on a 21-year daily run — and a cost nobody asked for must never be paid
+  silently. Without the flag the summary and ``result.json`` are exactly what
+  they were before it existed.
+
+``sweep`` needs no flag for its half of ADR-0039: it already ran every trial, so
+the winner's deflation is free and prints under the ranking table. A "best of 24"
+Sharpe quoted without the 24 is the number this bench exists not to print.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -73,8 +84,21 @@ from trading.engine import (
 from trading.frequency import DAILY, Frequency
 from trading.interfaces import Broker, DataAdapter
 from trading.liquidity import DEFAULT_FORMATION_DAYS, screen_by_adv
+from trading.metrics import (
+    DEFAULT_BOOTSTRAP_RESAMPLES,
+    DEFAULT_BOOTSTRAP_SEED,
+    SignificanceReport,
+    assess_significance,
+    trial_count_note,
+)
 from trading.metrics import compute as compute_metrics
-from trading.report import summarize, write_equity_csv, write_equity_png, write_result_json
+from trading.report import (
+    summarize,
+    summarize_significance,
+    write_equity_csv,
+    write_equity_png,
+    write_result_json,
+)
 from trading.risk import Guardrails
 from trading.strategies import free_parameter_count, get_strategy
 from trading.sweep import SweepSummary, WalkForwardSummary, run_sweep, run_walk_forward
@@ -314,6 +338,59 @@ def _run_benchmark(
         return None
 
 
+def _check_bootstrap_options(*, bootstrap: bool, resamples: int) -> None:
+    """Reject a bad ``--bootstrap-resamples`` **before** the backtest runs.
+
+    The bootstrap happens after the engine has finished, so validating it there
+    would let a typo throw away a completed multi-year run and write nothing. The
+    check is gated on ``--bootstrap`` because the count is meaningless without it,
+    exactly as ``--bootstrap-seed`` is.
+    """
+    if bootstrap and resamples < 1:
+        typer.echo(
+            f"error: --bootstrap-resamples must be >= 1, got {resamples}",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+
+def _assess_significance(
+    result: BacktestResult,
+    benchmark: BacktestResult | None,
+    *,
+    periods_per_year: float,
+    resamples: int,
+    seed: int,
+) -> SignificanceReport:
+    """Run the ADR-0039 bootstrap for a finished backtest, or exit 2 on a bad knob.
+
+    The benchmark's curve is what turns on the *paired* win rate — the figure that
+    says whether the strategy beat the alternative rather than merely beating zero —
+    so it is passed through whenever ``--benchmark`` produced a run. When it did not
+    (absent, or warned away by :func:`_run_benchmark`), ``assess_significance``
+    records a note explaining the absence instead of quietly omitting a row.
+
+    Any ``ValueError`` from ``metrics`` is a caller mistake rather than a data
+    shortfall (a data shortfall comes back as a ``None`` block and a note), so it
+    becomes the same clean exit-2 CLI error every other bad option gets instead of
+    a traceback. The one such mistake reachable from here — a resample count below
+    1 — is already caught by :func:`_check_bootstrap_options` before the run
+    starts; this is the backstop that keeps a future guard in ``metrics`` from
+    surfacing raw.
+    """
+    try:
+        return assess_significance(
+            result.equity_curve,
+            benchmark.equity_curve if benchmark is not None else None,
+            periods_per_year,
+            resamples=resamples,
+            seed=seed,
+        )
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+
 @app.command()
 def backtest(
     strategy: str = typer.Option(..., "--strategy", "-s", help="Registered strategy name."),
@@ -389,6 +466,26 @@ def backtest(
         "--adv-window",
         help="Calendar days of pre-backtest history the --min-adv screen measures over.",
     ),
+    bootstrap: bool = typer.Option(
+        False,
+        "--bootstrap/--no-bootstrap",
+        help=(
+            "Bootstrap the Sharpe: a stationary-block confidence interval, the paired "
+            "win rate against --benchmark, and the trial-count deflation (ADR-0039). "
+            "Off by default — it costs ~2.7s on a 21-year daily run."
+        ),
+    ),
+    bootstrap_resamples: int = typer.Option(
+        DEFAULT_BOOTSTRAP_RESAMPLES,
+        "--bootstrap-resamples",
+        help="Resamples per bootstrap figure (needs --bootstrap). Cost is linear in this.",
+    ),
+    bootstrap_seed: int = typer.Option(
+        DEFAULT_BOOTSTRAP_SEED,
+        "--bootstrap-seed",
+        help="Seed for the bootstrap RNG (needs --bootstrap). Printed with the interval, "
+        "so the figure is reproducible.",
+    ),
     plot: bool = typer.Option(
         False, "--plot/--no-plot", help="Also write an equity_curve.png next to the CSV."
     ),
@@ -400,6 +497,7 @@ def backtest(
     end = _parse_date("--to", to)
     tickers = _parse_symbols(symbols)
     freq = _parse_frequency(interval)
+    _check_bootstrap_options(bootstrap=bootstrap, resamples=bootstrap_resamples)
 
     try:
         strat = get_strategy(strategy)
@@ -436,6 +534,22 @@ def backtest(
     if bench_symbol:
         bench_result = _run_benchmark(adapter, bench_symbol, cash=cash, start=start, end=end)
 
+    # The bootstrap is computed ONCE here and handed to both the text summary and
+    # result.json (ADR-0039). Neither derives it: a `result.json` must never
+    # silently pay for thousands of Sharpe computations nobody asked for, and a run
+    # without --bootstrap has to print exactly the bytes it always did.
+    significance = (
+        _assess_significance(
+            result,
+            bench_result,
+            periods_per_year=freq.periods_per_year,
+            resamples=bootstrap_resamples,
+            seed=bootstrap_seed,
+        )
+        if bootstrap
+        else None
+    )
+
     # The strategy's tunable-argument count turns on the trades-per-parameter
     # sample-size check and its warning (ADR-0029).
     free_params = free_parameter_count(strat)
@@ -445,6 +559,7 @@ def backtest(
             bench_result,
             periods_per_year=freq.periods_per_year,
             free_parameters=free_params,
+            significance=significance,
         )
     )
     write_equity_csv(result, out, bench_result)
@@ -462,6 +577,7 @@ def backtest(
         frequency=freq.label,
         metrics=metrics,
         benchmark_curve=bench_result.equity_curve if bench_result is not None else None,
+        significance=significance,
     )
     typer.echo(f"Wrote result JSON to {result_json}")
     if plot:
@@ -883,6 +999,32 @@ def _format_sweep_table(summary: SweepSummary, rank_by: str, param_keys: list[st
     return "\n".join(lines)
 
 
+def _sweep_significance_block(summary: SweepSummary, rank_by: str, periods_per_year: float) -> str:
+    """The winner's trial-count deflation, rendered exactly as ``backtest`` renders it.
+
+    A sweep's headline is the *maximum* of everything it ran, and a maximum of N
+    draws beats zero even when not one of the N has an edge. This scores the winner
+    against the Sharpe the luckiest skill-free candidate would have shown, using the
+    same :func:`~trading.report.summarize_significance` renderer the backtest
+    summary uses so the two commands can never grow divergent wordings for the same
+    statistic.
+
+    No bootstrap runs here and none is needed: a sweep keeps each trial's
+    :class:`~trading.metrics.ReturnMoments`, not its curve, and the deflation is
+    arithmetic on those — so this block costs nothing and is therefore *not* behind
+    ``--bootstrap``, unlike the interval on a single backtest.
+
+    ``""`` when the summary has no runs, or when the winner's moments were not
+    recorded — an honest absence rather than a fabricated figure.
+    """
+    deflated = summary.deflated_winner(rank_by, periods_per_year)
+    if deflated is None:
+        return ""
+    return summarize_significance(
+        SignificanceReport(deflated=deflated, notes=[trial_count_note(deflated.trials)])
+    )
+
+
 def _format_param(value: object) -> str:
     """Compact rendering of one parameter value for the table (empty for None)."""
     if value is None:
@@ -1066,6 +1208,9 @@ def sweep(
             f"combos={len(summary.runs)} ranked by {rank_by}\n"
         )
         typer.echo(_format_sweep_table(summary, rank_by, param_keys))
+        deflation = _sweep_significance_block(summary, rank_by, freq.periods_per_year)
+        if deflation:
+            typer.echo("\n" + deflation)
         _write_sweep_csv(summary, out, rank_by, param_keys)
         typer.echo(f"\nWrote sweep results to {out}")
 

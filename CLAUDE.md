@@ -293,6 +293,43 @@ As of this writing:
   open), so there are **zero real paired fills** behind the 5 bps question so far.
   Wanted next: a `divergence` block in `result.json` + a dashboard panel (additive;
   `divergence_rows` already emits the flat shape).
+- **Is the Sharpe a measurement or a point estimate? (2026-08-08, ADR-0039):** every
+  headline figure the bench printed — Sharpe, Sortino, Calmar, alpha — was a point
+  estimate rendered to two decimals, a format that reads as a measurement. `metrics.py`
+  now qualifies it three ways. **A stationary block bootstrap** (`sharpe_confidence_interval`,
+  Politis & Romano: geometric block lengths, default 60 bars) brackets the Sharpe with a
+  percentile interval; resampling *individual* returns instead would destroy the serial
+  structure a trend edge consists of and hand back a **narrower**, more confident answer
+  from less information (measured on the AR(1) fixture: width 2.975 with 60-bar blocks vs
+  1.966 i.i.d. — the inequality is pinned by a test). **A paired win rate**
+  (`paired_bootstrap`) answers "beats the benchmark in X% of resamples" by drawing **one**
+  index sequence per resample and applying it to *both* series — resampling them
+  independently compares the strategy in one imaginary market against the benchmark in a
+  different one, and the guard fixture (strategy = benchmark + a constant, so its Sharpe is
+  higher *by construction*) drops from 1.0 to 0.585 the moment you do. **Trial deflation**
+  (`SweepSummary.trial_count` / `deflated_winner()`, Bailey & López de Prado's
+  `expected_max_sharpe` + `probabilistic_sharpe_ratio`) scores a search's winner against
+  the Sharpe the luckiest of N skill-free trials would have shown — and the correction
+  bites through the candidates' *spread*, not merely their count. Honesty rails throughout:
+  below `MIN_BOOTSTRAP_OBSERVATIONS = 30` return periods there is **no** interval and a note
+  saying why; a short series gets its block length cut and the reduction is printed, not
+  hidden; an interval straddling zero says in words that the sample cannot distinguish the
+  strategy from having no edge; and the trial count **always** prints the caveat that it
+  covers one invocation and is a **LOWER BOUND** (`metrics.trial_count_note`, shared by the
+  backtest and sweep paths so the sentence cannot drift). Determinism is part of the API:
+  every entry point takes an explicit `seed` (`DEFAULT_BOOTSTRAP_SEED = 20260808`), builds
+  its own `random.Random`, never touches the module-global RNG, and prints the seed.
+  **Wired to the CLI (KAN-675):** `backtest --bootstrap` (plus `--bootstrap-resamples` /
+  `--bootstrap-seed`) computes the block **once** and hands it to both `summarize` and
+  `write_result_json`; it is **off by default** because the 1,000-resample default costs
+  ~2.7 s on a 21-year daily run, and neither `summarize` nor `result_to_dict` ever derives
+  it internally — writing a `result.json` must not silently pay for a bootstrap nobody
+  asked for. Without the flag the summary and `result.json` are byte-identical to before
+  (pinned by a literal golden in `test_report.py` and a CLI-level identity test).
+  `sweep` needs no flag: it already ran every trial and kept each one's `ReturnMoments`, so
+  the winner's deflation is free arithmetic and prints under the ranking table always.
+  `result.json` gains one additive top-level `significance` key (null when not requested),
+  so `RESULT_SCHEMA_VERSION` stays **1**.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -303,7 +340,13 @@ As of this writing:
   point-in-time, judged once before the run), **parameter-stability / heatmap output**
   from a sweep, and **regime-split metrics**. The **paper-vs-simulated fill
   divergence report** is built (ADR-0038) but has only ~one live paired fill behind
-  it — the mechanism is done, the *evidence* about 5 bps is not.
+  it — the mechanism is done, the *evidence* about 5 bps is not; its `result.json`
+  block and dashboard panel are still unbuilt (additive; `divergence_rows` already
+  emits the flat shape). Three ADR-0039 gaps stay open too: `paper` has no
+  `--bootstrap` (only `backtest` does), `--folds` walk-forward prints no deflation of
+  its own, and there is **no cross-invocation trial ledger** — the tool sees one
+  command, so an operator who tried six strategies by hand has made 36 trials and the
+  tool will report 1. It says so every time; it cannot do better alone.
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -385,7 +428,8 @@ src/trading/
                            #   absent-symbol caveat lines + additive `absent` key (ADR-0032)
   divergence.py            # ShadowBroker: live-vs-modelled fill comparison + report (ADR-0038)
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
-                           #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed);
+                           #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed,
+                           #    --divergence, --bootstrap);
                            #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032)
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
@@ -406,8 +450,12 @@ src/trading/
   universe.py              # curated baskets (blue20) + @name expansion (ADR-0024) + broker verification (ADR-0028)
   liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029)
   metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure,
-                           #   entry count + trades-per-parameter significance (ADR-0029)
-  sweep.py                 # parameter sweep (ADR-0016) + true IS->OOS walk-forward (ADR-0026)
+                           #   entry count + trades-per-parameter significance (ADR-0029);
+                           #   benchmark-relative beta/alpha/correlation/IR (ADR-0037);
+                           #   Sharpe significance (ADR-0039): stationary block bootstrap CI,
+                           #   paired win rate, deflated Sharpe — seeded, never the global RNG
+  sweep.py                 # parameter sweep (ADR-0016) + true IS->OOS walk-forward (ADR-0026);
+                           #   trial_count + deflated_winner() — best-of-N is not a finding (ADR-0039)
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)
