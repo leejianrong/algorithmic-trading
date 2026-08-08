@@ -22,6 +22,10 @@ Three honesty knobs sit on top of that, all opt-in and all off by default:
   switch **re-arm** instead of latching for the whole run (ADR-0031) — the
   difference between a protected 20-year backtest and one disabled from 2001
   onward. Both off by default, on ``backtest``, ``paper``, and ``sweep``.
+- ``paper --divergence`` runs a counterfactual ``SimulatedBroker`` beside the live
+  broker and reports where the venue's fills differ from the modelled ones —
+  price, slippage in bps, latency, and rejections (ADR-0038). Off by default; a
+  run without it is byte-identical to before the flag existed.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -51,6 +55,13 @@ from trading.data.recent_window import (
 )
 from trading.data.synthetic import SyntheticAdapter
 from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
+from trading.divergence import (
+    NOTION_ADJUSTED,
+    NOTION_RAW,
+    ShadowBroker,
+    render_report,
+    write_divergence_csv,
+)
 from trading.engine import (
     DEFAULT_PAPER_LOOKBACK,
     BacktestResult,
@@ -621,6 +632,13 @@ def paper(
         "--source alpaca (a free data plan refuses recent SIP bars), else the "
         "SDK's consolidated-SIP default.",
     ),
+    divergence: bool = typer.Option(
+        False,
+        "--divergence/--no-divergence",
+        help="Run a counterfactual SimulatedBroker beside the live broker and report "
+        "where the fills diverge — price, slippage bps, latency, rejections "
+        "(ADR-0038). Off by default; enabling it never touches the live path.",
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/paper"), "--out", help="Result directory."),
 ) -> None:
@@ -664,7 +682,6 @@ def paper(
         data_feed = "iex"
     adapter = _make_adapter(source, cache_dir, seed, freq, data_feed)
     broker = _make_paper_broker(broker_name, live, cash)
-    engine = Engine(adapter, broker, Guardrails(risk))
 
     # The clock and feed are the *only* difference between backtest and paper
     # (ADR-0002/0014). Live: wall clock over a recent-window feed, runs until
@@ -687,6 +704,23 @@ def paper(
         clock = FakeClock(end + timedelta(days=1))
         feed = RecentWindowFeed(FakeAdapter(all_bars), clock, is_complete)
         run_kwargs = {"max_empty_polls": 1}
+
+    # Divergence tracking is a Broker *decorator*, so the engine, the strategy, and
+    # the guardrails are untouched and there is no mode branch inside the shared
+    # step (ADR-0002/0038). Off by default: with --no-divergence the wrapper is
+    # never constructed and the run is exactly what it was before this flag.
+    #
+    # The price notion is whatever the feed is serving (ADR-0021, and the reason a
+    # divergence number can be meaningless): --live polls RecentWindowFeed, which
+    # asks for RAW quotes, matching the raw dollars the venue fills in. The --once
+    # replay materializes the range through the adapter's default *adjusted* fetch
+    # above, so it is labelled as such and never silently mixed with a raw fill.
+    tracked_broker = broker
+    shadow: ShadowBroker | None = None
+    if divergence:
+        shadow = ShadowBroker(broker, clock, price_notion=NOTION_RAW if live else NOTION_ADJUSTED)
+        tracked_broker = shadow
+    engine = Engine(adapter, tracked_broker, Guardrails(risk))
 
     session = PaperSession(engine, strat, tickers, feed, clock, lookback=lookback, frequency=freq)
 
@@ -733,11 +767,22 @@ def paper(
             free_parameters=free_params,
         )
     )
+    artifacts = [
+        f"Session log: {log_path}",
+        f"Running state: {state_path}",
+        f"Equity curve: {csv_path}",
+        f"Result JSON: {result_json}",
+    ]
+
+    if shadow is not None:
+        records = shadow.divergences
+        divergence_csv = out / "fill_divergence.csv"
+        write_divergence_csv(records, divergence_csv)
+        typer.echo("\n" + render_report(shadow.summary, records))
+        artifacts.append(f"Fill divergence: {divergence_csv}")
+
     typer.echo(f"\nProcessed {len(session.session_log)} completed bar(s).")
-    typer.echo(
-        f"Session log: {log_path}\nRunning state: {state_path}\n"
-        f"Equity curve: {csv_path}\nResult JSON: {result_json}"
-    )
+    typer.echo("\n".join(artifacts))
 
 
 def _coerce_param_value(token: str) -> object:
