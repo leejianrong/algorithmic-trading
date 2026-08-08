@@ -205,7 +205,7 @@ As of this writing:
   100% clean** — `blue20` 20/20, `core10` 10/10 tradable+fractionable (ADR-0024/0028
   amended; it is a snapshot against one account, not a permanent fact). 23 new
   integration tests, double-gated on creds **and** SDK, skip cleanly in CI.
-- **Market-closed order branch verified live (2026-08-08, ADR-0035):** the one path
+- **Market-closed order branch verified live (2026-08-08, ADR-0036):** the one path
   PR #34 could not execute. With the venue shut, a fractional `TimeInForce.DAY`
   market order is **parked at status `accepted`** — not filled, not rejected — which
   is correctly non-terminal, so the poll times out cleanly and the id stays in
@@ -227,7 +227,7 @@ As of this writing:
   Account left flat. Still open: an order that *expires* overnight (same code path as
   `canceled`, not yet watched), and **duplicate order stacking** — while orders sit
   parked the portfolio stays flat, so a target-weight strategy re-emits the same order
-  every bar and the broker submits it again; needs its own slice (ADR-0035).
+  every bar and the broker submits it again; needs its own slice (ADR-0036).
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -329,7 +329,7 @@ src/trading/
   data/csv_adapter.py      # bring-your-own-data OHLCV CSV DataAdapter (--source csv)
   data/alpaca_client.py    # AlpacaClient seam + Fake/Real clients (ADR-0017/0018);
                            #   terminal order statuses (ADR-0033) + feed choice (ADR-0034)
-                           #   + cancel_order, the seam's 6th call (ADR-0035)
+                           #   + cancel_order, the seam's 6th call (ADR-0036)
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022)
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry

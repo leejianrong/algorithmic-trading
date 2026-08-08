@@ -58,7 +58,7 @@ class AlpacaBroker:
     :attr:`rejections` holds ``(Order, reason)`` exactly as
     :class:`~trading.broker.SimulatedBroker` does, because
     :class:`~trading.engine.Engine` merges both into the same
-    ``BacktestResult.rejections`` (ADR-0035).
+    ``BacktestResult.rejections`` (ADR-0036).
     """
 
     def __init__(
@@ -77,7 +77,7 @@ class AlpacaBroker:
         self._poll_interval = poll_interval
         self._pending: list[str] = []
         # What each pending order id was asked to do, so a rejection can name the
-        # Order rather than the id (ADR-0035): BacktestResult.rejections and
+        # Order rather than the id (ADR-0036): BacktestResult.rejections and
         # report.result_to_dict both read order.symbol / .qty / .side.
         self._requested: dict[str, Order] = {}
         self.rejections: list[tuple[Order, str]] = []

@@ -256,7 +256,7 @@ class TestGetAsset:
 
 
 class TestCancelOrder:
-    """The seam's sixth call (ADR-0017's anticipated widening, ADR-0035).
+    """The seam's sixth call (ADR-0017's anticipated widening, ADR-0036).
 
     Every behaviour asserted here was observed against the live paper venue with
     the market closed, not guessed: a working order cancels to ``canceled``, a

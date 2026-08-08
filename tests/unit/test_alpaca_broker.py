@@ -248,7 +248,7 @@ class TestTerminalStatuses:
 class TestRejectionShape:
     """A rejection is ``(Order, reason)`` -- the shape the result document reads.
 
-    Found by driving the market-closed branch against the live venue (ADR-0035).
+    Found by driving the market-closed branch against the live venue (ADR-0036).
     ADR-0033 made a ``canceled`` / ``expired`` / ``replaced`` order settle and be
     *reported*, but it recorded the order **id** as the tuple's first element while
     :class:`~trading.broker.SimulatedBroker`, ``BacktestResult.rejections``, and

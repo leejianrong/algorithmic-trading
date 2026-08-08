@@ -159,7 +159,7 @@ class AlpacaClient(Protocol):
         ...
 
     def cancel_order(self, order_id: str) -> None:
-        """Ask the venue to cancel a working order (ADR-0035).
+        """Ask the venue to cancel a working order (ADR-0036).
 
         The sixth call on the seam, and the widening ADR-0017 anticipated. It is
         what lets an operator (or a test) clear an order the venue has *parked* --
@@ -384,7 +384,7 @@ class FakeAlpacaClient:
     def cancel_order(self, order_id: str) -> None:
         """Mark a working order ``canceled``; a terminal one is left alone.
 
-        Mirrors what the live paper venue was observed to do (ADR-0035): a repeat
+        Mirrors what the live paper venue was observed to do (ADR-0036): a repeat
         cancel is accepted silently rather than raising, and any partial fill the
         order already got stays on the record so the broker can still emit it.
         Unlike the venue, the transition is immediate -- there is no clock here.
@@ -713,7 +713,7 @@ class RealAlpacaClient:
         )
 
     def cancel_order(self, order_id: str) -> None:
-        """Cancel a working order at the venue (ADR-0035).
+        """Cancel a working order at the venue (ADR-0036).
 
         The SDK's ``cancel_order_by_id`` returns ``None`` and the order reaches
         ``canceled`` a moment later, so this returns nothing and callers re-read

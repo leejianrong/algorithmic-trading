@@ -1,4 +1,4 @@
-# ADR-0035: The market-closed order branch, and what a rejection is made of
+# ADR-0036: The market-closed order branch, and what a rejection is made of
 
 - Status: Accepted
 - Date: 2026-08-08

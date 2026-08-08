@@ -427,7 +427,7 @@ class TestOrderLifecycle:
 
 @_needs_live
 class TestMarketClosedOrder:
-    """The pending/timeout branch, driven against the real venue (ADR-0035).
+    """The pending/timeout branch, driven against the real venue (ADR-0036).
 
     ADR-0033 shipped the terminal-status classification but recorded, honestly,
     that "the market-closed pending/timeout branch of the real broker" had never
@@ -559,7 +559,7 @@ class TestMarketClosedOrder:
             assert broker.pending_order_ids == ()  # the id is evicted
             assert elapsed < 4.0, "a terminal order must settle without waiting out the timeout"
 
-            # Reported, not silently dropped -- and shaped for result.json (ADR-0035).
+            # Reported, not silently dropped -- and shaped for result.json (ADR-0036).
             assert len(broker.rejections) == 1
             order, reason = broker.rejections[0]
             assert order == submitted
@@ -650,7 +650,7 @@ def _flatten(client: object, symbol: str, target_qty: float) -> None:
 
 
 def _cancel_open_orders(client: object, symbol: str) -> None:
-    """Cancel every still-working order in ``symbol``, through the seam (ADR-0035)."""
+    """Cancel every still-working order in ``symbol``, through the seam (ADR-0036)."""
     import contextlib
 
     for order_id in _open_order_ids(client, symbol):
