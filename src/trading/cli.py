@@ -88,11 +88,14 @@ from trading.divergence import (
 )
 from trading.engine import (
     DEFAULT_PAPER_LOOKBACK,
+    LIVE_SILENCE_TOLERANCE,
+    MIN_LIVE_EMPTY_POLLS,
     BacktestResult,
     BarOutcome,
     EmptyUniverseError,
     Engine,
     PaperSession,
+    silence_tolerance_polls,
 )
 from trading.frequency import DAILY, Frequency
 from trading.interfaces import Broker, DataAdapter
@@ -320,6 +323,20 @@ def _parse_frequency(interval: str) -> Frequency:
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
+
+
+def _format_span(span: timedelta) -> str:
+    """Render a duration in the coarsest whole unit that fits, for an operator line.
+
+    ``timedelta``'s own ``str`` gives ``1:00:00`` and ``4 days, 0:00:00``; a session
+    announcing when it will stop should say "60 minutes" and "4 days".
+    """
+    seconds = span.total_seconds()
+    for unit, size in (("day", 86_400.0), ("hour", 3_600.0), ("minute", 60.0)):
+        if seconds >= size:
+            value = seconds / size
+            return f"{value:g} {unit}" + ("" if value == 1.0 else "s")
+    return f"{seconds:g} seconds"
 
 
 def _make_adapter(
@@ -950,6 +967,15 @@ def paper(
         f"much history a --live session warms up on (default {DEFAULT_PAPER_LOOKBACK}). "
         "Under --once this is a floor: the replay always covers the whole range.",
     ),
+    max_empty_polls: int | None = typer.Option(
+        None,
+        "--max-empty-polls",
+        help="Stop after this many consecutive polls that reveal no new bar. The "
+        "default is derived from --interval: whatever covers "
+        f"{_format_span(LIVE_SILENCE_TOLERANCE)} of silence, at least "
+        f"{MIN_LIVE_EMPTY_POLLS} polls (5m -> 12, 1d -> 4). Under --once the "
+        "default stays 1.",
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/paper"), "--out", help="Result directory."),
 ) -> None:
@@ -1003,10 +1029,27 @@ def paper(
     # keeps the default policy so the daily path stays byte-identical to V5.
     is_complete = interval_is_complete(freq.delta) if freq.is_intraday else default_is_complete
     window = DEFAULT_PAPER_LOOKBACK if lookback is None else lookback
+
+    # How much silence ends the session, decided here because this is where the
+    # live/replay distinction lives (ADR-0049). A --once replay knows its whole
+    # range up front and drains it in one poll, so a single quiet poll means done;
+    # that explicit 1 is what keeps every offline replay byte-identical. A --live
+    # session's quiet polls are the market being shut or the feed hiccuping, and the
+    # loop's own default of 2 polls meant ten minutes at 5m and two days at 1d — so
+    # a daily session died over every weekend and an intraday one died on a
+    # twenty-minute data gap. The live default is therefore a duration converted at
+    # the bar interval. An operator who knows their venue can override either.
+    if max_empty_polls is not None and max_empty_polls < 1:
+        typer.echo("error: --max-empty-polls must be at least 1", err=True)
+        raise typer.Exit(2)
+
     run_kwargs: dict[str, int] = {}
     if live:
         clock: WallClock | FakeClock = WallClock()
         feed = RecentWindowFeed(adapter, clock, is_complete)
+        quiet_polls = (
+            silence_tolerance_polls(freq.delta) if max_empty_polls is None else max_empty_polls
+        )
     else:
         series = {s: adapter.get_bars(s, start, end) for s in tickers}
         all_bars = [bar for bars in series.values() for bar in bars]
@@ -1014,7 +1057,8 @@ def paper(
         window = max(window, total + 1)
         clock = FakeClock(end + timedelta(days=1))
         feed = RecentWindowFeed(FakeAdapter(all_bars), clock, is_complete)
-        run_kwargs = {"max_empty_polls": 1}
+        quiet_polls = 1 if max_empty_polls is None else max_empty_polls
+    run_kwargs = {"max_empty_polls": quiet_polls}
 
     # Divergence tracking is a Broker *decorator*, so the engine, the strategy, and
     # the guardrails are untouched and there is no mode branch inside the shared
@@ -1068,11 +1112,19 @@ def paper(
     state_path = out / "paper_state.json"
     mode = "live" if live else "once"
     typer.echo(f"Paper session ({mode}) — strategy={strategy} symbols={','.join(tickers)}\n")
+    if live:
+        # An unattended session ends by *policy*, and the operator watching it needs
+        # to be able to tell that from a crash or a hang before it happens rather
+        # than after (ADR-0049). Live-only: --once stdout must not move.
+        typer.echo(
+            f"Stops after {quiet_polls} consecutive poll(s) with no new bar "
+            f"— {_format_span(quiet_polls * freq.delta)} of silence at {freq.label}.\n"
+        )
     # The one record that makes an unattended session's log answerable afterwards:
     # what was asked for, and when. Everything per-bar stays on stdout (ADR-0043).
     logger.info(
         "paper session starting: mode=%s strategy=%s symbols=%s interval=%s source=%s "
-        "broker=%s lookback=%d out=%s",
+        "broker=%s lookback=%d max_empty_polls=%d out=%s",
         mode,
         strategy,
         ",".join(tickers),
@@ -1080,6 +1132,7 @@ def paper(
         source,
         broker_name,
         window,
+        quiet_polls,
         out,
     )
 

@@ -549,6 +549,50 @@ class Engine:
 # polls, so this only bounds how far back a single poll looks.
 DEFAULT_PAPER_LOOKBACK = 512
 
+# How long a *live* paper session tolerates a feed that reveals nothing new before
+# it stops, and the floor in polls under that duration (ADR-0049).
+#
+# ``PaperSession.run`` counts consecutive quiet *polls*, and a count cannot mean the
+# same thing at two cadences: the historical default of 2 was ten minutes at
+# ``--interval 5m`` and two days at ``1d``, so the same constant that stopped an
+# intraday session on a brief data gap also killed a daily session over every
+# weekend. The policy is therefore a duration, converted at the session's poll
+# interval by :func:`silence_tolerance_polls`.
+#
+# The numbers are chosen for an asymmetric trade. Stopping late costs a handful of
+# extra polls against a shut venue; stopping early costs the whole day's
+# measurement, which is the only thing a live session exists to produce (ADR-0038).
+# So they are generous toward the cheap error. The floor exists because at 30m and
+# coarser the duration converts to fewer polls than the old default, which would
+# make this change a regression at exactly the cadence the weekend bug lives at.
+LIVE_SILENCE_TOLERANCE = timedelta(minutes=60)
+MIN_LIVE_EMPTY_POLLS = 4
+
+
+def silence_tolerance_polls(
+    poll_interval: timedelta,
+    *,
+    tolerance: timedelta = LIVE_SILENCE_TOLERANCE,
+    minimum: int = MIN_LIVE_EMPTY_POLLS,
+) -> int:
+    """How many consecutive quiet polls ``tolerance`` of silence is, at this cadence.
+
+    Rounded *up*, so the session never tolerates less silence than asked for, and
+    floored at ``minimum``. At the standard intervals: ``1m -> 60``, ``5m -> 12``,
+    ``30m -> 4``, ``1h -> 4``, ``1d -> 4`` (four days, which clears a normal weekend
+    and a three-day one).
+
+    A free function rather than a method or a new default on
+    :meth:`PaperSession.run`: the choice belongs where the live/replay distinction
+    is made — the CLI — and changing the loop's own default would silently retune
+    every existing caller. Nothing on the backtest path calls this;
+    :meth:`Engine.run` has no empty-poll concept at all.
+    """
+    if poll_interval <= timedelta(0):  # defensive: never divide by a non-positive step
+        return minimum
+    polls = -(-tolerance // poll_interval)  # ceiling division on timedeltas
+    return max(minimum, int(polls))
+
 
 def prime_history(state: _RunState, feed: Feed) -> None:
     """Load ``feed``'s bars into ``state`` as *history only* — never as trades (ADR-0042).
@@ -600,6 +644,12 @@ class PaperSession:
     The loop is bounded for tests and offline demos: it stops once ``max_new_bars``
     have been processed, or after ``max_empty_polls`` consecutive polls that reveal
     nothing new, whichever comes first (with ``max_polls`` as a hard safety).
+
+    ``max_empty_polls`` is a count, so what it *means* depends on the poll cadence —
+    the default of 2 is ten minutes at ``--interval 5m`` and two days at ``1d``. A
+    real live session should pass a value derived from its interval rather than
+    inherit that default; :func:`silence_tolerance_polls` computes it, and
+    ``trading paper --live`` passes it (ADR-0049).
 
     **Warmup vs. live (ADR-0042).** A completed-bar feed hands back a window of
     *history* the moment a session opens — up to ``lookback`` bars that closed

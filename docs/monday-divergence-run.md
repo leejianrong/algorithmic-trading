@@ -65,8 +65,10 @@ needed here — the defaults are what the command above gets.
 
 ## What should happen, in order
 
-**09:30.** The session starts and prints a warmup line. It primes about 512 bars of
-history without trading them, then sleeps to the next 5-minute boundary.
+**09:30.** The session starts and prints two lines: how long it will tolerate silence
+(`Stops after 12 consecutive poll(s) with no new bar — 1 hour of silence at 5m`) and
+a warmup line. It primes about 512 bars of history without trading them, then sleeps
+to the next 5-minute boundary.
 
 **About 09:35.** First trade. Not 09:30, and that is correct: the session trades the
 first bar that completes after startup. Before ADR-0042 it would have fired roughly
@@ -78,9 +80,13 @@ at the open. Expect somewhere near 87.
 
 **16:00.** The close. No new bars complete after this.
 
-**16:10 to 16:15.** The session ends on its own. Two consecutive polls with no new
-bar stop it (`max_empty_polls = 2`), and it writes all five artifacts on the way out.
-This looks like the program quitting unexpectedly. It is not.
+**About 17:00 to 17:05.** The session ends on its own, roughly an hour after the last
+bar, and writes all five artifacts on the way out. It stops after an hour of silence:
+twelve consecutive 5-minute polls with no new bar (ADR-0049). Until then it keeps
+polling a shut venue, which is intended — the polls are nearly free and stopping early
+would cost the measurement. Nothing is printed while it waits, so between about 16:05
+and 17:00 the session is silent by design. This looks like the program quitting
+unexpectedly when it finally exits. It is not.
 
 ## What to look out for
 
@@ -113,9 +119,13 @@ orders, so it belongs to closed markets. If it shows up mid-session, orders are
 sitting unfilled for whole bars. The run will survive it now (ADR-0041 classifies it
 instead of letting it kill the session) but it is a signal worth noticing.
 
-**Watch for the session ending early.** Two consecutive polls with nothing new will
-stop it, and a data gap of ten minutes would do that as easily as the close. If it
-exits at 11:00, that is a feed problem, not a finished run.
+**Watch for the session ending early.** An exit before about 17:00 is a feed problem,
+not a finished run — it means an hour passed with no new bar, which mid-session can
+only be an outage. Until ADR-0049 the tolerance was ten minutes, so a brief IEX hiccup
+was enough to end the day; an 11:00 exit now takes a 55-minute blackout and is worth
+believing. What the run cannot survive either way is a gap that swallows the whole
+hour: the session stops, writes its artifacts, and whatever fills it had are all it
+gets. Rerun on Tuesday if that happens.
 
 ## How to read the result
 
@@ -154,7 +164,9 @@ before trusting any backtest number, and no more than that.
 ## If it goes wrong
 
 Run it again Tuesday. Nothing about the setup is single-use, and the only cost of a
-failed run is the day. Sample size can also be pooled across sessions by hand:
+failed run is the day. If Monday shows the feed dropping out for longer than an hour,
+`--max-empty-polls N` overrides the tolerance for the retry (`N` polls, so at `5m` a
+value of 24 buys two hours); the default is what should be used otherwise. Sample size can also be pooled across sessions by hand:
 concatenate the per-session `fill_divergence.csv` files (use a distinct `--out` each
 time, or they overwrite) and average `realized_slippage_bps` where the live outcome
 is a fill and the model outcome is a fill. Pooling across days pools across market
