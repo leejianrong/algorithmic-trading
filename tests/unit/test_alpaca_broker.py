@@ -243,3 +243,83 @@ class TestTerminalStatuses:
         assert broker.pending_order_ids == ("1",)
         assert broker.rejections == []
         assert clock.sleep_calls  # it waited out the timeout
+
+
+class TestRejectionShape:
+    """A rejection is ``(Order, reason)`` -- the shape the result document reads.
+
+    Found by driving the market-closed branch against the live venue (ADR-0036).
+    ADR-0033 made a ``canceled`` / ``expired`` / ``replaced`` order settle and be
+    *reported*, but it recorded the order **id** as the tuple's first element while
+    :class:`~trading.broker.SimulatedBroker`, ``BacktestResult.rejections``, and
+    :func:`trading.report.result_to_dict` all use the :class:`~trading.types.Order`.
+    ``Engine._finalize`` merges ``broker.rejections`` in through a ``getattr``, so
+    ``mypy --strict`` never saw the mismatch, and the fast layer only ever read
+    ``rejections[0][1]`` -- the reason -- so nothing caught it either. The first
+    order to end unfilled in a live session therefore crashed ``result.json`` with
+    ``AttributeError: 'str' object has no attribute 'symbol'`` -- and an unfilled
+    DAY order *expires* at the close, so that is the routine end of the very
+    market-closed branch ADR-0033 left unverified.
+    """
+
+    def _canceled(self, qty: float = 4.0) -> AlpacaBroker:
+        client = FakeAlpacaClient({"AAA": _series("AAA", [100.0])}, cash=10_000.0, auto_fill=False)
+        broker = AlpacaBroker(client, clock=_clock(), poll_timeout=timedelta(seconds=0))
+        broker.submit(Order("AAA", Side.BUY, qty=qty))
+        client.set_order_status("1", "canceled")
+        broker.on_bar({"AAA": _bar("AAA", 100.0)})
+        return broker
+
+    def test_rejection_carries_the_submitted_order(self) -> None:
+        broker = self._canceled(qty=4.0)
+
+        (order, reason) = broker.rejections[0]
+
+        assert isinstance(order, Order)
+        assert (order.symbol, order.side, order.qty) == ("AAA", Side.BUY, 4.0)
+        # ADR-0033's honesty requirement is unchanged: the reason still names the
+        # venue's order id and the status the order ended in.
+        assert "canceled" in reason
+        assert "1" in reason
+
+    def test_rejections_survive_the_result_document(self) -> None:
+        # The end-to-end shape check: this is the call that crashed, on the
+        # canonical artifact the dashboard reads (ADR-0023). Serializing the whole
+        # document -- not just reading the one key -- is deliberate: that is what
+        # `write_result_json` actually does, so a later additive key (ADR-0032's
+        # `absent`, say) stays covered by this test rather than around it.
+        import json
+
+        from trading.engine import BacktestResult
+        from trading.report import result_to_dict
+        from trading.types import Portfolio
+
+        broker = self._canceled(qty=2.5)
+        result = BacktestResult(
+            symbols=["AAA"],
+            starting_cash=10_000.0,
+            equity_curve=[],
+            final_portfolio=Portfolio(cash=10_000.0),
+            rejections=list(broker.rejections),
+        )
+
+        document = result_to_dict(result, mode="paper")
+
+        assert document["rejections"] == [
+            {"symbol": "AAA", "qty": 2.5, "side": "buy", "reason": broker.rejections[0][1]}
+        ]
+        assert json.loads(json.dumps(document))["rejections"] == document["rejections"]
+
+    def test_rejection_shape_matches_the_simulated_broker(self) -> None:
+        # One execution path (ADR-0002): both brokers feed the same field, so the
+        # tuple each appends must have the same shape.
+        from trading.broker import SimulatedBroker
+        from trading.types import Portfolio
+
+        broker = self._canceled()
+        simulated = SimulatedBroker(Portfolio(cash=1.0))
+        simulated.submit(Order("AAA", Side.BUY, qty=1_000_000))  # cannot be funded
+        simulated.on_bar({"AAA": _bar("AAA", 100.0)})
+
+        assert simulated.rejections, "expected the underfunded order to be rejected"
+        assert type(broker.rejections[0][0]) is type(simulated.rejections[0][0])

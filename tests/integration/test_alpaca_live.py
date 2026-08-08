@@ -28,10 +28,14 @@ from __future__ import annotations
 import importlib.util
 import os
 from datetime import UTC, datetime, timedelta
+from typing import TYPE_CHECKING
 
 import pytest
 
 from trading.types import Side
+
+if TYPE_CHECKING:  # the wrapper's *name*, without importing it at collection time
+    from trading.data.alpaca_client import RealAlpacaClient
 
 _HAVE_CREDS = bool(os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_SECRET_KEY"))
 _HAVE_SDK = importlib.util.find_spec("alpaca") is not None
@@ -150,6 +154,23 @@ class TestSdkShapeAssumptions:
         from alpaca.common.exceptions import APIError
 
         assert isinstance(APIError.status_code, property)
+
+    def test_the_queued_statuses_are_not_terminal(self) -> None:
+        # The market-closed branch rests on this: a DAY order placed while the
+        # venue is shut is parked as `accepted` (observed) or `new`, and both must
+        # stay *working* so the poll waits and retries rather than dropping the
+        # order (ADR-0020, ADR-0033).
+        from alpaca.trading.enums import OrderStatus
+
+        from trading.data.alpaca_client import TERMINAL_STATUSES
+
+        for member in (OrderStatus.ACCEPTED, OrderStatus.NEW, OrderStatus.PENDING_NEW):
+            assert member.value not in TERMINAL_STATUSES
+
+    def test_cancel_order_by_id_is_the_sdk_call_the_wrapper_makes(self) -> None:
+        from alpaca.trading.client import TradingClient
+
+        assert callable(TradingClient.cancel_order_by_id)
 
 
 # --- Live: account and asset metadata ----------------------------------------
@@ -401,11 +422,210 @@ class TestOrderLifecycle:
         assert {s: p.qty for s, p in broker.portfolio.positions.items()} == pytest.approx(held)
 
 
-def _flatten(client: object, symbol: str, target_qty: float) -> None:
-    """Sell back down to ``target_qty`` so the test leaves no position behind.
+# --- Live: the branch that only runs when the venue is shut -------------------
 
-    Best-effort by design: if the market is closed the sell queues and the test
-    should not fail for it, so a refusal is swallowed. Anything this opens is a
+
+@_needs_live
+class TestMarketClosedOrder:
+    """The pending/timeout branch, driven against the real venue (ADR-0036).
+
+    ADR-0033 shipped the terminal-status classification but recorded, honestly,
+    that "the market-closed pending/timeout branch of the real broker" had never
+    run: the first live session happened during market hours and took the fill
+    path. Everything below needs the venue *shut*, which is a few hours a day and
+    all weekend, so each test skips when the market is open rather than asserting
+    a branch that cannot happen.
+
+    What the venue actually does, observed 2026-08-08 (Saturday, next open Mon
+    2026-08-10 09:30 ET): a fractional ``TimeInForce.DAY`` market order is
+    accepted and parked at status ``accepted`` -- not rejected, not filled -- and
+    stays there. ``accepted`` is *not* terminal, so the poll waits it out and
+    leaves the order pending, which is exactly what ADR-0020 designed. Cancelling
+    moved it to ``canceled`` in under a second.
+    """
+
+    def _require_closed(self) -> None:
+        if _market_is_open():
+            pytest.skip("this branch only exists while the venue is closed")
+
+    def test_a_parked_order_stays_pending_past_a_clean_poll_timeout(self) -> None:
+        """Submit -> parked non-terminal -> timeout returns cleanly -> still pending.
+
+        The poll timeout is shortened from the 30s default purely to keep the test
+        quick; the branch it drives is identical, and the default is asserted
+        below so a change to it is still caught.
+        """
+        import time
+
+        from trading.brokers.alpaca import DEFAULT_POLL_TIMEOUT, AlpacaBroker
+        from trading.clock import WallClock
+        from trading.data.alpaca_client import TERMINAL_STATUSES, RealAlpacaClient
+        from trading.types import Bar, Order
+
+        assert timedelta(seconds=30) == DEFAULT_POLL_TIMEOUT  # what live runs use
+
+        self._require_closed()
+        client = RealAlpacaClient()
+        poll_timeout = timedelta(seconds=6)
+        broker = AlpacaBroker(
+            client,
+            clock=WallClock(),
+            poll_timeout=poll_timeout,
+            poll_interval=timedelta(seconds=2),
+        )
+        opening_qty = broker.portfolio.position(_SYMBOL).qty
+        bar = Bar(
+            symbol=_SYMBOL, ts=datetime.now(UTC), open=1.0, high=1.0, low=1.0, close=1.0, volume=1
+        )
+
+        try:
+            broker.submit(Order(_SYMBOL, Side.BUY, qty=_TINY_QTY))
+            assert len(broker.pending_order_ids) == 1
+            order_id = broker.pending_order_ids[0]
+
+            # The venue parked it rather than filling or refusing it.
+            parked = client.get_order(order_id)
+            assert parked.status not in TERMINAL_STATUSES, (
+                f"expected a working status with the market closed, got {parked.status!r}"
+            )
+            assert parked.filled_qty == 0.0
+            assert parked.filled_avg_price is None
+
+            # The timeout fires cleanly: no hang, no raise, no fill, no eviction.
+            started = time.monotonic()
+            fills = broker.on_bar({_SYMBOL: bar})
+            elapsed = time.monotonic() - started
+
+            assert fills == []
+            assert broker.rejections == []
+            assert broker.pending_order_ids == (order_id,)
+            assert elapsed >= poll_timeout.total_seconds()
+            assert elapsed < poll_timeout.total_seconds() + 15.0, "polling overran its timeout"
+            # Still parked afterwards -- polling is a read, it does not disturb it.
+            assert client.get_order(order_id).status not in TERMINAL_STATUSES
+        finally:
+            _flatten(client, _SYMBOL, opening_qty)
+
+    def test_cancelling_a_parked_order_settles_it_and_evicts_the_id(self) -> None:
+        """The other half: ``canceled`` IS terminal, so the next bar drops the id.
+
+        This is the whole point of ADR-0033's classification, run for real: before
+        it, a canceled order stayed in the pending set and burned the full poll
+        timeout on every subsequent bar for the rest of the session.
+        """
+        import time
+
+        from trading.brokers.alpaca import AlpacaBroker
+        from trading.clock import WallClock
+        from trading.data.alpaca_client import (
+            STATUS_CANCELED,
+            TERMINAL_STATUSES,
+            RealAlpacaClient,
+        )
+        from trading.types import Bar, Order
+
+        self._require_closed()
+        client = RealAlpacaClient()
+        broker = AlpacaBroker(
+            client,
+            clock=WallClock(),
+            poll_timeout=timedelta(seconds=4),
+            poll_interval=timedelta(seconds=2),
+        )
+        opening_qty = broker.portfolio.position(_SYMBOL).qty
+        bar = Bar(
+            symbol=_SYMBOL, ts=datetime.now(UTC), open=1.0, high=1.0, low=1.0, close=1.0, volume=1
+        )
+        submitted = Order(_SYMBOL, Side.BUY, qty=_TINY_QTY)
+
+        try:
+            broker.submit(submitted)
+            order_id = broker.pending_order_ids[0]
+
+            client.cancel_order(order_id)
+            for _ in range(10):  # the venue cancels asynchronously
+                if client.get_order(order_id).status == STATUS_CANCELED:
+                    break
+                time.sleep(1)
+            assert client.get_order(order_id).status == STATUS_CANCELED
+            assert STATUS_CANCELED in TERMINAL_STATUSES
+
+            # The next bar settles it on the *first* poll: no timeout is burned.
+            started = time.monotonic()
+            fills = broker.on_bar({_SYMBOL: bar})
+            elapsed = time.monotonic() - started
+
+            assert fills == []  # nothing filled, so nothing to blotter
+            assert broker.pending_order_ids == ()  # the id is evicted
+            assert elapsed < 4.0, "a terminal order must settle without waiting out the timeout"
+
+            # Reported, not silently dropped -- and shaped for result.json (ADR-0036).
+            assert len(broker.rejections) == 1
+            order, reason = broker.rejections[0]
+            assert order == submitted
+            assert STATUS_CANCELED in reason
+            assert order_id in reason
+
+            # A later bar does no further work on it.
+            assert broker.on_bar({_SYMBOL: bar}) == []
+            assert len(broker.rejections) == 1
+        finally:
+            _flatten(client, _SYMBOL, opening_qty)
+
+    def test_cancelling_an_already_terminal_order_is_accepted(self) -> None:
+        # Pins what the fake mimics: the venue answers a repeat cancel with 200,
+        # so `cancel_order` is idempotent and cleanup can call it unconditionally.
+        import time
+
+        from trading.data.alpaca_client import STATUS_CANCELED, RealAlpacaClient
+
+        self._require_closed()
+        client = RealAlpacaClient()
+        placed = client.submit_order(_SYMBOL, _TINY_QTY, Side.BUY)
+        try:
+            client.cancel_order(placed.id)
+            for _ in range(10):
+                if client.get_order(placed.id).status == STATUS_CANCELED:
+                    break
+                time.sleep(1)
+            assert client.get_order(placed.id).status == STATUS_CANCELED
+
+            client.cancel_order(placed.id)  # must not raise
+
+            assert client.get_order(placed.id).status == STATUS_CANCELED
+        finally:
+            _flatten(client, _SYMBOL, 0.0)
+
+    def test_cancelling_an_unknown_order_raises_lookup_error(self) -> None:
+        # The 404 -> LookupError mapping, the same distinction get_asset draws:
+        # "we never heard of it" is not "we could not ask".
+        import uuid
+
+        from trading.data.alpaca_client import RealAlpacaClient
+
+        with pytest.raises(LookupError):
+            RealAlpacaClient().cancel_order(str(uuid.uuid4()))
+
+    def test_the_session_leaves_no_working_orders_behind(self) -> None:
+        # The account-hygiene guard: a parked order that outlives a test fills at
+        # the next open, hours later, and looks like a phantom trade.
+        from trading.data.alpaca_client import RealAlpacaClient
+
+        client = RealAlpacaClient()
+        _cancel_open_orders(client, _SYMBOL)
+
+        assert _open_order_ids(client, _SYMBOL) == []
+
+
+def _flatten(client: object, symbol: str, target_qty: float) -> None:
+    """Leave the account as we found it: no working orders, no extra shares.
+
+    Cancelling first is not optional. A market order placed while the venue is
+    closed is *parked* rather than filled (see :class:`TestMarketClosedOrder`), so
+    a test that only sells back what it can see leaves a queued buy behind that
+    fills at the next open -- a stray position appearing hours after the test
+    passed. Selling is best-effort after that: if the market is closed the sell
+    queues too, and the test should not fail for it. Anything this opens is a
     hundredth of a share of paper money.
     """
     import time
@@ -413,6 +633,7 @@ def _flatten(client: object, symbol: str, target_qty: float) -> None:
     from trading.data.alpaca_client import TERMINAL_STATUSES, RealAlpacaClient
 
     assert isinstance(client, RealAlpacaClient)
+    _cancel_open_orders(client, symbol)
     held = next((p.qty for p in client.list_positions() if p.symbol == symbol), 0.0)
     excess = held - target_qty
     if excess <= 0.0:
@@ -425,3 +646,36 @@ def _flatten(client: object, symbol: str, target_qty: float) -> None:
         if client.get_order(order.id).status in TERMINAL_STATUSES:
             return
         time.sleep(2)
+    _cancel_open_orders(client, symbol)
+
+
+def _cancel_open_orders(client: object, symbol: str) -> None:
+    """Cancel every still-working order in ``symbol``, through the seam (ADR-0036)."""
+    import contextlib
+
+    for order_id in _open_order_ids(client, symbol):
+        # Already terminal, or the venue refused: not this test's failure.
+        with contextlib.suppress(Exception):
+            _as_real(client).cancel_order(order_id)
+
+
+def _open_order_ids(client: object, symbol: str) -> list[str]:
+    """Ids of the venue's currently-open orders in ``symbol``.
+
+    ``get_orders`` is typed ``list[Order] | list[str]`` by the SDK (the raw-data
+    arm ``RealAlpacaClient`` never asks for), so the string arm is skipped rather
+    than assumed away -- the same stance :func:`_require_model` takes.
+    """
+    return [
+        str(raw.id)
+        for raw in _as_real(client)._trading.get_orders()
+        if not isinstance(raw, str) and str(raw.symbol) == symbol
+    ]
+
+
+def _as_real(client: object) -> RealAlpacaClient:
+    """Narrow a client to the real wrapper (these helpers only ever get one)."""
+    from trading.data.alpaca_client import RealAlpacaClient
+
+    assert isinstance(client, RealAlpacaClient)
+    return client

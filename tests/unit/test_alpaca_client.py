@@ -12,6 +12,7 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from trading.data.alpaca_client import (
+    STATUS_CANCELED,
     STATUS_FILLED,
     STATUS_NEW,
     AccountSnapshot,
@@ -252,3 +253,58 @@ class TestGetAsset:
         client.set_asset_failure("AAPL")
         client.set_asset("AAPL")
         assert client.get_asset("AAPL").tradable is True
+
+
+class TestCancelOrder:
+    """The seam's sixth call (ADR-0017's anticipated widening, ADR-0036).
+
+    Every behaviour asserted here was observed against the live paper venue with
+    the market closed, not guessed: a working order cancels to ``canceled``, a
+    second cancel of an already-terminal order is accepted silently, and an
+    unknown id is a 404 the wrapper turns into a :class:`LookupError`.
+    """
+
+    def test_protocol_includes_cancel_order(self) -> None:
+        client = FakeAlpacaClient()
+        assert isinstance(client, AlpacaClient)
+        assert hasattr(AlpacaClient, "cancel_order")
+
+    def test_cancelling_a_working_order_makes_it_canceled(self) -> None:
+        client = FakeAlpacaClient({"AAPL": _series("AAPL", [100.0])}, auto_fill=False)
+        order = client.submit_order("AAPL", 1.0, Side.BUY)
+        assert client.get_order(order.id).status == STATUS_NEW
+
+        client.cancel_order(order.id)
+
+        assert client.get_order(order.id).status == STATUS_CANCELED
+
+    def test_cancel_keeps_a_partial_fill_on_the_record(self) -> None:
+        # A partially-filled-then-canceled order moved real shares; cancelling
+        # must not erase them (ADR-0033 emits that partial as a Fill).
+        client = FakeAlpacaClient({"AAPL": _series("AAPL", [100.0])}, auto_fill=False)
+        order = client.submit_order("AAPL", 4.0, Side.BUY)
+        client.set_order_status(order.id, "partially_filled", filled_qty=1.5, filled_avg_price=99.5)
+
+        client.cancel_order(order.id)
+
+        after = client.get_order(order.id)
+        assert after.status == STATUS_CANCELED
+        assert after.filled_qty == 1.5
+        assert after.filled_avg_price == 99.5
+
+    def test_cancelling_a_terminal_order_is_a_silent_no_op(self) -> None:
+        # Observed live 2026-08-08: DELETE /orders/{id} on an already-canceled
+        # order returned 200 with no error, so the fake must not invent one.
+        client = FakeAlpacaClient({"AAPL": _series("AAPL", [100.0])})
+        order = client.submit_order("AAPL", 1.0, Side.BUY)  # auto_fill -> filled
+        assert order.status == STATUS_FILLED
+
+        client.cancel_order(order.id)
+
+        assert client.get_order(order.id).status == STATUS_FILLED
+
+    def test_cancelling_an_unknown_order_raises_lookup_error(self) -> None:
+        # The venue answers 404; "we never heard of it" must stay distinct from
+        # "we cancelled it", exactly as get_asset keeps unknown apart from refused.
+        with pytest.raises(LookupError, match="no-such-order"):
+            FakeAlpacaClient().cancel_order("no-such-order")
