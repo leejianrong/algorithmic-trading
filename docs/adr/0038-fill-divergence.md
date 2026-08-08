@@ -99,7 +99,24 @@ The proof is a test that runs the same strategy twice — once through a plain
 `SimulatedBroker`, once through a `ShadowBroker` whose injected shadow raises on
 every call — and asserts the two `BacktestResult`s are **equal**. `BacktestResult`
 is a dataclass, so that compares the whole run: curve, blotter, rejections, clamps,
-halt state. The same test exists for a clock that raises.
+halt state. The same test exists for a clock that raises. Deleting the `try/except`
+in `on_bar` turns four of these red with the shadow's `RuntimeError` leaking into
+the engine loop; that was watched, then restored.
+
+Property 1 needed its own test, because the `try/except` hides it: with both in
+place, swapping the statement order changes nothing an `Exception` can reveal. The
+one failure that distinguishes them is a `BaseException` — and it is not
+hypothetical, because **Ctrl-C is the only way a `--live` session ends** (ADR-0033).
+So a clock whose `now()` raises `KeyboardInterrupt` is injected, and the test asserts
+the order is *at the venue* (`pending_order_ids`) even though `submit` propagated the
+interrupt. Moving `self._live.submit(order)` below the bookkeeping turns it red with
+the order never placed.
+
+One operation does precede the live call: the pre-bar portfolio snapshot, because the
+counterfactual must be judged against the book that existed *before* this bar's fills.
+It is two attribute reads and a `dict` copy over frozen `Position`s — no user code
+runs inside it — and it is guarded, so a failure disables the shadow and lets
+`on_bar` proceed exactly as if tracking were off.
 
 ### ADR-0002 is intact
 
@@ -108,6 +125,11 @@ that satisfies the `Broker` protocol needs no engine support. Wrapping a
 `SimulatedBroker` in a backtest is legal and is the mechanism's **null test**: the
 same broker compared against its own model must diverge by exactly zero, and a test
 asserts that. If the reference price were wrong, the null test would show the error.
+
+The fast-layer fixture makes every bar's `close` differ from its `open` on purpose.
+A fixture where they coincide cannot tell a correct reference from one priced off the
+close, which is precisely the mistake this ADR exists to avoid; with the gap in
+place, changing `bar.open` to `bar.close` in the module turns six tests red.
 
 ### Honesty about sample size
 
@@ -156,6 +178,29 @@ every modelled rejection would be mis-read as a fill.
 - The mechanism is fully covered offline (`FakeAdapter` / `FakeAlpacaClient` /
   `FakeClock`); the live layer is double-gated on credentials **and** the SDK and
   skips cleanly in CI, so live runs are evidence, not the test suite.
+- **Executed against the real paper account, 2026-08-08** (Saturday, venue shut,
+  next open Mon 2026-08-10 09:30 ET), with the market-closed branch (ADR-0036) as
+  the divergence:
+
+  ```
+  raw bars: 2026-08-06 open=314.55 | 2026-08-07 open=311.395
+    AAPL buy 0.01 — live pending | model filled 0.01 @ 311.5507
+    reference_price 311.395   modelled_slippage_bps 5.0   outcome_diverged true
+  VERDICT: no comparable fills — this run says nothing about the 5.00 bps model.
+  ```
+
+  Every part of that is the design working: the reference is the RAW open of the
+  bar the order would have executed on, the model's fill is that open times
+  `1.0005` to the last decimal, the venue simply *did not fill* — and the report
+  says outright that it therefore concludes nothing. `shadow.enabled` stayed
+  `True` with no errors, so nothing was swallowed. The account was left flat
+  ($100,000.06 cash, no positions, no working orders) and that was **checked
+  after** the run, not assumed.
+- **Still unverified:** a *filled* live order through the wrapper, which needs the
+  venue open. The fill branch is covered offline against `FakeAlpacaClient` and the
+  live test asserts it when the market is open, so the first weekday run will
+  execute it — but until then this ADR has zero real paired fills, and the report's
+  own verdict line is the honest statement of that.
 - **Known limitation — cadence, not microstructure.** Under a daily paper session
   the venue fills at the next session open, which is the same event the model prices,
   so the comparison is tight. Run the session at a coarse interval against a venue

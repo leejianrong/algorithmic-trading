@@ -284,8 +284,15 @@ As of this writing:
   prints the block; **off by default**, with a CLI test asserting `equity_curve.csv`
   and `result.json` are byte-identical with and without the flag. Below
   `MIN_PAIRED_FILLS = 30` the verdict says the model is "neither confirmed nor
-  refuted" (ADR-0029's spirit). Wanted next: a `divergence` block in `result.json` +
-  a dashboard panel (additive; `divergence_rows` already emits the flat shape).
+  refuted" (ADR-0029's spirit). **Run live against the paper account (2026-08-08,
+  venue shut):** `AAPL buy 0.01 — live pending | model filled @ 311.5507` off a raw
+  open of `311.395`, i.e. exactly 5.00 bps, with the parked-order case (ADR-0036) as
+  the reported divergence and the verdict correctly refusing to conclude anything;
+  account left flat and checked. Still unverified: a *filled* live order (needs the
+  venue open — covered offline, and the live test asserts it when the market is
+  open), so there are **zero real paired fills** behind the 5 bps question so far.
+  Wanted next: a `divergence` block in `result.json` + a dashboard panel (additive;
+  `divergence_rows` already emits the flat shape).
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);

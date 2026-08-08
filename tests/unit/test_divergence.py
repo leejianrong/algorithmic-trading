@@ -58,15 +58,21 @@ START = datetime(2026, 1, 5, tzinfo=UTC)
 
 
 def _bars(symbol: str, opens: list[float]) -> list[Bar]:
-    """A series whose open is what matters; close tracks open so marks are simple."""
+    """A series indexed by its OPEN, with a deliberately different close.
+
+    The gap is load-bearing: ``SimulatedBroker`` fills at the open, so a fixture
+    where close == open cannot tell a correct reference price from a run that
+    priced the counterfactual off the close instead. Verified by making the module
+    read ``bar.close`` and watching these tests go red.
+    """
     return [
         Bar(
             symbol=symbol,
             ts=START + timedelta(days=i),
             open=price,
-            high=price * 1.01,
+            high=price * 1.03,
             low=price * 0.99,
-            close=price,
+            close=price * 1.02,
             volume=1_000,
         )
         for i, price in enumerate(opens)
@@ -107,6 +113,21 @@ class _BoomClock:
 
     def sleep_until(self, ts: datetime) -> None:
         raise RuntimeError("clock exploded")
+
+
+class _InterruptClock:
+    """A clock whose read raises ``KeyboardInterrupt`` — a ``BaseException``.
+
+    Not caught by ``except Exception``, and not hypothetical: Ctrl-C is the only
+    way a ``--live`` session ends (ADR-0033), so it can land anywhere, including
+    between the wrapper being asked to submit and the order reaching the venue.
+    """
+
+    def now(self) -> datetime:
+        raise KeyboardInterrupt
+
+    def sleep_until(self, ts: datetime) -> None:
+        raise KeyboardInterrupt
 
 
 class TestSeamAndDelegation:
@@ -299,6 +320,24 @@ class TestShadowCannotPerturbTheLivePath:
         assert [f.qty for f in fills] == [pytest.approx(3.0)]
         assert wrapped.portfolio.position("AAA").qty == pytest.approx(3.0)
         assert not wrapped.enabled
+
+    def test_the_order_is_placed_before_any_shadow_work_runs(self) -> None:
+        """Ordering, not just the try/except: the live call is the first statement.
+
+        ``except Exception`` cannot catch a ``KeyboardInterrupt``, so this is the
+        one failure that distinguishes "live first" from "live after bookkeeping" —
+        and it is the failure a ``--live`` session actually meets (ADR-0033). Swap
+        the two statements in ``ShadowBroker.submit`` and this goes red with the
+        order never reaching the venue.
+        """
+        client = FakeAlpacaClient({"AAA": _bars("AAA", [100.0])}, cash=10_000.0, auto_fill=False)
+        live = AlpacaBroker(client, clock=_clock())
+        wrapped = ShadowBroker(live, _InterruptClock())
+
+        with pytest.raises(KeyboardInterrupt):
+            wrapped.submit(Order("AAA", Side.BUY, qty=1))
+
+        assert live.pending_order_ids == ("1",)  # the venue has it, interrupt or not
 
     def test_the_shadow_never_holds_the_live_portfolio(self) -> None:
         seen: list[Portfolio] = []
