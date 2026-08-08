@@ -10,6 +10,10 @@ When a benchmark run is supplied it also renders the benchmark-relative block �
 beta, annualized alpha, correlation, information ratio, and the exposure-adjusted
 return of both sides (ADR-0037). Without a benchmark not one of those lines
 appears and the summary is byte-identical to what it has always been.
+When the caller supplies a :class:`~trading.metrics.SignificanceReport` it also
+renders the ADR-0039 block — the bootstrap confidence interval on Sharpe, the
+paired beats-the-benchmark win rate, and the trial-count deflation — and again,
+omitting it leaves the summary byte-identical.
 ``write_equity_csv`` writes one
 row per trading day with an ``exposure`` column and, when a benchmark run is
 supplied, a ``benchmark_equity`` column aligned by timestamp. ``write_equity_png``
@@ -26,11 +30,23 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
 from trading.frequency import TRADING_DAYS_PER_YEAR, Frequency
-from trading.metrics import MIN_TRADES_PER_PARAMETER, compare_to_benchmark, compute
+from trading.metrics import (
+    DEFLATED_SHARPE_CONFIDENCE,
+    MIN_TRADES_PER_PARAMETER,
+    compare_to_benchmark,
+    compute,
+)
 
 if TYPE_CHECKING:
     from trading.engine import BacktestResult, EquityPoint
-    from trading.metrics import BenchmarkComparison, PerformanceMetrics
+    from trading.metrics import (
+        BenchmarkComparison,
+        DeflatedSharpe,
+        PairedBootstrap,
+        PerformanceMetrics,
+        SharpeInterval,
+        SignificanceReport,
+    )
 
 
 # Schema version of the canonical machine-readable run artifact emitted by
@@ -49,6 +65,7 @@ def summarize(
     *,
     periods_per_year: float = 252.0,
     free_parameters: int | None = None,
+    significance: SignificanceReport | None = None,
 ) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
 
@@ -65,6 +82,13 @@ def summarize(
     :func:`trading.strategies.free_parameter_count`) adds the trades-per-parameter
     significance line and, when the sample is too thin to support that many knobs,
     an explicit warning (ADR-0029). Omitted, the block is unchanged.
+
+    ``significance`` (from :func:`trading.metrics.assess_significance`) adds the
+    ADR-0039 block: the bootstrap confidence interval on Sharpe, the paired
+    beats-the-benchmark win rate, and the trial-count deflation. It is
+    caller-supplied rather than computed here because a bootstrap is the most
+    expensive thing in the report by an order of magnitude, and because a run that
+    does not ask for it must print exactly the bytes it always has.
     """
     metrics = compute(result, periods_per_year, free_parameters=free_parameters)
     lines = [f"Symbols:       {', '.join(result.symbols)}"]
@@ -113,6 +137,8 @@ def summarize(
         lines.extend(
             _benchmark_relative_lines(comparison, metrics, bench_metrics, len(result.equity_curve))
         )
+    if significance is not None:
+        lines.extend(significance_lines(significance))
     if result.rejections:
         lines.append(f"Rejected:      {len(result.rejections)} order(s)")
     if result.clamps:
@@ -209,6 +235,97 @@ def _benchmark_relative_lines(
         ]
     )
     return lines
+
+
+def _sharpe_interval_lines(interval: SharpeInterval) -> list[str]:
+    """The Sharpe confidence interval, and the warning that matters most.
+
+    A point estimate reads as a measurement; an interval reads as what it is. When
+    the interval straddles zero the run has *not* measured an edge, and the report
+    says exactly that instead of leaving the reader to compare two numbers in their
+    head — the same rule ADR-0029 applied to a thin trade count.
+    """
+    lines = [
+        f"Sharpe {interval.confidence * 100:.0f}% CI: "
+        f"[{interval.low:+.2f}, {interval.high:+.2f}]  "
+        f"(stationary block bootstrap: {interval.resamples} resamples, "
+        f"{interval.block_length}-bar blocks, {interval.observations} return periods, "
+        f"seed {interval.seed})"
+    ]
+    if interval.block_length_was_reduced:
+        lines.append(
+            f"  note: block length cut from {interval.requested_block_length} to "
+            f"{interval.block_length} bars — the series is too short to hold blocks that "
+            "long, so less autocorrelation is preserved than intended"
+        )
+    if interval.straddles_zero:
+        lines.append(
+            "  ⚠ the interval straddles zero — this sample cannot distinguish the "
+            "strategy from having no edge at all; the point estimate is not a finding"
+        )
+    return lines
+
+
+def _paired_lines(paired: PairedBootstrap) -> list[str]:
+    """The paired beats-the-benchmark win rate (the powerful figure, ADR-0039)."""
+    return [
+        f"Beats bench:   {paired.win_rate * 100:.1f}% of {paired.resamples} PAIRED resamples "
+        f"(strategy Sharpe > benchmark Sharpe on the same blocks; "
+        f"observed edge {paired.observed_edge:+.2f} over {paired.observations} shared periods)"
+    ]
+
+
+def _deflated_lines(deflated: DeflatedSharpe) -> list[str]:
+    """The trial-count deflation (KAN-619): what the winner is worth after the search."""
+    lines = [
+        f"Trials:        {deflated.trials} scored; the luckiest skill-free one would show "
+        f"Sharpe {deflated.null_best_sharpe:+.2f} (observed {deflated.observed_sharpe:+.2f})"
+    ]
+    if deflated.probability is None:
+        lines.append(
+            "Deflated:      n/a — the skew/kurtosis correction is undefined on this "
+            "return series, so no probability can be stated"
+        )
+        return lines
+    lines.append(f"Deflated:      P(true Sharpe > that null best) = {deflated.probability:.2f}")
+    if not deflated.significant:
+        lines.append(
+            f"  ⚠ below {DEFLATED_SHARPE_CONFIDENCE:.2f} — after discounting for "
+            f"{deflated.trials} trial(s), this Sharpe is not distinguishable from the best "
+            "of that many skill-free runs"
+        )
+    return lines
+
+
+def significance_lines(significance: SignificanceReport) -> list[str]:
+    """Render the whole ADR-0039 significance block, notes included.
+
+    Each of the three figures is rendered only when it could be computed; anything
+    that could not is explained by a ``note:`` line rather than silently missing,
+    because "we did not measure this" and "we measured it and it was zero" are the
+    two things this bench refuses to conflate.
+    """
+    lines: list[str] = []
+    if significance.sharpe_interval is not None:
+        lines.extend(_sharpe_interval_lines(significance.sharpe_interval))
+    if significance.paired is not None:
+        lines.extend(_paired_lines(significance.paired))
+    if significance.deflated is not None:
+        lines.extend(_deflated_lines(significance.deflated))
+    lines.extend(f"  note: {note}" for note in significance.notes)
+    return lines
+
+
+def summarize_significance(significance: SignificanceReport | None) -> str:
+    """:func:`significance_lines` as one block of text, or ``""`` when absent.
+
+    The entry point a non-``summarize`` caller (the sweep command) uses to print
+    the same block under its own ranking table, so the two commands never grow
+    divergent wordings for the same statistic.
+    """
+    if significance is None:
+        return ""
+    return "\n".join(significance_lines(significance))
 
 
 def _halt_episode_lines(result: BacktestResult) -> list[str]:
@@ -361,6 +478,7 @@ def result_to_dict(
     benchmark_curve: list[EquityPoint] | None = None,
     benchmark_metrics: BenchmarkComparison | None = None,
     periods_per_year: float | None = None,
+    significance: SignificanceReport | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
 
@@ -406,6 +524,20 @@ def result_to_dict(
           "absent": [                 # requested symbols that contributed no bars
             {"symbol": str, "reason": str, "detail": str}, ...   # ADR-0032, additive
           ],
+          "significance": {   # ADR-0039, additive; null when it was not computed
+            "sharpe_interval": {"point": float, "low": float, "high": float,
+                                "confidence": float, "resamples": int,
+                                "block_length": int, "requested_block_length": int,
+                                "observations": int, "seed": int} | null,
+            "paired": {"win_rate": float, "observed_edge": float, "resamples": int,
+                       "block_length": int, "requested_block_length": int,
+                       "observations": int, "seed": int} | null,
+            "deflated": {"trials": int, "observed_sharpe": float,
+                         "null_best_sharpe": float, "probability": float | null,
+                         "observations": int, "trial_sharpe_stdev": float | null,
+                         "skew": float, "kurtosis": float} | null,
+            "notes": list[str]
+          } | null,
           "halt": {"halted": bool,          # a halt occurred during the run
                    "halt_ts": iso8601 str | null,     # the FIRST halt
                    "halt_reason": str | null,
@@ -419,8 +551,9 @@ def result_to_dict(
         }
 
     The ``episode_count``/``episodes`` keys (ADR-0031), the top-level ``absent``
-    list (ADR-0032), and the top-level ``benchmark_metrics`` block plus the
-    ``metrics.return_per_unit_exposure`` field (ADR-0037) are purely additive:
+    list (ADR-0032), the top-level ``benchmark_metrics`` block plus the
+    ``metrics.return_per_unit_exposure`` field (ADR-0037), and the top-level
+    ``significance`` block (ADR-0039) are purely additive:
     every pre-existing key keeps its exact meaning and value — ``symbols`` is
     still the *requested* universe, ``metrics`` is still exactly
     ``dataclasses.asdict`` of what the caller passed — so
@@ -459,6 +592,12 @@ def result_to_dict(
         Annualization factor for that derivation. ``None`` (the default) resolves
         it from the ``frequency`` label, so a daily run keeps the 252 basis and an
         intraday one scales correctly without the caller repeating itself.
+    significance:
+        An already-computed :class:`~trading.metrics.SignificanceReport`
+        (ADR-0039), or ``None`` (emits ``null``). Unlike ``benchmark_metrics`` this
+        is **never derived here**: a bootstrap costs thousands of Sharpe
+        computations, so writing a ``result.json`` must not silently pay for one
+        the caller did not ask for.
     """
     return {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -518,6 +657,9 @@ def result_to_dict(
             {"symbol": entry.symbol, "reason": entry.reason, "detail": entry.detail}
             for entry in result.absent
         ],
+        # Whether the Sharpe above means anything (ADR-0039). ``null`` means the
+        # caller did not ask for a bootstrap — NOT that the run was insignificant.
+        "significance": asdict(significance) if significance is not None else None,
         "halt": {
             "halted": result.halted,
             "halt_ts": result.halt_ts.isoformat() if result.halt_ts is not None else None,
@@ -547,6 +689,7 @@ def write_result_json(
     benchmark_curve: list[EquityPoint] | None = None,
     benchmark_metrics: BenchmarkComparison | None = None,
     periods_per_year: float | None = None,
+    significance: SignificanceReport | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
 
@@ -561,6 +704,7 @@ def write_result_json(
         benchmark_curve=benchmark_curve,
         benchmark_metrics=benchmark_metrics,
         periods_per_year=periods_per_year,
+        significance=significance,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:

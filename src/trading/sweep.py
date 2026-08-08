@@ -23,6 +23,13 @@ between a hopeful number and an honest one:
   unbiased estimate of forward performance. ADR-0016 parked this recombination as
   "a later slice"; ADR-0026 is that slice.
 
+A sweep also knows the one thing a single backtest cannot: **how many trials
+competed**. :attr:`SweepSummary.trial_count` and
+:meth:`SweepSummary.deflated_winner` carry that count into the report so "best of
+24 configurations" stops reading like a finding (ADR-0039). The deflation itself
+is pure arithmetic — no RNG — and only the bootstrap in :mod:`trading.metrics`
+draws random numbers, always from an explicitly seeded generator.
+
 Everything here is pure with respect to the inputs: no wall clock, no RNG, no
 network. Determinism comes entirely from the injected adapter (seed a
 ``SyntheticAdapter`` for offline, repeatable sweeps) and the deterministic grid
@@ -41,7 +48,14 @@ from typing import TYPE_CHECKING, cast
 from trading.broker import SimulatedBroker
 from trading.config import RiskConfig
 from trading.engine import EmptyUniverseError, Engine
-from trading.metrics import PerformanceMetrics, compute
+from trading.metrics import (
+    DeflatedSharpe,
+    PerformanceMetrics,
+    ReturnMoments,
+    compute,
+    curve_moments,
+    deflated_sharpe,
+)
 from trading.risk import Guardrails
 from trading.strategies import STRATEGIES
 from trading.types import Portfolio
@@ -197,6 +211,13 @@ class SweepRun:
 
     ``window`` is 0 for a plain grid sweep and the 0-based window index under
     walk-forward; ``start``/``end`` are that window's actual date bounds.
+
+    ``moments`` holds the run's return-series moments (ADR-0039) — five floats, not
+    the whole return series — which is exactly what
+    :func:`~trading.metrics.deflated_sharpe` needs to discount the eventual winner
+    for the number of combinations that competed. It defaults to ``None`` so
+    hand-built :class:`SweepRun` fixtures stay valid, and ``None`` means "not
+    recorded", never "no dispersion".
     """
 
     params: ParamCombo
@@ -204,6 +225,7 @@ class SweepRun:
     window: int
     start: datetime
     end: datetime
+    moments: ReturnMoments | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -229,6 +251,55 @@ class SweepSummary:
         key = _rank_key(by)
         return sorted(self.runs, key=lambda run: key(run.metrics), reverse=True)
 
+    @property
+    def trial_count(self) -> int:
+        """How many runs competed for the top of the ranking (KAN-619, ADR-0039).
+
+        **One completed run is one trial** — a ``(combination, window)`` pair, since
+        that is the granularity :meth:`ranked` sorts and therefore the granularity
+        at which a winner is *selected*. Combinations the strategy constructor
+        rejected never ran and never had a chance to win, so ``skipped`` does not
+        count; a window dropped for having no data did not produce a candidate
+        either.
+
+        This is what the tool can see. Every earlier invocation of ``trading
+        sweep``, every date range tried and abandoned, every strategy compared by
+        hand — all invisible, so any correction built on this number is a lower
+        bound. :func:`~trading.metrics.assess_significance` prints that caveat
+        alongside the figure rather than letting it read as a complete accounting.
+        """
+        return len(self.runs)
+
+    def trial_sharpes(self) -> list[float]:
+        """The annualized Sharpe of every run, in grid-expansion order.
+
+        The input :func:`~trading.metrics.expected_max_sharpe` needs: both the
+        *count* of trials and their *spread* determine how high the luckiest
+        skill-free candidate would have scored.
+        """
+        return [run.metrics.sharpe for run in self.runs]
+
+    def deflated_winner(
+        self,
+        by: str = "sharpe",
+        periods_per_year: float = 252.0,
+    ) -> DeflatedSharpe | None:
+        """Deflate the top-ranked run's Sharpe for the whole search (ADR-0039).
+
+        The answer to "best of 24 configs" reading like a finding: the winner is
+        scored against the Sharpe the luckiest of those 24 would have shown with no
+        edge at all. ``None`` when there are no runs, or when the winner's moments
+        were not recorded (a hand-built summary) — an honest absence, never a
+        flattering skip.
+        """
+        winners = self.ranked(by)
+        if not winners:
+            return None
+        moments = winners[0].moments
+        if moments is None:
+            return None
+        return deflated_sharpe(moments, self.trial_sharpes(), periods_per_year)
+
 
 def _build_strategy(name: str, combo: ParamCombo) -> Strategy:
     """Construct a parameterized strategy from the registry factory.
@@ -251,13 +322,15 @@ def _run_combo(
     *,
     cash: float,
     risk: RiskConfig,
-) -> tuple[PerformanceMetrics, int]:
-    """Run one combo over one span and return its metrics + equity-curve length.
+) -> tuple[PerformanceMetrics, int, ReturnMoments | None]:
+    """Run one combo over one span; return its metrics, bar count, and moments.
 
     A *fresh* :class:`~trading.broker.SimulatedBroker` and
     :class:`~trading.risk.Guardrails` per call, so no portfolio or kill-switch
     state ever leaks between runs (ADR-0016). The curve length is returned so
-    callers can tell a real result from a span that produced (almost) no bars.
+    callers can tell a real result from a span that produced (almost) no bars, and
+    the return-series moments (ADR-0039) so the winner can later be deflated
+    without re-running anything or retaining the whole curve.
 
     A span in which *no* symbol has data raises
     :class:`~trading.engine.EmptyUniverseError` from the engine (ADR-0032). That is
@@ -268,7 +341,7 @@ def _run_combo(
     broker = SimulatedBroker(Portfolio(cash=cash))
     engine = Engine(adapter, broker, Guardrails(risk))
     result = engine.run(_build_strategy(strategy, combo), tickers, start, end)
-    return compute(result), len(result.equity_curve)
+    return compute(result), len(result.equity_curve), curve_moments(result.equity_curve)
 
 
 def _partition_grid(
@@ -342,7 +415,7 @@ def run_sweep(
     for combo in runnable:
         for window_index, (win_start, win_end) in enumerate(spans):
             try:
-                metrics, _points = _run_combo(
+                metrics, _points, moments = _run_combo(
                     strategy,
                     combo,
                     adapter,
@@ -366,6 +439,7 @@ def run_sweep(
                     window=window_index,
                     start=win_start,
                     end=win_end,
+                    moments=moments,
                 )
             )
 
@@ -596,7 +670,7 @@ def run_walk_forward(
         scored: list[_Scored] = []
         try:
             for combo in runnable:
-                metrics, points = _run_combo(
+                metrics, points, _moments = _run_combo(
                     strategy,
                     combo,
                     adapter,
@@ -616,7 +690,7 @@ def run_walk_forward(
 
         # --- out-of-sample: the winner, ONCE, on data selection never saw ------
         try:
-            oos_metrics, oos_points = _run_combo(
+            oos_metrics, oos_points, _oos_moments = _run_combo(
                 strategy,
                 winner.combo,
                 adapter,

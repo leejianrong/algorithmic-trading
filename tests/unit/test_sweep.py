@@ -29,6 +29,8 @@ from trading.data.fake import FakeAdapter
 from trading.data.synthetic import SyntheticAdapter
 from trading.metrics import PerformanceMetrics
 from trading.sweep import (
+    SweepRun,
+    SweepSummary,
     WalkForwardFold,
     WalkForwardSummary,
     expand_grid,
@@ -622,3 +624,145 @@ def test_walk_forward_unknown_strategy_and_rank_key_raise() -> None:
         )
     with pytest.raises(ValueError, match="unknown walk-forward mode"):
         run_walk_forward("equal_weight", {}, _adapter(), _SYMBOLS, _START, _END, mode="diagonal")
+
+
+# --- trial accounting and the deflated winner (KAN-619, ADR-0039) -------------
+
+
+def test_every_run_records_its_return_moments() -> None:
+    """The five floats the deflation needs, captured without keeping the curve."""
+    summary = run_sweep(
+        "sma_crossover",
+        {"fast": [5, 10], "slow": [30, 50]},
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+    )
+    assert summary.runs
+    for run in summary.runs:
+        assert run.moments is not None
+        assert run.moments.count > 0
+        assert run.moments.stdev > 0.0
+        # The moments describe the same series the metrics do: mean / stdev,
+        # annualized, is exactly the Sharpe already on the run.
+        annualized = run.moments.mean / run.moments.stdev * math.sqrt(252.0)
+        assert annualized == pytest.approx(run.metrics.sharpe)
+
+
+def test_trial_count_is_the_number_of_runs_that_competed() -> None:
+    """A trial is a (combination, window) run — the granularity a winner is picked at."""
+    summary = run_sweep(
+        "sma_crossover",
+        {"fast": [5, 10], "slow": [30, 50]},
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+    )
+    assert summary.trial_count == 4
+    assert len(summary.trial_sharpes()) == 4
+
+
+def test_windows_multiply_the_trial_count() -> None:
+    summary = run_sweep(
+        "sma_crossover",
+        {"fast": [5], "slow": [30, 50]},
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+        windows=3,
+    )
+    assert summary.trial_count == 6
+
+
+def test_rejected_combos_are_not_trials() -> None:
+    """A combination the constructor refused never ran, so it never had a chance to win."""
+    summary = run_sweep(
+        "sma_crossover",
+        {"fast": [10, 50], "slow": [30]},  # fast=50 >= slow=30 is rejected
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+    )
+    assert len(summary.skipped) == 1
+    assert summary.trial_count == 1
+
+
+def test_deflated_winner_scores_the_top_ranked_run_against_the_whole_search() -> None:
+    summary = run_sweep(
+        "sma_crossover",
+        {"fast": [5, 10, 15], "slow": [30, 50]},
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+    )
+    deflated = summary.deflated_winner()
+    assert deflated is not None
+    assert deflated.trials == summary.trial_count == 6
+    assert deflated.observed_sharpe == pytest.approx(summary.ranked()[0].metrics.sharpe)
+    # Six candidates with a spread of Sharpes means the null is no longer zero:
+    # the best of six coin flips already looks like an edge.
+    assert deflated.null_best_sharpe > 0.0
+    assert deflated.trial_sharpe_stdev is not None
+
+
+def test_a_bigger_grid_raises_the_bar_the_winner_must_clear() -> None:
+    """The point of KAN-619: searching harder makes the winner *less* impressive."""
+    small = run_sweep(
+        "sma_crossover", {"fast": [5], "slow": [30, 50]}, _adapter(), _SYMBOLS, _START, _END
+    )
+    large = run_sweep(
+        "sma_crossover",
+        {"fast": [5, 10, 15, 20], "slow": [30, 50, 80]},
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+    )
+    small_deflated = small.deflated_winner()
+    large_deflated = large.deflated_winner()
+    assert small_deflated is not None
+    assert large_deflated is not None
+    assert large_deflated.trials > small_deflated.trials
+    assert large_deflated.null_best_sharpe > small_deflated.null_best_sharpe
+
+
+def test_deflated_winner_is_none_when_there_is_nothing_to_deflate() -> None:
+    empty = run_sweep(
+        "sma_crossover", {"fast": [50], "slow": [30]}, _adapter(), _SYMBOLS, _START, _END
+    )
+    assert empty.runs == []
+    assert empty.deflated_winner() is None
+
+
+def test_deflated_winner_is_none_for_a_hand_built_summary_without_moments() -> None:
+    """An honest absence: a summary that never recorded moments cannot be deflated."""
+    summary = SweepSummary(
+        strategy="sma_crossover",
+        symbols=["AAA"],
+        runs=[
+            SweepRun(
+                params={"fast": 5},
+                metrics=_metrics(1.5, 0.2),
+                window=0,
+                start=_START,
+                end=_END,
+            )
+        ],
+    )
+    assert summary.trial_count == 1
+    assert summary.deflated_winner() is None
+
+
+def test_deflation_is_deterministic_and_needs_no_rng() -> None:
+    first = run_sweep(
+        "sma_crossover", {"fast": [5, 10], "slow": [30, 50]}, _adapter(), _SYMBOLS, _START, _END
+    )
+    second = run_sweep(
+        "sma_crossover", {"fast": [5, 10], "slow": [30, 50]}, _adapter(), _SYMBOLS, _START, _END
+    )
+    assert first.deflated_winner() == second.deflated_winner()

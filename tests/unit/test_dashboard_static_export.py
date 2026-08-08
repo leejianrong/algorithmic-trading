@@ -9,14 +9,15 @@ structure, never brittle full-HTML equality. No engine, no network, no FastAPI.
 
 from __future__ import annotations
 
-from datetime import UTC, datetime
+import random
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from trading.dashboard.payload import build_payload
 from trading.dashboard.static_export import render_html, write_html
 from trading.engine import BacktestResult, EquityPoint, HaltEpisode
-from trading.metrics import PerformanceMetrics, compute
+from trading.metrics import PerformanceMetrics, assess_significance, compute
 from trading.report import RESULT_SCHEMA_VERSION, result_to_dict
 from trading.types import Fill, Order, Portfolio, Side
 
@@ -263,5 +264,103 @@ def test_return_per_unit_exposure_is_shown_as_a_percentage() -> None:
 
 def test_benchmark_panel_keeps_the_page_self_contained() -> None:
     html = render_html(build_payload(_benchmark_doc(_STRATEGY_CURVE, _BENCHMARK_CURVE)))
+    assert "http://" not in html
+    assert "https://" not in html
+
+
+# --- Sharpe significance panel (ADR-0039) ------------------------------------
+
+
+def _significance_doc(
+    *, mean: float = 0.0005, benchmark: bool = False, trials: int = 1, seed: int = 404
+) -> dict[str, Any]:
+    """A run document long enough to bootstrap, plus its significance block."""
+    rng = random.Random(seed)
+    equity = 1_000.0
+    curve = [EquityPoint(_ts(1), equity, 0.5)]
+    for i in range(400):
+        equity *= 1.0 + rng.gauss(mean, 0.01)
+        curve.append(EquityPoint(_ts(1) + timedelta(days=i + 1), equity, 0.5))
+    result = BacktestResult(
+        symbols=["AAA"],
+        starting_cash=curve[0].equity,
+        equity_curve=curve,
+        final_portfolio=Portfolio(cash=curve[-1].equity),
+        fills=[],
+    )
+    bench = [EquityPoint(p.ts, p.equity * 0.5, 1.0) for p in curve] if benchmark else None
+    report = assess_significance(
+        curve,
+        bench,
+        resamples=100,
+        trial_sharpes=[0.2 * i for i in range(trials)] if trials > 1 else None,
+    )
+    return result_to_dict(
+        result,
+        mode="backtest",
+        frequency="1d",
+        metrics=compute(result),
+        benchmark_curve=bench,
+        significance=report,
+    )
+
+
+def test_significance_panel_renders_the_interval_and_its_provenance() -> None:
+    html = render_html(build_payload(_significance_doc()))
+    assert "Sharpe significance" in html
+    for label in ("Point Sharpe", "Block length", "Resamples", "Seed"):
+        assert label in html
+
+
+def test_significance_panel_warns_when_the_interval_straddles_zero() -> None:
+    # A zero-drift draw whose 95% interval really does contain zero — asserted on
+    # the document first, so the test is about the *rendering*, not about the draw.
+    doc = _significance_doc(mean=0.0, seed=1)
+    interval = doc["significance"]["sharpe_interval"]
+    assert interval["low"] <= 0.0 <= interval["high"]
+    assert "straddles zero" in render_html(build_payload(doc))
+
+
+def test_significance_panel_shows_the_paired_win_rate_when_a_benchmark_ran() -> None:
+    html = render_html(build_payload(_significance_doc(benchmark=True)))
+    assert "Beats benchmark" in html
+    assert "Observed edge" in html
+
+
+def test_significance_panel_shows_the_trial_deflation() -> None:
+    html = render_html(build_payload(_significance_doc(trials=24)))
+    assert "Trials" in html
+    assert "Null best Sharpe" in html
+    assert "Deflated P" in html
+    assert "not distinguishable from the best of that many skill-free runs" in html
+
+
+def test_significance_panel_says_so_plainly_when_no_bootstrap_ran() -> None:
+    doc = _benchmark_doc(_STRATEGY_CURVE, _BENCHMARK_CURVE)
+    assert doc["significance"] is None
+    html = render_html(build_payload(doc))
+    assert "No bootstrap was run for this result" in html
+
+
+def test_significance_panel_is_absent_for_a_pre_adr_0039_document() -> None:
+    """A result.json written before this feature has no key; say nothing about it."""
+    doc = _benchmark_doc(_STRATEGY_CURVE, _BENCHMARK_CURVE)
+    del doc["significance"]
+    html = render_html(build_payload(doc))
+    assert "Sharpe significance" not in html
+
+
+def test_significance_notes_reach_the_page() -> None:
+    html = render_html(build_payload(_significance_doc()))
+    assert "LOWER BOUND" in html
+
+
+def test_the_significance_block_never_leaks_into_the_flat_metric_grid() -> None:
+    html = render_html(build_payload(_significance_doc()))
+    assert "Sharpe Interval" not in html
+
+
+def test_significance_panel_keeps_the_page_self_contained() -> None:
+    html = render_html(build_payload(_significance_doc(benchmark=True, trials=24)))
     assert "http://" not in html
     assert "https://" not in html

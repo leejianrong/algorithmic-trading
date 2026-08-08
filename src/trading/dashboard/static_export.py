@@ -203,6 +203,96 @@ def _benchmark_panel(document: dict[str, Any]) -> str:
     )
 
 
+def _significance_panel(document: dict[str, Any]) -> str:
+    """The Sharpe-significance panel (ADR-0039), or nothing at all.
+
+    Same three states as :func:`_benchmark_panel`, for the same reason: a
+    ``result.json`` written before this feature existed has no ``significance``
+    key and the page stays silent rather than inventing an absence; a present
+    ``null`` says plainly that no bootstrap was requested; and a present block
+    renders the interval, the paired win rate, and the trial deflation.
+
+    The two warnings are the point of the panel. An interval that straddles zero
+    and a deflated probability under the threshold both mean the headline Sharpe
+    above is not a finding, and the page says so in words rather than leaving the
+    reader to compare numbers.
+    """
+    if "significance" not in document:
+        return ""
+    block = document["significance"]
+    if block is None:
+        body = (
+            '<p class="muted">No bootstrap was run for this result, so there is no '
+            "confidence interval on the Sharpe above. That is a missing measurement, "
+            "not a passing one.</p>"
+        )
+        return f'<section class="panel"><h2>Sharpe significance</h2>{body}</section>'
+
+    tiles: list[str] = []
+    warnings: list[str] = []
+    interval = block.get("sharpe_interval")
+    if interval:
+        low, high = interval.get("low"), interval.get("high")
+        tiles.append(
+            _tile(
+                f"Sharpe {_num(interval.get('confidence', 0) * 100)}% CI",
+                f"[{_ratio(low)}, {_ratio(high)}]",
+            )
+        )
+        tiles.append(_tile("Point Sharpe", _ratio(interval.get("point"))))
+        tiles.append(_tile("Block length", f"{_num(interval.get('block_length'))} bars"))
+        tiles.append(_tile("Resamples", _num(interval.get("resamples"))))
+        tiles.append(_tile("Seed", _num(interval.get("seed"))))
+        if isinstance(low, (int, float)) and isinstance(high, (int, float)) and low <= 0 <= high:
+            warnings.append(
+                "The confidence interval straddles zero: this sample cannot distinguish "
+                "the strategy from having no edge at all."
+            )
+    paired = block.get("paired")
+    if paired:
+        tiles.append(_tile("Beats benchmark", _pct_plain(paired.get("win_rate"))))
+        tiles.append(_tile("Observed edge", _ratio(paired.get("observed_edge"))))
+    deflated = block.get("deflated")
+    if deflated:
+        tiles.append(_tile("Trials", _num(deflated.get("trials"))))
+        tiles.append(_tile("Null best Sharpe", _ratio(deflated.get("null_best_sharpe"))))
+        probability = deflated.get("probability")
+        tiles.append(_tile("Deflated P", "n/a" if probability is None else _ratio(probability)))
+        if isinstance(probability, (int, float)) and probability < 0.95:
+            warnings.append(
+                f"After discounting for {deflated.get('trials')} trial(s), the Sharpe is "
+                "not distinguishable from the best of that many skill-free runs."
+            )
+    notes = block.get("notes") or []
+    note_html = "".join(f"<li>{_esc(note)}</li>" for note in notes)
+    warning_html = "".join(f'<p class="warn">{_esc(text)}</p>' for text in warnings)
+    notes_block = (
+        f'<ul class="muted" style="margin:12px 0 0;font-size:0.85rem;">{note_html}</ul>'
+        if note_html
+        else ""
+    )
+    return (
+        '<section class="panel"><h2>Sharpe significance</h2>'
+        f'<div class="tiles">{"".join(tiles)}</div>{warning_html}{notes_block}</section>'
+    )
+
+
+def _tile(label: str, rendered: str) -> str:
+    """One metric tile — the shape every panel above already uses."""
+    return (
+        f'<div class="tile"><div class="tile-label">{_esc(label)}</div>'
+        f'<div class="tile-value">{_esc(rendered)}</div></div>'
+    )
+
+
+def _pct_plain(value: Any) -> str:
+    """A 0-1 fraction as an unsigned percentage (a win rate is never negative)."""
+    try:
+        return f"{float(value) * 100:.1f}%"
+    except (TypeError, ValueError):
+        return _esc(value)
+
+
 def _chart_svg(chart: dict[str, Any]) -> str:
     width = float(chart["width"])
     height = float(chart["height"])
@@ -449,6 +539,10 @@ th {
   background: var(--halt-bg); color: var(--halt-ink); border: 1px solid var(--halt-ink);
   border-radius: 10px; padding: 12px 16px; margin-bottom: 20px;
 }
+.warn {
+  background: var(--halt-bg); color: var(--halt-ink); border: 1px solid var(--halt-ink);
+  border-radius: 8px; padding: 10px 14px; margin: 12px 0 0; font-size: 0.9rem;
+}
 """
 
 
@@ -488,6 +582,7 @@ def render_html(payload: dict[str, Any]) -> str:
   {_metrics_panel(document.get("metrics"))}
 </section>
 {_benchmark_panel(document)}
+{_significance_panel(document)}
 <section class="panel">
   <h2>Fills</h2>
   {_fills_table(document.get("fills", []))}
