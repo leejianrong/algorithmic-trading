@@ -51,7 +51,14 @@ from trading.data.recent_window import (
 )
 from trading.data.synthetic import SyntheticAdapter
 from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
-from trading.engine import DEFAULT_PAPER_LOOKBACK, BacktestResult, BarOutcome, Engine, PaperSession
+from trading.engine import (
+    DEFAULT_PAPER_LOOKBACK,
+    BacktestResult,
+    BarOutcome,
+    EmptyUniverseError,
+    Engine,
+    PaperSession,
+)
 from trading.frequency import DAILY, Frequency
 from trading.interfaces import Broker, DataAdapter
 from trading.liquidity import DEFAULT_FORMATION_DAYS, screen_by_adv
@@ -256,6 +263,46 @@ def _make_paper_broker(name: str, live: bool, cash: float) -> Broker:
     raise typer.Exit(2)
 
 
+def _run_benchmark(
+    adapter: DataAdapter,
+    symbol: str,
+    *,
+    cash: float,
+    start: datetime,
+    end: datetime,
+) -> BacktestResult | None:
+    """Run the unconstrained buy-and-hold benchmark, or warn and return ``None``.
+
+    The benchmark is a comparison bolted onto a backtest that has *already*
+    finished, so a benchmark that cannot be run must cost one warning line, not
+    the summary, the equity CSV, and the result.json the operator asked for.
+    Previously the exception escaped after the main run had succeeded and the
+    whole command died with a traceback.
+
+    Exactly one exception type is tolerated, and the narrowness is deliberate.
+    After ADR-0032 every way the benchmark's *data* can fail arrives here as
+    :class:`~trading.engine.EmptyUniverseError`: a mistyped ticker, a symbol that
+    had not listed in the range, and a transport/credentials/unreadable-file
+    failure all end up as an :class:`~trading.engine.AbsentSymbol` inside
+    :func:`~trading.engine.load_series`, and a one-symbol universe with nothing
+    in it raises. The three failure shapes therefore share one handler *and* stay
+    distinguishable, because the error message carries the per-symbol reason.
+    Anything else — a broken guardrail, a sizing crash, a misbehaving broker —
+    means the bench itself is faulty, which makes the strategy numbers suspect
+    too, so it is left to propagate.
+    """
+    bench_broker = SimulatedBroker(Portfolio(cash=cash))
+    engine = Engine(adapter, bench_broker, Guardrails(RiskConfig.unlimited()))
+    try:
+        return engine.run(get_strategy("buy_and_hold"), [symbol], start, end)
+    except EmptyUniverseError as exc:
+        typer.echo(
+            f"warning: benchmark {symbol} could not be run, continuing without it — {exc}",
+            err=True,
+        )
+        return None
+
+
 @app.command()
 def backtest(
     strategy: str = typer.Option(..., "--strategy", "-s", help="Registered strategy name."),
@@ -376,10 +423,7 @@ def backtest(
     bench_result: BacktestResult | None = None
     bench_symbol = benchmark.strip().upper()
     if bench_symbol:
-        bench_broker = SimulatedBroker(Portfolio(cash=cash))
-        bench_result = Engine(adapter, bench_broker, Guardrails(RiskConfig.unlimited())).run(
-            get_strategy("buy_and_hold"), [bench_symbol], start, end
-        )
+        bench_result = _run_benchmark(adapter, bench_symbol, cash=cash, start=start, end=end)
 
     # The strategy's tunable-argument count turns on the trades-per-parameter
     # sample-size check and its warning (ADR-0029).
