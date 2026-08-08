@@ -59,7 +59,7 @@ testpaths = ["tests"]
 addopts = "-ra --strict-markers -m 'not integration and not e2e and not network'"
 markers = [
     "integration: needs external infra (broker creds, optional extras) but NOT the open internet. CI-only, not in the fast gate.",
-    "network: talks to a third-party service we do not control (yfinance). Nightly only — never a required check (ADR-0040).",
+    "network: talks to a third-party service we do not control (yfinance, Alpaca). Nightly only — never a required check (ADR-0040, ADR-0046).",
     "e2e: boots the full stack end to end. CI-only.",
 ]
 

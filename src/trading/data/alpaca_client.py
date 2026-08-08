@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Protocol, runtime_checkable
 
 from trading.types import SHARE_EPS, Bar, Side
@@ -91,6 +91,32 @@ class AssetInfo:
             raise ValueError(f"AssetInfo.symbol must not contain whitespace, got {self.symbol!r}")
 
 
+@dataclass(frozen=True, slots=True)
+class SplitEvent:
+    """One stock split, as the broker's corporate-actions record describes it.
+
+    ``ratio`` is ``new_rate / old_rate``: ``4.0`` for a 4-for-1 forward split
+    (one old share becomes four), ``0.1`` for a 1-for-10 reverse split. It is the
+    factor a *correct* adjusted series divides every pre-``ex_date`` price by, and
+    therefore exactly the factor :mod:`trading.data.alpaca_adapter` checks for
+    (ADR-0045).
+
+    ``ex_date`` is the first session that trades at the post-split price, which is
+    the boundary the check straddles — not ``payable_date`` or ``record_date``,
+    which say nothing about which bar carries the new price level.
+    """
+
+    symbol: str
+    ex_date: date
+    ratio: float
+
+    def __post_init__(self) -> None:
+        if not self.symbol:
+            raise ValueError("SplitEvent.symbol must be a non-empty ticker")
+        if self.ratio <= 0.0:
+            raise ValueError(f"SplitEvent.ratio must be positive, got {self.ratio}")
+
+
 # Order lifecycle statuses we use. Kept as strings (not an enum) so a real
 # Alpaca status string round-trips unchanged through :class:`AlpacaOrder`. The
 # literals below are alpaca-py's ``OrderStatus`` *values*, verified against the
@@ -165,6 +191,24 @@ class AlpacaClient(Protocol):
         The interval selects the bar cadence (daily or intraday); ``get_daily_bars``
         is the ``interval == 1 day`` special case. Bars are ascending by time with
         START timestamps, ``adjusted`` selecting adjusted vs raw prices (ADR-0008).
+        """
+        ...
+
+    def get_splits(self, symbol: str, start: datetime, end: datetime) -> list[SplitEvent]:
+        """Stock splits for ``symbol`` with an ex-date inside ``[start, end]`` (ADR-0045).
+
+        The seventh call on the seam, and the second widening ADR-0017
+        anticipated. It exists because the bars endpoint's ``adjustment=all`` is
+        not self-verifying: on 2026-08-09 Alpaca served AAPL's 2020-08-31 bars
+        with the 4:1 split **not** backed out while still answering the adjusted
+        request, i.e. a phantom-split cliff (ADR-0008) inside a series that claims
+        to have none. This call is the independent record that makes the defect
+        detectable rather than merely suspected — and Alpaca's own corporate-actions
+        endpoint *does* carry the split, so the two halves of the provider
+        disagree with each other, not with us.
+
+        A transport/plan failure raises, exactly like :meth:`get_asset`: "we could
+        not ask" is never the same answer as "there were no splits" (ADR-0028).
         """
         ...
 
@@ -266,6 +310,8 @@ class FakeAlpacaClient:
         self._prices: dict[str, float] = {}
         self._assets: dict[str, AssetInfo] = dict(assets or {})
         self._asset_failures: dict[str, str] = {}
+        self._splits: dict[str, list[SplitEvent]] = {}
+        self._split_failures: dict[str, str] = {}
         # (symbol, side-or-None) -> the exception submit_order should raise.
         self._submit_failures: dict[tuple[str, Side | None], Exception] = {}
         self._next_id = 1
@@ -363,6 +409,21 @@ class FakeAlpacaClient:
         self._asset_failures[symbol] = message
         self._assets.pop(symbol, None)
 
+    def set_splits(self, symbol: str, splits: list[SplitEvent]) -> None:
+        """Script the corporate-actions record :meth:`get_splits` will report."""
+        self._splits[symbol] = list(splits)
+        self._split_failures.pop(symbol, None)
+
+    def set_splits_failure(self, symbol: str, message: str = "split lookup failed") -> None:
+        """Make :meth:`get_splits` raise for ``symbol`` -- "we could not ask" (ADR-0028).
+
+        The distinction the adapter's guard turns on: a failed lookup is not
+        evidence that the adjusted series is wrong, so it may not be reported as
+        one (ADR-0045).
+        """
+        self._split_failures[symbol] = message
+        self._splits.pop(symbol, None)
+
     def _fill_price(self, symbol: str, override: float | None) -> float:
         """Resolve a fill price: explicit override, set price, else last bar close."""
         if override is not None:
@@ -402,6 +463,20 @@ class FakeAlpacaClient:
         accepted for signature parity but do not re-derive or re-bucket prices.
         """
         return [b for b in self._bars.get(symbol, []) if start <= b.ts <= end]
+
+    def get_splits(self, symbol: str, start: datetime, end: datetime) -> list[SplitEvent]:
+        """Return the scripted splits for ``symbol`` with an ex-date in ``[start, end]``.
+
+        Empty by default: the fake models no corporate actions, so a test that
+        cares about one says so explicitly via :meth:`set_splits`.
+        """
+        if symbol in self._split_failures:
+            raise RuntimeError(f"{self._split_failures[symbol]}: {symbol!r}")
+        return [
+            split
+            for split in self._splits.get(symbol, [])
+            if start.date() <= split.ex_date <= end.date()
+        ]
 
     def submit_order(self, symbol: str, qty: float, side: Side) -> AlpacaOrder:
         scripted = self._submit_failures.get((symbol, side)) or self._submit_failures.get(
@@ -698,6 +773,12 @@ class RealAlpacaClient:
         self._data = StockHistoricalDataClient(key, secret)
         self._trading = TradingClient(key, secret, paper=paper)
         self._feed = feed
+        # Built on first use only: the corporate-actions endpoint is a *different*
+        # Alpaca service with its own base URL, and most runs never ask for a
+        # split, so a client that only trades pays nothing for it.
+        self._key = key
+        self._secret = secret
+        self._corporate_actions: Any | None = None
 
     @property
     def feed(self) -> str | None:
@@ -802,6 +883,48 @@ class RealAlpacaClient:
         ]
         bars.sort(key=lambda b: b.ts)
         return bars
+
+    def get_splits(self, symbol: str, start: datetime, end: datetime) -> list[SplitEvent]:
+        """Stock splits for ``symbol`` with an ex-date in ``[start, end]`` (ADR-0045).
+
+        Reads Alpaca's corporate-actions endpoint -- a *different* service from
+        the bars endpoint, which is the whole point: it is an independent record
+        of the events the adjusted bars are supposed to have backed out. Verified
+        against the live paper plan on 2026-08-09: it returns AAPL's 2020-08-31
+        ``forward_splits`` entry (``new_rate=4.0, old_rate=1.0``) even though the
+        bars endpoint's adjusted series ignores it.
+
+        Both ``forward_splits`` and ``reverse_splits`` are read; the other
+        corporate-action types Alpaca reports (cash dividends, name changes,
+        mergers, ...) do not rescale a price series and are skipped. Failures
+        propagate: a plan or transport error means "we could not ask", which the
+        caller must not read as "there were no splits" (ADR-0028).
+        """
+        from alpaca.data.historical.corporate_actions import CorporateActionsClient
+        from alpaca.data.requests import CorporateActionsRequest
+
+        if self._corporate_actions is None:
+            self._corporate_actions = CorporateActionsClient(self._key, self._secret)
+        response = self._corporate_actions.get_corporate_actions(
+            CorporateActionsRequest(symbols=[symbol], start=start.date(), end=end.date())
+        )
+        actions = _require_model(response, "corporate actions")
+        data: dict[str, list[Any]] = actions.data
+        splits: list[SplitEvent] = []
+        for kind in ("forward_splits", "reverse_splits"):
+            for row in data.get(kind, []):
+                old_rate = float(row.old_rate)
+                if old_rate <= 0.0:
+                    continue  # a rate of zero is not a rescaling we can reason about
+                splits.append(
+                    SplitEvent(
+                        symbol=str(getattr(row, "symbol", "") or symbol),
+                        ex_date=row.ex_date,
+                        ratio=float(row.new_rate) / old_rate,
+                    )
+                )
+        splits.sort(key=lambda s: s.ex_date)
+        return splits
 
     def submit_order(self, symbol: str, qty: float, side: Side) -> AlpacaOrder:
         """Place a market order, or raise :class:`OrderRejectedError` if refused.
