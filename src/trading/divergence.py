@@ -431,7 +431,11 @@ class ShadowBroker:
 
     @property
     def divergences(self) -> list[FillDivergence]:
-        """Every tracked order, in submission order.
+        """Every tracked order: settled ones in settlement order, then the open ones.
+
+        Not submission order — an order the venue took three bars to answer closes
+        after one submitted later. Each row carries ``submitted_at`` and
+        ``submitted_ts``, so a caller that wants submission order can sort on them.
 
         Safe to read at any point: an order only one side has answered is emitted
         with :data:`PENDING` on the other, which is itself a divergence worth
