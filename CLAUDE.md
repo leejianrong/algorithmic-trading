@@ -253,9 +253,41 @@ As of this writing:
   already-terminal order and `LookupError` on an unknown id, both observed against the
   venue rather than assumed. 5 new live tests (skip when the market is open) + 8 fast.
   Account left flat. Still open: an order that *expires* overnight (same code path as
-  `canceled`, not yet watched), and **duplicate order stacking** — while orders sit
-  parked the portfolio stays flat, so a target-weight strategy re-emits the same order
-  every bar and the broker submits it again; needs its own slice (ADR-0036).
+  `canceled`, not yet watched). Duplicate order stacking, the other gap this ADR
+  recorded, is now closed — see below.
+- **A parked order cannot be duplicated (2026-08-08, ADR-0036 amended, offline-verified):**
+  while an order sat `accepted` at the venue the portfolio reconciled from a flat
+  account, so a target-weight strategy re-emitted the same order every bar and
+  `AlpacaBroker` submitted it again — orders compounding for as long as the venue held
+  them, then all filling at the open. And the guardrails were **no backstop**:
+  `Guardrails` nets same-bar committed exposure, but that tally resets at the top of
+  every bar while `current_gross` reads off a book a parked order leaves flat, so each
+  bar re-authorised a fresh *full* gross allowance. Measured: five bars of an unmet 20%
+  target queued **100% of equity**. `submit` now **refuses** a new order when the broker
+  is already working one in the same symbol **and side**, recording `(Order, reason)` on
+  `rejections` (so it reaches `result.json` and the summary, never a silent drop) and
+  naming the working order's venue id. Keying on the side is what makes "never block an
+  exit" structural rather than a special case: long-or-flat means a SELL is the only way
+  out (ADR-0011), the same asymmetry the halt path already encodes (ADR-0013/0031), and
+  an exit is never even compared against a working entry. A duplicate SELL *is*
+  suppressed — the first is already working and will still fill; a second would oversell.
+  Partial fills stay legitimate (ADR-0033): the key is *working*, not submitted, so a
+  partially-filled-then-`canceled`/`expired` order is out of the pending set and a
+  follow-up for the remainder goes through, while one still reporting
+  `partially_filled` suppresses the remainder until the venue settles it. Built from the
+  state the broker already had (`_pending` + `_requested`) — no new bookkeeping, no seam
+  change, and `SimulatedBroker` fills within the bar so it has no working order to
+  duplicate: **the backtest path is untouched**. 10 new fast tests, including the
+  exposure statement asserted end to end through the real `Engine` with default
+  guardrails so the cross-bar hole cannot reopen quietly. This is the **symptom-level**
+  guard; the intent-level fix (the sizer netting in-flight quantity, so the duplicate is
+  never generated) is deliberately deferred as **KAN-678** — defence in depth, not
+  alternatives. Known cosmetic gaps, both in the shared engine's per-bar bookkeeping
+  rather than the broker: a refusal reaches `BacktestResult.rejections` but not that
+  bar's `BarOutcome.broker_rejections` (the engine snapshots the broker's list around
+  `on_bar` only) and the refused order still appears in `BarOutcome.submitted`. The
+  live test is written and gated but **unexecuted** (no credentials in the landing
+  worktree).
 - **Fill divergence — is the modelled 5 bps real? (offline-verified, ADR-0038):**
   `divergence.py` answers the one question no backtest can. `ShadowBroker` is a
   **`Broker` decorator** (no engine change, no `if paper:` — ADR-0002 intact) that
@@ -459,7 +491,8 @@ src/trading/
   config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps)
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5)
   broker.py                # SimulatedBroker + CostModel
-  brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020)
+  brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020);
+                           #   refuses a duplicate while a same-side order is working (ADR-0036)
   report.py                # text summary + equity_curve.csv + result.json (result_to_dict, ADR-0023);
                            #   absent-symbol caveat lines + additive `absent` key (ADR-0032)
   divergence.py            # ShadowBroker: live-vs-modelled fill comparison + report (ADR-0038)

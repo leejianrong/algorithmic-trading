@@ -125,10 +125,104 @@ order is left behind.
   venue has not been watched end to end (only `canceled`, which shares the code
   path). The paper account was left flat — no positions, no working orders,
   $100,000.06 cash — and that was checked after the run, not assumed.
-- **Known and unfixed:** while orders sit parked, the portfolio reconciles from the
-  account and therefore stays flat, so a target-weight strategy re-emits the same
-  order every bar and `AlpacaBroker` submits a *duplicate* each time. Overnight at
-  an intraday interval that stacks orders that all fill at the open, and the poll
-  cost grows with the pending set. Suppressing a duplicate needs a policy decision
-  about what a strategy means when it re-targets a weight it already asked for, so
-  it gets its own slice rather than riding along with a verification ticket.
+- ~~**Known and unfixed:**~~ **now fixed — see the amendment below.** While orders
+  sit parked, the portfolio reconciles from the account and therefore stays flat, so
+  a target-weight strategy re-emits the same order every bar and `AlpacaBroker`
+  submitted a *duplicate* each time. Overnight at an intraday interval that stacks
+  orders that all fill at the open, and the poll cost grows with the pending set.
+  Suppressing a duplicate needed a policy decision about what a strategy means when
+  it re-targets a weight it already asked for, so it got its own slice rather than
+  riding along with a verification ticket.
+
+## Amendment (2026-08-08, KAN-669): a duplicate order is refused, not sent
+
+The open question above is now decided. **If `AlpacaBroker` is already working an
+order in the same symbol and the same direction, `submit` refuses the new one** —
+it records `(order, reason)` on `rejections`, naming the working order's venue id,
+and never reaches the client.
+
+Confirmed live on 2026-08-08 before the fix, and worse than the paragraph above
+said: **the guardrails give no cross-bar protection at all.** `Guardrails` nets
+same-bar committed exposure through `_committed_gross`, but that tally is reset at
+the top of every bar, and `current_gross` is read off a portfolio that a parked
+order leaves flat. So each bar re-authorises a fresh *full* gross allowance against
+a book it believes is empty; `max_position_pct = 0.25` caps one order, not the
+running total. Measured in the fast layer: five bars of an unmet 20% target queued
+**100% of equity** at the venue, all of it to fill at the next open. The only
+backstop was Alpaca's own buying-power check — a third party's risk limit standing
+in for ours.
+
+**The refusal is keyed on symbol *and* side.** Two consequences, both intended:
+
+- **A working BUY can never block a SELL.** This bench is long-or-flat (ADR-0011),
+  so a SELL is the only exit there is, and an unsellable position is far worse than
+  a duplicate buy. It is the same asymmetry the kill switch already encodes — exits
+  are allowed while halted, always (ADR-0013/0031). Because the side is part of the
+  key, an exit is never even *compared* against a working entry: it is structural,
+  not a special case that a later refactor could drop. Tested in both directions.
+- **A duplicate SELL is suppressed too, and that is not blocking an exit.** The
+  first SELL is already at the venue and will still fill; a second would try to sell
+  the same position twice, which this bench forbids outright.
+
+**Partial fills stay legitimate (ADR-0033).** The key is *working*, not *submitted*.
+An order that partly filled and then **ended** — `canceled` / `expired`, the routine
+end of a parked DAY order — is out of the pending set by the next bar, so a
+follow-up order for the unfilled remainder is a fresh intent and goes through (its
+partial fill still flows, unchanged). An order still reporting `partially_filled` is
+in a *working* state: the rest of that same order is live at the venue, so topping up
+the remainder would double it, and the guard suppresses it until the venue settles.
+Both cases have their own test.
+
+**This is the symptom-level guard, and deliberately only that.** The intent-level
+fix — teaching the sizer to net in-flight quantity, so a target is computed against
+"held plus working" rather than against a book that reads flat — is **deferred as
+KAN-678**. That is the better answer to "what does a strategy mean when it re-targets
+a weight it already asked for": it stops the duplicate being *generated* instead of
+refusing it at the wire, and it repairs the guardrails' blind spot rather than
+routing around it. But it changes the sizing layer, which the backtest shares, so it
+needs its own slice and its own byte-identity proof. The two are **defence in depth,
+not alternatives**: even with a netting sizer, a broker that will submit a duplicate
+on request is a broker that will eventually be asked to.
+
+Why the broker and not somewhere else:
+
+| Option | Why not |
+|--------|---------|
+| Net in-flight quantity in `sizing.py` (KAN-678) | The right fix, and the reason this one is scoped as a *guard* rather than a solution. It touches the shared sizing path, so it cannot ride along with a broker-local change that must not alter backtest output. Deferred, not rejected. |
+| Track cross-bar committed exposure in `Guardrails` | Would fix the exposure hole generally, but the guardrails are shared by both modes and have no notion of an order in flight — only `AlpacaBroker` knows what the venue is still working. Making risk state depend on a broker's private pending set inverts the dependency. |
+| Cancel the parked order and resubmit the new one | Trades a duplicate for a race: cancellation is asynchronous (established above), so between the request and `canceled` the venue may fill the original and the "replacement" doubles the position anyway. It also churns the venue every bar. |
+| Refuse on symbol alone, ignoring side | Would block an exit while a buy is parked. Non-negotiable: long-or-flat means a stuck position has no other way out. |
+| Suppress silently, with no `rejections` entry | The bench trades on honest numbers. A refused order is a decision the run made; it belongs in `result.json` and the summary beside a venue rejection, not in a log line. |
+| Dedupe on the whole `Order`, quantity included | A re-emitted target rarely repeats to the share, so nearly every duplicate would slip through — the bug would look fixed and not be. |
+
+Consequences:
+
+- Five bars of an unmet target queue one order, not five. Ten new fast tests pin it:
+  the submission count reaching a never-filling venue, the refusal's shape and its
+  survival through `result_to_dict`, both exit directions, both partial-fill cases,
+  the release once an order settles, and symbol independence. The exposure statement
+  is asserted end to end through the real `Engine` with default guardrails, so the
+  cross-bar hole cannot reopen quietly.
+- **Only `AlpacaBroker` changed.** `SimulatedBroker` fills within the bar, so it
+  never has a working order to duplicate; the backtest path is untouched and its
+  output byte-identical.
+- **One refusal per refused order**, so a weekend session that re-asks on every
+  intraday bar records one row per bar for as long as the order is parked. That is
+  deliberately not deduplicated: each row is a real decision the run made, and a
+  hundred of them is the report telling you the venue has been holding your order
+  for a hundred bars. `SimulatedBroker` records a rejected order the same way.
+- **Two cosmetic gaps in the *engine's* per-bar bookkeeping, named rather than
+  fixed.** A refusal happens at submit time, in `_step` step 4, but the engine
+  snapshots `broker.rejections` around `on_bar` (step 1) to attribute
+  `BarOutcome.broker_rejections`, and it appends to `BarOutcome.submitted` on the
+  assumption that `submit` accepted. So a refusal reaches
+  `BacktestResult.rejections` — hence `result.json` and the summary, which is the
+  visibility that matters — while that bar's `BarOutcome` neither lists it nor
+  omits the order from `submitted`. Both live in the shared engine, which this
+  broker-local slice does not own.
+- A live test drives the same three-bars-one-order sequence against the paper
+  account with the venue shut and asserts the exit is still accepted. It is
+  double-gated on credentials **and** the SDK and skips when the market is open.
+  **Not yet executed:** the worktree this landed from had no credentials, so unlike
+  the rest of ADR-0036 the live half of this amendment is written but unwitnessed.
+  The fast layer is what the fix rests on.

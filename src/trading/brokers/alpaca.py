@@ -30,7 +30,7 @@ from trading.data.alpaca_client import (
     AlpacaOrder,
     RealAlpacaClient,
 )
-from trading.types import Bar, Fill, Order, Portfolio, Position
+from trading.types import Bar, Fill, Order, Portfolio, Position, Side
 
 # How long a single ``on_bar`` will poll a pending order before giving up and
 # leaving it to a later bar, and how long to wait between polls. Kept short
@@ -59,6 +59,15 @@ class AlpacaBroker:
     :class:`~trading.broker.SimulatedBroker` does, because
     :class:`~trading.engine.Engine` merges both into the same
     ``BacktestResult.rejections`` (ADR-0036).
+
+    An order the broker is already working in the same symbol and direction makes
+    a new one a **duplicate**, and :meth:`submit` refuses it rather than sending
+    it (ADR-0036 as amended). A parked order leaves the account flat, so a
+    target-weight strategy asks again every bar; without this the orders compound
+    for as long as the venue holds them and then all fill at once. Nothing else in
+    the bench needs this -- :class:`~trading.broker.SimulatedBroker` fills within
+    the bar, so it never has a working order to duplicate -- which is why the guard
+    lives here and the backtest path is untouched.
     """
 
     def __init__(
@@ -105,7 +114,26 @@ class AlpacaBroker:
         The fill is realized later, in :meth:`on_bar`, once the venue reports the
         order settled (ADR-0001: an order submitted on bar *t* fills no earlier
         than *t+1*).
+
+        **Unless the venue is already working the same intent.** A parked order
+        leaves the account -- and therefore the reconciled portfolio -- flat, so a
+        target-weight strategy re-emits its unmet target on every bar; submitting
+        each one stacks orders that all fill at the next open. When
+        :meth:`_working_order_id` finds a same-symbol, same-side order still
+        working, this records the new one on :attr:`rejections` and does **not**
+        send it (ADR-0036 as amended).
         """
+        working_id = self._working_order_id(order.symbol, order.side)
+        if working_id is not None:
+            working = self._requested[working_id]
+            self.rejections.append(
+                (
+                    order,
+                    f"not submitted: order {working_id} ({working.qty:g} "
+                    f"{order.side.value} {order.symbol}) is still working at the venue",
+                )
+            )
+            return
         placed = self._client.submit_order(order.symbol, order.qty, order.side)
         self._pending.append(placed.id)
         self._requested[placed.id] = order
@@ -158,6 +186,40 @@ class AlpacaBroker:
         return fills
 
     # -- internals --
+
+    def _working_order_id(self, symbol: str, side: Side) -> str | None:
+        """The id of an order in ``symbol`` on ``side`` the venue is still working.
+
+        Derived entirely from the state the broker already keeps -- the pending id
+        list and the ``_requested`` map of what each id was asked to do -- so the
+        guard adds no bookkeeping that could drift out of step with the venue.
+
+        **Keyed on symbol *and* side, deliberately.** Two consequences, both
+        wanted:
+
+        * A working BUY can never block a SELL. This bench is long-or-flat
+          (ADR-0011), so a SELL is the only exit there is, and an unsellable
+          position is far worse than a duplicate buy -- the same asymmetry the kill
+          switch already encodes by allowing exits while halted (ADR-0013/0031).
+          Because the key includes the side, an exit is never even *compared*
+          against a working entry.
+        * A duplicate SELL is suppressed too, and that is not blocking an exit: the
+          first SELL is already at the venue and will still fill. Sending a second
+          would try to sell the position twice, which this bench forbids outright.
+
+        **Working, not merely submitted.** A partially filled order that the venue
+        then *ended* (``canceled`` / ``expired`` -- the routine end of a parked DAY
+        order) is gone from the pending set by the time the next bar submits, so a
+        follow-up order for the unfilled remainder is a fresh intent and goes
+        through. One still reporting ``partially_filled`` is a working state
+        (ADR-0033): the rest of that same order is live, so topping it up would
+        double the remainder, and the guard suppresses it until the venue settles.
+        """
+        for order_id in self._pending:
+            working = self._requested.get(order_id)
+            if working is not None and working.symbol == symbol and working.side is side:
+                return order_id
+        return None
 
     def _poll(self, order_id: str) -> AlpacaOrder | None:
         """Poll one order until it reaches a terminal status or the timeout elapses.
