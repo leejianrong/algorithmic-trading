@@ -117,6 +117,28 @@ TERMINAL_STATUSES = frozenset({STATUS_FILLED, STATUS_REJECTED}) | TERMINAL_UNFIL
 _FAKE_EXCHANGE = "FAKE"
 
 
+class OrderRejectedError(RuntimeError):
+    """The venue refused a specific order outright, at submit time (ADR-0041).
+
+    Distinct from a transport, credential, or rate-limit failure: the request was
+    well formed and authenticated, and Alpaca decided *this order* may not be
+    placed -- no order id exists and nothing is working. Distinct too from
+    :data:`TERMINAL_UNFILLED_STATUSES`, which is a venue decision about an order it
+    already accepted (ADR-0033); this one never got that far.
+
+    Raised so :class:`~trading.brokers.alpaca.AlpacaBroker` can record it as a
+    rejection instead of letting a raw SDK ``APIError`` escape the seam and kill a
+    live session (ADR-0017: no SDK type leaves this module).
+    """
+
+
+# HTTP statuses that are never a refusal of the order itself, whatever the body
+# says: 401 is a credential problem and 429 is a rate limit -- both mean "we could
+# not ask", the distinction ADR-0028 draws for asset lookups. Everything 5xx is
+# excluded by the 4xx range check below.
+_NOT_AN_ORDER_REFUSAL = frozenset({401, 429})
+
+
 @runtime_checkable
 class AlpacaClient(Protocol):
     """Exactly what the Alpaca data adapter and paper broker need from Alpaca.
@@ -244,6 +266,8 @@ class FakeAlpacaClient:
         self._prices: dict[str, float] = {}
         self._assets: dict[str, AssetInfo] = dict(assets or {})
         self._asset_failures: dict[str, str] = {}
+        # (symbol, side-or-None) -> the exception submit_order should raise.
+        self._submit_failures: dict[tuple[str, Side | None], Exception] = {}
         self._next_id = 1
 
     # -- test/setup helpers (not part of the protocol) --
@@ -308,6 +332,32 @@ class FakeAlpacaClient:
         self._state.orders[order_id] = updated
         return updated
 
+    def set_submit_refusal(self, symbol: str, message: str, *, side: Side | None = None) -> None:
+        """Make :meth:`submit_order` refuse ``symbol`` with an :class:`OrderRejectedError`.
+
+        The fake accepted every order until ADR-0041, which is exactly why the live
+        duplicate-guard test asserted an exit the real venue refuses. ``side``
+        scopes the refusal to one direction, because that is the shape the venue
+        actually has: a parked BUY makes the *SELL* a "potential wash trade", while
+        the BUY itself is still accepted.
+        """
+        self._submit_failures[(symbol, side)] = OrderRejectedError(message)
+
+    def set_submit_failure(
+        self, symbol: str, error: Exception, *, side: Side | None = None
+    ) -> None:
+        """Make :meth:`submit_order` raise ``error`` -- a *transport* failure, not a refusal.
+
+        The other side of ADR-0041's classification: something that means "we could
+        not ask" must still propagate out of the broker rather than being recorded
+        as the venue's decision.
+        """
+        self._submit_failures[(symbol, side)] = error
+
+    def clear_submit_refusals(self) -> None:
+        """Drop every scripted submit failure (the venue stops refusing)."""
+        self._submit_failures.clear()
+
     def set_asset_failure(self, symbol: str, message: str = "asset lookup failed") -> None:
         """Make :meth:`get_asset` raise for ``symbol`` (an unknown ticker or API error)."""
         self._asset_failures[symbol] = message
@@ -354,6 +404,13 @@ class FakeAlpacaClient:
         return [b for b in self._bars.get(symbol, []) if start <= b.ts <= end]
 
     def submit_order(self, symbol: str, qty: float, side: Side) -> AlpacaOrder:
+        scripted = self._submit_failures.get((symbol, side)) or self._submit_failures.get(
+            (symbol, None)
+        )
+        if scripted is not None:
+            # Nothing is recorded and no id is issued: a refused order does not
+            # exist at the venue, which is what the broker's guard depends on.
+            raise scripted
         if qty <= 0:
             raise ValueError(f"order qty must be positive, got {qty}")
         order_id = str(self._next_id)
@@ -530,6 +587,57 @@ def _classify_data_error(exc: Exception, symbol: str, feed: str | None) -> Excep
     )
 
 
+def _order_error_code(exc: Exception) -> int | None:
+    """Alpaca's numeric error code for a refused order, or ``None`` if it gave none.
+
+    This is the structural discriminator :func:`_classify_order_error` turns on,
+    and it was read off the wire rather than assumed (2026-08-08, paper account):
+    a refusal of a *specific order* always carries an eight-digit ``code`` in the
+    body (``40310000`` insufficient buying power / wash trade, ``42210000`` unknown
+    asset / fractional short), while a credential failure answers a bare
+    ``{"message": "unauthorized."}`` with no code at all.
+
+    ``APIError.code`` is a *property that raises* in that no-code case -- alpaca-py
+    implements it as ``json.loads(self._error)["code"]``, so it throws ``KeyError``
+    rather than returning ``None`` -- which is why this cannot be a plain
+    ``getattr`` with a default.
+    """
+    try:
+        code: object = exc.code  # type: ignore[attr-defined]
+    except Exception:
+        return None
+    return code if isinstance(code, int) else None
+
+
+def _classify_order_error(exc: Exception, symbol: str, qty: float, side: Side) -> Exception:
+    """Map a failed order submission to our own type, or pass it through (ADR-0041).
+
+    "The venue refused this order" becomes an :class:`OrderRejectedError` carrying
+    the venue's body verbatim; "we could not ask" -- bad credentials, a rate limit,
+    a 5xx, a socket that died -- propagates unchanged, exactly the way
+    :meth:`RealAlpacaClient.get_asset` keeps an unknown ticker apart from a
+    transport failure (ADR-0028).
+
+    Getting this backwards is expensive in both directions. Treating a refusal as
+    fatal kills a live session mid-bar and loses its artifacts (the bug this
+    function exists to fix). Treating an outage as a refusal would let a run
+    continue quietly recording rejections and never trading -- so the pass-through
+    side is deliberately the default, and only a 4xx that Alpaca *named* with an
+    error code is claimed as a refusal.
+    """
+    status = getattr(exc, "status_code", None)
+    if not isinstance(status, int) or not (400 <= status < 500):
+        return exc
+    if status in _NOT_AN_ORDER_REFUSAL:
+        return exc
+    code = _order_error_code(exc)
+    if code is None:
+        return exc
+    return OrderRejectedError(
+        f"Alpaca refused {side.value} {qty:g} {symbol} (HTTP {status}, code {code}): {exc}"
+    )
+
+
 def _require_float(value: str | float | None, what: str) -> float:
     """Coerce an Alpaca numeric field (often a string) to float, or fail loudly.
 
@@ -696,6 +804,12 @@ class RealAlpacaClient:
         return bars
 
     def submit_order(self, symbol: str, qty: float, side: Side) -> AlpacaOrder:
+        """Place a market order, or raise :class:`OrderRejectedError` if refused.
+
+        A venue refusal is *classified*, not leaked: without this the SDK's
+        ``APIError`` travelled out of the seam, out of ``AlpacaBroker.submit`` and
+        out of a live session, taking the run's artifacts with it (ADR-0041).
+        """
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
 
@@ -705,7 +819,11 @@ class RealAlpacaClient:
             side=OrderSide.BUY if side is Side.BUY else OrderSide.SELL,
             time_in_force=TimeInForce.DAY,
         )
-        return self._to_order(_require_model(self._trading.submit_order(request), "submit_order"))
+        try:
+            placed = self._trading.submit_order(request)
+        except Exception as exc:
+            raise _classify_order_error(exc, symbol, qty, side) from exc
+        return self._to_order(_require_model(placed, "submit_order"))
 
     def get_order(self, order_id: str) -> AlpacaOrder:
         return self._to_order(

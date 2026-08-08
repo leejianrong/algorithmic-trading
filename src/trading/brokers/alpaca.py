@@ -28,6 +28,7 @@ from trading.data.alpaca_client import (
     TERMINAL_STATUSES,
     AlpacaClient,
     AlpacaOrder,
+    OrderRejectedError,
     RealAlpacaClient,
 )
 from trading.types import Bar, Fill, Order, Portfolio, Position, Side
@@ -55,6 +56,8 @@ class AlpacaBroker:
     ``expired``, ``replaced`` -- is recorded on :attr:`rejections` rather than
     raised, so one bad order never aborts a run; one still *working* at the poll
     timeout is neither, it simply stays pending and is retried on the next bar.
+    An order the venue refuses at *submit* time, before it exists at all, lands
+    there too (ADR-0041) -- the same promise, on the other end of the lifecycle.
     :attr:`rejections` holds ``(Order, reason)`` exactly as
     :class:`~trading.broker.SimulatedBroker` does, because
     :class:`~trading.engine.Engine` merges both into the same
@@ -122,6 +125,14 @@ class AlpacaBroker:
         :meth:`_working_order_id` finds a same-symbol, same-side order still
         working, this records the new one on :attr:`rejections` and does **not**
         send it (ADR-0036 as amended).
+
+        **And the venue gets a veto of its own.** An order Alpaca refuses outright
+        -- insufficient buying power, an unknown asset, or the "potential wash
+        trade" refusal it answers an opposite-side order with while one is working
+        -- arrives as an :class:`~trading.data.alpaca_client.OrderRejectedError`
+        and is recorded on :attr:`rejections` too, rather than propagating out of
+        the engine and ending the session (ADR-0041). A failure that means *we
+        could not ask* still propagates: it is not a decision about this order.
         """
         working_id = self._working_order_id(order.symbol, order.side)
         if working_id is not None:
@@ -134,7 +145,13 @@ class AlpacaBroker:
                 )
             )
             return
-        placed = self._client.submit_order(order.symbol, order.qty, order.side)
+        try:
+            placed = self._client.submit_order(order.symbol, order.qty, order.side)
+        except OrderRejectedError as exc:
+            # No id came back, so nothing is pending and nothing needs polling --
+            # the next bar is free to try the same intent again.
+            self.rejections.append((order, str(exc)))
+            return
         self._pending.append(placed.id)
         self._requested[placed.id] = order
 

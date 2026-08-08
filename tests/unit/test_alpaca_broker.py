@@ -590,3 +590,153 @@ class TestParkedOrdersDoNotCompoundExposure:
 
         assert len(result.rejections) == self.BARS - 1
         assert all("working" in reason for (_order, reason) in result.rejections)
+
+
+class TestVenueRefusalAtSubmit:
+    """A venue refusal at *submit* time is recorded, not raised (ADR-0041).
+
+    Found by executing the duplicate-guard live test against the paper account on
+    2026-08-08 with the venue shut. Alpaca answered the exit order with::
+
+        HTTP 403 {"code":40310000,"existing_order_id":"a182da86-...",
+                  "message":"potential wash trade detected. use complex orders",
+                  "reject_reason":"opposite side market/stop order exists"}
+
+    which the SDK raises as an ``APIError``. Nothing caught it, so it travelled
+    straight out of ``AlpacaBroker.submit`` -- through ``Engine._step`` and out of
+    ``PaperSession.run`` -- killing the session and taking the equity CSV,
+    ``result.json`` and the summary with it. That is the same class of loss
+    ADR-0033 fixed for Ctrl-C, arriving through a different door, and it is the
+    *routine* case: the refusal only happens while an order is parked, which is
+    the normal state of every overnight and weekend session.
+    """
+
+    def _broker(self, client: FakeAlpacaClient) -> AlpacaBroker:
+        return AlpacaBroker(client, clock=_clock(), poll_timeout=timedelta(seconds=0))
+
+    def test_a_refused_submit_is_recorded_instead_of_raising(self) -> None:
+        client = FakeAlpacaClient({"AAA": _series("AAA", [100.0])}, auto_fill=False)
+        client.set_submit_refusal("AAA", "potential wash trade detected. use complex orders")
+        broker = self._broker(client)
+        refused = Order("AAA", Side.SELL, qty=10)
+
+        broker.submit(refused)  # must not raise
+
+        assert len(broker.rejections) == 1
+        order, reason = broker.rejections[0]
+        assert order is refused
+        assert "wash trade" in reason  # the venue's words, not a summary
+
+    def test_a_refused_order_never_becomes_pending(self) -> None:
+        # No id came back, so there is nothing to poll -- and nothing that could
+        # make the duplicate guard refuse the *next* attempt for a ghost order.
+        client = FakeAlpacaClient({"AAA": _series("AAA", [100.0])}, auto_fill=False)
+        client.set_submit_refusal("AAA", "insufficient buying power")
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+
+        assert broker.pending_order_ids == ()
+        assert broker.on_bar({"AAA": _bar("AAA", 100.0)}) == []
+
+    def test_a_later_bar_can_still_try_again(self) -> None:
+        # A refusal is per-order, not a latch: the strategy re-emits next bar and
+        # the broker submits it, because nothing is working at the venue.
+        client = FakeAlpacaClient({"AAA": _series("AAA", [100.0])}, auto_fill=False)
+        client.set_submit_refusal("AAA", "potential wash trade detected")
+        broker = self._broker(client)
+
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        client.clear_submit_refusals()
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+
+        assert len(broker.rejections) == 1
+        assert len(broker.pending_order_ids) == 1
+
+    def test_we_could_not_ask_still_propagates(self) -> None:
+        # The other half of the classification (ADR-0028's stance, again): a
+        # credential or transport failure is NOT the venue refusing an order, and
+        # swallowing it would turn a broken session into a quiet stream of
+        # rejections that never trades.
+        client = FakeAlpacaClient({"AAA": _series("AAA", [100.0])}, auto_fill=False)
+        client.set_submit_failure("AAA", ConnectionError("connection reset by peer"))
+        broker = self._broker(client)
+
+        with pytest.raises(ConnectionError):
+            broker.submit(Order("AAA", Side.BUY, qty=10))
+
+        assert broker.rejections == []
+
+    def test_the_venue_can_refuse_the_exit_our_guard_deliberately_allows(self) -> None:
+        """The whole live finding, offline: our guard lets the SELL through, the venue does not.
+
+        ADR-0036's amendment says a working BUY "can never block a SELL", and that
+        remains true of *this bench* -- the guard is keyed on side and never even
+        compares the two. What the live run showed is that the claim does not
+        extend to the system: Alpaca refuses an opposite-side market order while
+        one is working, so an exit attempted against a parked entry is refused by
+        the **venue**. The bench's job is to report that, not to crash on it.
+        """
+        client = FakeAlpacaClient({"AAA": _series("AAA", [100.0])}, auto_fill=False)
+        broker = self._broker(client)
+        broker.submit(Order("AAA", Side.BUY, qty=10))
+        assert len(broker.pending_order_ids) == 1
+        # ...and now the venue starts refusing the opposite side, as it really does.
+        client.set_submit_refusal("AAA", "opposite side market/stop order exists", side=Side.SELL)
+
+        broker.submit(Order("AAA", Side.SELL, qty=10))
+
+        # Our guard did not refuse it: the reason is the venue's, not ours.
+        assert len(broker.rejections) == 1
+        _order, reason = broker.rejections[0]
+        assert "still working at the venue" not in reason  # not the duplicate guard
+        assert "opposite side" in reason
+        # And the parked BUY is untouched: one order at the venue, still pending.
+        assert len(broker.pending_order_ids) == 1
+
+    def test_a_venue_refusal_survives_the_result_document(self) -> None:
+        # Same visibility requirement as every other rejection (ADR-0036): it must
+        # reach result.json, which reads order.symbol / .qty / .side off the tuple.
+        import json
+
+        from trading.report import result_to_dict
+        from trading.types import Portfolio
+
+        client = FakeAlpacaClient({"AAA": _series("AAA", [100.0])}, auto_fill=False)
+        client.set_submit_refusal("AAA", "potential wash trade detected")
+        broker = self._broker(client)
+        broker.submit(Order("AAA", Side.SELL, qty=2.5))
+
+        document = result_to_dict(
+            BacktestResult(
+                symbols=["AAA"],
+                starting_cash=10_000.0,
+                equity_curve=[],
+                final_portfolio=Portfolio(cash=10_000.0),
+                rejections=list(broker.rejections),
+            ),
+            mode="paper",
+        )
+
+        assert document["rejections"] == [
+            {"symbol": "AAA", "qty": 2.5, "side": "sell", "reason": broker.rejections[0][1]}
+        ]
+        assert json.loads(json.dumps(document))["rejections"] == document["rejections"]
+
+    def test_a_refused_session_still_finishes_its_bars(self) -> None:
+        # The consequence that matters: a refusing venue costs the run its trades,
+        # not its artifacts. Driven through the real Engine so the exception path
+        # is the production one.
+        series = _series("AAA", [100.0] * 4)
+        client = FakeAlpacaClient({"AAA": series}, cash=10_000.0, auto_fill=False)
+        client.set_submit_refusal("AAA", "potential wash trade detected")
+        broker = AlpacaBroker(client, clock=_clock(), poll_timeout=timedelta(seconds=0))
+
+        result = Engine(FakeAdapter(series), broker).run(
+            EqualWeight(invested=0.2), ["AAA"], series[0].ts, series[-1].ts
+        )
+
+        assert len(result.equity_curve) == len(series)
+        assert result.fills == []
+        assert result.rejections
+        assert all("wash trade" in reason for (_order, reason) in result.rejections)
