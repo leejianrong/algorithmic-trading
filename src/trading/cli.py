@@ -808,9 +808,25 @@ def gen_data(
         typer.echo(f"wrote {len(bars)} bars to {path}")
 
 
-def _format_bar(outcome: BarOutcome) -> str:
-    """One human-readable status line for a newly completed paper bar."""
-    day = outcome.ts.date().isoformat()
+def _format_bar(outcome: BarOutcome, frequency: Frequency) -> str:
+    """One human-readable status line for a newly completed paper bar.
+
+    The leading stamp is rendered at the session's ``frequency``: a bare date for
+    daily (exactly as before intraday existed), date **and** ``%H:%M`` for anything
+    sub-daily — the same rendering the ADR-0042 warmup line uses for its span.
+    Without the time, a ``--interval 5m`` session prints ~78 identical stamps per
+    symbol-day, so the operator watching stdout cannot tell which bar is which, when
+    a fill happened, or whether the session is progressing or wedged; and this line
+    is also what goes to ``paper_session.log``, the only per-bar artifact that
+    survives mid-session, so the after-the-fact record had no time axis either.
+
+    The frequency is *passed in*, not sniffed off ``outcome.ts``. A non-midnight
+    timestamp would have implied intraday with no plumbing at all, but that is
+    inference rather than fact — it would silently re-format a daily bar stamped at
+    a session time — and ADR-0022's whole point is that the interval is carried
+    deliberately rather than guessed. The caller already has it in scope.
+    """
+    day = _format_bar_stamp(outcome.ts, frequency)
     if outcome.intents:
         decisions = ", ".join(_format_intent(i) for i in outcome.intents)
     else:
@@ -833,6 +849,13 @@ def _format_bar(outcome: BarOutcome) -> str:
         parts.append("RESUME: kill switch re-armed — new entries allowed again")
     parts.append(f"equity: ${outcome.equity:,.2f}  exposure: {outcome.exposure * 100:.1f}%")
     return "  |  ".join(parts)
+
+
+def _format_bar_stamp(ts: datetime, frequency: Frequency) -> str:
+    """The leading timestamp of a per-bar line, at ``frequency``'s resolution."""
+    if frequency.is_intraday:
+        return f"{ts:%Y-%m-%d %H:%M}"
+    return ts.date().isoformat()
 
 
 def _format_intent(intent: object) -> str:
@@ -1181,7 +1204,7 @@ def paper(
 
             def reporter(outcome: BarOutcome) -> None:
                 announce_warmup()
-                line = _format_bar(outcome)
+                line = _format_bar(outcome, freq)
                 typer.echo(line)
                 log_fh.write(line + "\n")
                 log_fh.flush()

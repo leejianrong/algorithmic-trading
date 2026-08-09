@@ -271,6 +271,7 @@ class TestTheOperatorActuallySeesIt:
 
     def test_the_paper_status_line_shows_the_refusal(self) -> None:
         from trading.cli import _format_bar
+        from trading.frequency import DAILY
 
         series = {"AAA": _series("AAA", 2)}
         client = _ParkingClient(series)
@@ -278,7 +279,7 @@ class TestTheOperatorActuallySeesIt:
         session, _broker = _session(client, strategy, series)
         session.run(max_new_bars=2)
 
-        line = _format_bar(session.session_log[1])
+        line = _format_bar(session.session_log[1], DAILY)
 
         assert "REJECT BUY AAA" in line
         assert "still working at the venue" in line
