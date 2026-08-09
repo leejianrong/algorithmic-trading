@@ -20,6 +20,32 @@ Monday runs a live paper session with a counterfactual `SimulatedBroker` shadowi
 model would have filled at, both measured against the same reference price. The
 difference is the answer.
 
+## Do not start it more than ~50 minutes early
+
+Tempting, in Singapore, to set it running and go to bed. Don't start it before
+**20:40 SGT**, and prefer 21:25–21:30.
+
+The session stops after 60 minutes of silence (ADR-0049: 12 polls of 5 minutes; it
+prints its own policy at startup). A poll before the open reveals nothing new, so
+silence *before* the first bar counts exactly the same as a data outage during the
+day. The first completed 5m bar is the 09:30–09:35 one, which lands at 09:35 ET =
+21:35 SGT — so the clock starts from launch and has to reach 21:35 before it runs out:
+
+| launch | ET | quiet before the first bar | empty polls | outcome |
+|---|---|---|---|---|
+| 21:30 SGT | 09:30 | 5 min | 1 | fine — this is the plan |
+| 21:00 SGT | 09:00 | 35 min | 7 | fine |
+| 20:40 SGT | 08:40 | 55 min | 11 | fine, but that is the edge |
+| **20:30 SGT** | 08:30 | 65 min | 13 | **dies at ~21:35, before it ever trades** |
+| **20:00 SGT** | 08:00 | 95 min | 19 | **dies at ~21:00** |
+
+It exits *cleanly* when this happens — artifacts written, exit 0 — so from the
+morning it looks like a completed run that found nothing. Check the warmup line and
+`Processed N completed bar(s)` before believing a quiet result.
+
+Starting late is the safer error: the session simply trades from whenever it starts.
+Starting an hour early is the one that silently costs the day.
+
 ## Before you start
 
 Four things, all quick. The first three are what `make paper-preflight` checks:
