@@ -39,12 +39,26 @@ It is measured on the clock, never ``time.time()``, so it is deterministic under
 offline ``--once`` replay drains every bar inside a single poll, so its latencies
 are near zero by construction.
 
+**An order the broker refused is not an order at the venue** (ADR-0050). A broker
+declines at two moments — at settlement, inside ``on_bar``, and at *submit*, where
+the duplicate-order guard (ADR-0036) and the venue's own veto (ADR-0041) live. Only
+the first was ever watched here, so a refused order was tracked like any other,
+never settled, and was reported as :data:`OUTCOME_PENDING` — the same rendering a
+genuinely parked order gets, for an order the venue never received. It is now
+detected by diffing the live rejection list around the live ``submit``, per order,
+and kept out of the comparison entirely: no tracked row, no ``pending``, no journal
+row to retract. It is counted on :attr:`ShadowBroker.submit_refusals` and printed,
+because the end-of-run tally already carries every refusal and this report must not
+be the one place they go quiet. Nothing about the measurement moves — a refused
+order never filled on either side, so it was never a paired fill.
+
 **The shadow can never perturb the live path.** Three structural properties, each
 covered by a test:
 
 1. The live call happens **first and unguarded** in both :meth:`ShadowBroker.submit`
-   and :meth:`ShadowBroker.on_bar`. Shadow code cannot run before the real order is
-   placed, so it cannot prevent it.
+   and :meth:`ShadowBroker.on_bar`. The one statement that precedes it — reading
+   the live rejection count so the refusal above can be told from an older one —
+   is itself inside ``try/except``, and the live call is reached on every path.
 2. Every line of shadow work sits inside ``try/except Exception``. A failure
    records a message on :attr:`ShadowBroker.errors`, permanently disables the
    shadow, and returns the live result unchanged. A bug here costs a report, never
@@ -260,6 +274,7 @@ class DivergenceSummary:
     max_latency: timedelta | None
     unmatched_live_fills: int = 0
     unmatched_live_rejections: int = 0
+    submit_refusals: int = 0
     errors: tuple[str, ...] = ()
     min_samples: int = MIN_PAIRED_FILLS
 
@@ -285,6 +300,7 @@ def summarize(
     errors: Sequence[str] = (),
     unmatched_live_fills: int = 0,
     unmatched_live_rejections: int = 0,
+    submit_refusals: int = 0,
 ) -> DivergenceSummary:
     """Aggregate divergence rows into a :class:`DivergenceSummary`."""
     config = costs or CostConfig()
@@ -325,6 +341,7 @@ def summarize(
         max_latency=max(latencies) if latencies else None,
         unmatched_live_fills=unmatched_live_fills,
         unmatched_live_rejections=unmatched_live_rejections,
+        submit_refusals=submit_refusals,
         errors=tuple(errors),
     )
 
@@ -403,6 +420,12 @@ class ShadowBroker:
         # attribution rule below is wrong, which is worth knowing.
         self.unmatched_live_fills: list[tuple[datetime | None, Fill]] = []
         self.unmatched_live_rejections: list[tuple[datetime | None, Order, str]] = []
+        # Orders the live broker refused at submit, so they never reached the venue
+        # and have no counterfactual to compare (ADR-0050). Kept apart from
+        # ``unmatched_live_rejections``, which means "our attribution rule is
+        # wrong": these are attributed exactly, to an order deliberately not
+        # tracked. Reported as a count, never as a row.
+        self.submit_refusals: list[tuple[datetime | None, Order, str]] = []
 
     # -- Broker seam (pure delegation on the live path) --
 
@@ -425,11 +448,45 @@ class ShadowBroker:
         return []
 
     def submit(self, order: Order) -> None:
-        """Place ``order`` on the live broker, then record it for comparison."""
-        self._live.submit(order)  # LIVE FIRST, UNGUARDED: nothing below can stop it.
-        if not self._enabled:
+        """Place ``order`` on the live broker, then record it for comparison.
+
+        **Unless the broker refused it** (ADR-0050). A broker declines at two
+        moments and only the settlement one used to be watched: the duplicate-order
+        guard (ADR-0036) and the venue's own veto (ADR-0041) both record on
+        ``rejections`` from inside ``submit``, before the order exists anywhere.
+        Such an order is not tracked at all — tracking it would leave a row nothing
+        can ever settle, which reads as :data:`OUTCOME_PENDING`, i.e. as an order
+        working at a venue that never received it. It lands on
+        :attr:`submit_refusals` instead, so it is reported rather than dropped.
+
+        The refusal is detected by diffing the live broker's rejection list around
+        the live call, per order — the same shape ``Engine._step`` uses (ADR-0044),
+        and per order rather than per bar for the same reason: the venue refuses a
+        *specific* order, so a bar with one refusal and two acceptances must say so.
+
+        The pre-call read is the only shadow statement that has ever run ahead of
+        the live submit, so it is guarded like every other: a broker whose
+        ``rejections`` raises disables the shadow, and the live call is still
+        reached on every path. ADR-0038's ordering guarantee is intact.
+        """
+        before: int | None = None
+        if self._enabled:
+            try:
+                before = len(self.rejections)
+            except Exception as exc:
+                self._disable("submit", exc)
+
+        self._live.submit(order)  # LIVE FIRST, UNGUARDED: nothing here can stop it.
+
+        if not self._enabled or before is None:
             return
         try:
+            refused = self.rejections[before:]
+            if refused:
+                self.submit_refusals.extend(
+                    (self._last_bar_ts, refused_order, reason) for refused_order, reason in refused
+                )
+                return
             self._tracked.append(
                 _Tracked(
                     order=order,
@@ -479,6 +536,11 @@ class ShadowBroker:
         Safe to read at any point: an order only one side has answered is emitted
         with :data:`PENDING` on the other, which is itself a divergence worth
         reporting (an order parked at the venue while the model filled it, ADR-0036).
+
+        Only orders the live broker *accepted* are here. One it refused at submit
+        never reached the venue, so it can never settle and a row for it would be a
+        permanent, indistinguishable ``pending`` (ADR-0050); those are counted on
+        :attr:`submit_refusals` instead.
         """
         return [*self._closed, *(self._close(t) for t in self._tracked)]
 
@@ -492,6 +554,7 @@ class ShadowBroker:
             errors=self.errors,
             unmatched_live_fills=len(self.unmatched_live_fills),
             unmatched_live_rejections=len(self.unmatched_live_rejections),
+            submit_refusals=len(self.submit_refusals),
         )
 
     # -- internals --
@@ -899,7 +962,15 @@ def render_report(
         f"  Price notion:      {summary.price_notion} (both sides; never mixed — ADR-0021)",
         f"  Cost model:        {summary.modelled_slippage_bps:.2f} bps slippage, "
         f"${summary.modelled_commission_per_share:.4f}/share commission",
-        f"  Orders tracked:    {summary.orders}",
+        f"  Orders tracked:    {summary.orders} (accepted by the live broker)",
+        *(
+            [
+                f"  Refused at submit: {summary.submit_refusals} — never reached the venue, "
+                "so not tracked and not pending (ADR-0036/0041; see the run's rejections)"
+            ]
+            if summary.submit_refusals
+            else []
+        ),
         f"  Comparable fills:  {summary.comparable} (both sides filled, reference open known)",
         f"  Outcome mismatch:  {summary.outcome_divergences} "
         f"(live-only fills {summary.live_only_fills}, model-only {summary.model_only_fills})",
