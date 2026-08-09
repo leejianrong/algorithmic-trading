@@ -22,28 +22,64 @@ difference is the answer.
 
 ## Before you start
 
-Four things, all quick:
+Four things, all quick. The first three are what `make paper-preflight` checks:
+
+```bash
+uv sync --extra alpaca     # the SDK is an optional extra, not in the frozen deps
+make paper-preflight       # read-only; exits non-zero if anything is not clean
+```
 
 1. `uv sync --extra alpaca`. The SDK is an optional extra and is not in the frozen
-   deps.
+   deps. The preflight reports whether it imports; it does not install it for you.
 2. `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in the environment. The code reads
    `os.environ` directly and does not load `.env`, so use `uv run --env-file .env`
-   if you are relying on the file.
+   if you are relying on the file. The preflight target passes `--env-file .env`
+   when the file exists, and reports presence only — it never prints a key.
 3. Check the paper account is flat. It should be, at about $100,000 with no
-   positions and no open orders.
+   positions and no open orders. The preflight prints cash, equity, the position
+   count and the working-order count, and fails on anything held or working. It
+   also prints the venue's own clock — whether the market is open, and the next
+   open and close — which is the quickest way to confirm the date you are about to
+   pass. That last read goes straight to the SDK inside `scripts/`, because the
+   `AlpacaClient` seam has no calendar call and adding one is an ADR-0017 decision
+   nobody needs for a run (ADR-0051).
 4. Stop the laptop sleeping. There is no supervision and no restart. If the machine
-   suspends, the run is gone. (This is what EPIC-86 exists to fix, and it is not
-   fixed yet.)
+   suspends, the run is gone. Nothing checks this for you. (This is what EPIC-86
+   exists to fix, and it is not fixed yet.)
+
+Then prove the whole path works, any time, without committing to the real thing:
+
+```bash
+make paper-dryrun          # the real command, scratch --out, stops at the first quiet poll
+```
+
+With the venue shut that primes warmup, trades nothing, and exits — which *is*
+success. It passes `--max-empty-polls 1` so it stops at the first quiet poll
+instead of waiting out the hour ADR-0049 gives a real session, so it costs one
+poll boundary (up to five minutes at `5m`). What matters in the output is
+`Warmup: primed N completed bar(s)` with `N` well above zero; the target says so
+before it starts and re-checks it at the end.
 
 ## The command
 
 ```bash
-uv run trading paper --strategy sma_crossover --symbols @blue20 \
+uv run --env-file .env trading paper --strategy sma_crossover --symbols @blue20 \
   --interval 5m --source alpaca --broker alpaca --live \
   --data-feed iex --divergence \
   --from 2026-08-10 --to 2026-08-10 \
-  --out results/paper/2026-08-10-divergence
+  --out results/paper/<UTC timestamp>-divergence
 ```
+
+**Run it with `make paper-live`**, which is that exact command, detached, with the
+`--out` timestamped for you. Nothing about the run changes — same strategy,
+symbols, interval, source, broker, feed and flags — so the block above is still
+what executes, and every launch echoes it in full and copies it to
+`<out>/launch.cmd`. Two reasons the target exists rather than typing this: a
+closed terminal kills a foreground session (SIGHUP is not handled), and a fixed
+`--out` would truncate an earlier attempt's `fill_divergence.csv` at startup
+(ADR-0048), which is precisely the evidence a retry is trying not to lose. The
+strategy, symbols and interval stay overridable — `make paper-live
+PAPER_STRATEGY=momentum` — and everything that defines the run does not.
 
 `sma_crossover` at 5m over `@blue20` was chosen by measurement, not taste. Across 25
 seed and session combinations it produced 75 to 108 fills per session, median 87, and
@@ -90,9 +126,15 @@ finalizes cleanly (ADR-0043) — but it changes what "watch for X" means everywh
 below. You are not watching; you are reading the evidence on Tuesday morning. Two
 consequences worth acting on:
 
-- **Detach the session, or a closed terminal kills it.** SIGHUP is not handled. Start
-  it under `tmux` (recommended — you can reattach on Tuesday and read the scrollback)
-  or `nohup`. Closing the lid on the terminal at 22:00 without this loses the run.
+- **Detach the session, or a closed terminal kills it.** SIGHUP is not handled.
+  `make paper-live` does this for you — `tmux` if it is installed (recommended: you
+  can reattach on Tuesday with `tmux attach -t paper-<stamp>` and read the
+  scrollback), `setsid` otherwise, and it prints which one it used. Launching the
+  raw command in a foreground shell and then closing the lid at 22:00 loses the run.
+  Do not reach for `nohup` on its own: `uv run` installs its own SIGHUP handler,
+  which overrides the ignore `nohup` sets, and a HUP in uv's first second kills the
+  wrapper before the python child that would have inherited the ignore even exists
+  (measured — the process gone with an empty log, ADR-0051).
 - **Stop the machine sleeping, and mean it.** This is a WSL2 host, so Windows
   suspending takes WSL down with it and the run is gone. Check the Windows power
   plan, not just the Linux side. An overnight run is exactly the case the
@@ -131,8 +173,11 @@ artifacts, and since ADR-0043 SIGTERM takes the same path, so `kill <pid>` from
 another terminal — or `docker stop`, or `systemd stop` — finalizes the run instead of
 destroying it. The summary names which one stopped it. Two things that are still not
 safe: `kill -9`, which by definition cannot be caught, and **closing the terminal**,
-which sends SIGHUP and is not handled. If you need to walk away from the session,
-start it under `nohup` or `tmux`.
+which sends SIGHUP and is not handled. Watched directly: a SIGHUP to a running
+session's process group killed it in under a second and left `equity_curve.csv` and
+`result.json` unwritten — only `paper_session.log` and the incrementally journaled
+`fill_divergence.csv` (ADR-0048) survived. `make paper-live` is what avoids that; it
+is not optional for an overnight run.
 
 Once it is finalizing, a second `kill` is ignored on purpose, so that writing
 `equity_curve.csv` and `result.json` cannot be interrupted half way. It takes
@@ -144,6 +189,14 @@ plain `kill` on the wrapper is fine — uv forwards SIGTERM and the session fina
 verified against this exact command. `kill -9` is not: SIGKILL cannot be forwarded, so
 you kill the wrapper and leave the session running orphaned. If you ever need to be
 certain you are signalling the session itself, target the `.venv/bin/python` child.
+
+`make paper-stop` is that `kill`, with the pid bookkeeping done for you: it re-reads
+the live wrapper pid from tmux, refuses to signal a pid that no longer looks like the
+session, sends SIGTERM and only SIGTERM, waits for the exit, and then lists the five
+artifacts and their sizes. `make paper-status` is the read-only version — where the
+run is writing, whether it is still alive, `paper_state.json`, and the last few
+console lines. There is no dashboard for a running session (KAN-712); that is all
+you get, and on Tuesday morning it is enough to tell a finished run from a dead one.
 
 **Check the first order's timestamp.** If anything in `fill_divergence.csv` has a
 `submitted_ts` before 09:30, the warmup fix did not take and the sample is
@@ -209,9 +262,11 @@ before trusting any backtest number, and no more than that.
 Run it again Tuesday. Nothing about the setup is single-use, and the only cost of a
 failed run is the day. If Monday shows the feed dropping out for longer than an hour,
 `--max-empty-polls N` overrides the tolerance for the retry (`N` polls, so at `5m` a
-value of 24 buys two hours); the default is what should be used otherwise. Sample size can also be pooled across sessions by hand:
-concatenate the per-session `fill_divergence.csv` files (use a distinct `--out` each
-time, or they overwrite) and average `realized_slippage_bps` where the live outcome
+value of 24 buys two hours; `make paper-live PAPER_EXTRA_ARGS="--max-empty-polls 24"`);
+the default is what should be used otherwise. Sample size can also be pooled across sessions by hand:
+concatenate the per-session `fill_divergence.csv` files (`make paper-live` gives each
+launch its own timestamped `--out`, so nothing overwrites) and average
+`realized_slippage_bps` where the live outcome
 is a fill and the model outcome is a fill. Pooling across days pools across market
 conditions, which widens the variance the report's `stdev_realized_bps` is meant to
 express, so say so if you do it.
