@@ -710,6 +710,22 @@ make audit          # dependency vulnerability scan
 make ci-local       # everything on CI's merge path, locally (the six required checks)
 ```
 
+Operator targets for a live paper session (ADR-0051) — needs the `alpaca` extra and
+paper credentials:
+
+```bash
+make paper-preflight   # read-only pre-run checks; non-zero if the account is not clean
+make paper-dryrun      # rehearse the exact live command into a scratch --out, stop at the first quiet poll
+make paper-live        # launch the real run DETACHED (tmux, else setsid) into a fresh timestamped --out
+make paper-stop        # SIGTERM so ADR-0043 finalizes; never SIGKILL
+make paper-status      # artifacts, paper_state.json, and the tail of the running session's console
+```
+
+**Never launch a live session with bare `nohup`.** `uv run` installs its own SIGHUP
+handler, which overrides the `SIG_IGN` `nohup` sets (measured: wrapper `SigCgt` has
+bit 1 set, `SigIgn` does not), so a hangup in uv's first second kills the wrapper
+before the child exists. `make paper-live` uses tmux or `setsid` instead.
+
 Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
 
 ## How work is done here (conventions)
