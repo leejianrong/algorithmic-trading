@@ -63,22 +63,41 @@ want that in a file, redirect stderr; `2>session.log` will not disturb the stdou
 report you are watching. `--log-level` and `--log-format json` exist and neither is
 needed here — the defaults are what the command above gets.
 
-## Times in this runbook are ET; the terminal prints UTC
+## This run happens overnight, Singapore time
 
-Every time below is New York market time, because that is how the session is
-described. Every timestamp the bench *prints* is UTC — bar stamps, log records,
-`result.json`, the warmup span. Nothing converts between them, deliberately: one
-clock everywhere beats two that can disagree.
+The operator is in Singapore (UTC+8). A US session is 09:30–16:00 New York time,
+which lands **21:30 Monday to 04:00 Tuesday** locally. Plan for that before
+anything else on this page:
 
-| what | ET | UTC, as it appears on screen |
-|---|---|---|
-| Open, session starts | 09:30 | **13:30** |
-| First trade | ~09:35 | **~13:35** |
-| Close, last bar | 16:00 | **20:00** |
-| Session ends by itself | ~17:00 | **~21:00** |
+| what | ET | UTC (what prints) | **SGT (your clock)** |
+|---|---|---|---|
+| Open, session starts | Mon 09:30 | Mon 13:30 | **Mon 21:30** |
+| First trade | ~Mon 09:35 | ~Mon 13:35 | **~Mon 21:35** |
+| Close, last bar | Mon 16:00 | Mon 20:00 | **Tue 04:00** |
+| Session ends by itself | ~Mon 17:00 | ~Mon 21:00 | **Tue 05:00** |
 
-So the first per-bar line you are waiting for reads `2026-08-10 13:35`, not
-`09:35`. (Daylight saving: ET is UTC-4 in August. In winter it is UTC-5.)
+Three columns because all three are real: the runbook narrates in ET because that
+is what a trading day *is*, the terminal prints UTC because that is what every
+timestamp in this bench carries, and SGT is when you will actually be awake.
+Nothing converts in code, deliberately — one clock everywhere beats two that can
+disagree, and rendering market-local time needs a timezone database and a decision
+about which market. So the first per-bar line you are waiting for reads
+`2026-08-10 13:35`. (ET is UTC-4 in August, UTC-5 in winter.)
+
+**You will be asleep for nearly all of it.** That is survivable — every artifact is
+now written as the session goes rather than at the end (ADR-0048), and a stop signal
+finalizes cleanly (ADR-0043) — but it changes what "watch for X" means everywhere
+below. You are not watching; you are reading the evidence on Tuesday morning. Two
+consequences worth acting on:
+
+- **Detach the session, or a closed terminal kills it.** SIGHUP is not handled. Start
+  it under `tmux` (recommended — you can reattach on Tuesday and read the scrollback)
+  or `nohup`. Closing the lid on the terminal at 22:00 without this loses the run.
+- **Stop the machine sleeping, and mean it.** This is a WSL2 host, so Windows
+  suspending takes WSL down with it and the run is gone. Check the Windows power
+  plan, not just the Linux side. An overnight run is exactly the case the
+  "no supervision, no restart" warning below is about — EPIC-86 is the fix, and it is
+  not built.
 
 ## What should happen, in order
 
