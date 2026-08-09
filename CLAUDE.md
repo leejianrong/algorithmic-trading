@@ -729,6 +729,18 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   `gh api repos/:owner/:repo/branches/main/protection`; the escape hatch, if a
   required check can never pass, is to edit protection — an admin can still do
   that, which is what keeps `enforce_admins: true` from deadlocking a solo repo.
+- **Squash against your own base commit, never `origin/main`.** `git reset --soft
+  origin/main` is the reflex for collapsing WIP into one commit, and it is **unsafe
+  here by construction**: lanes land while other lanes are still working, so
+  `origin/main` moves and the reset diffs your tree against a newer commit — staging
+  **every file a sibling landed as a deletion**. Nothing warns you; the working tree
+  looks right and only the index is wrong, so the PR silently reverts merged work.
+  Record the base when you branch (`BASE=$(git rev-parse HEAD)`) and squash to that.
+  **Two lanes hit this in one afternoon on 2026-08-09** — both caught it in
+  `git status` before committing, which is the only thing that stood between it and a
+  bad merge. So: check `git status` after any soft reset, and treat a deletion you did
+  not make as a stop sign. Picking up a sibling's landed work is a *rebase*, a separate
+  deliberate action from squashing your own history.
 - **Fast gate before every push.** `make check` must pass; the pre-push hook runs
   it. Bypass only with a scoped reason via `git push --no-verify`.
 - **Layer tests by cost.** Fast layer = no infra, runs everywhere. Integration
