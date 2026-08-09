@@ -1,11 +1,33 @@
 # One-command dev loop (dev-playbook principle 17). Every target is stack-aware
 # via `uv run`, so a newcomer needs only `make setup` then `make check`.
 
-.PHONY: setup install-hooks check lint format typecheck test test-integration test-network test-all audit ci-local paper-preflight paper-dryrun paper-live paper-stop paper-status
+.PHONY: help setup install-hooks check lint format typecheck test test-integration test-network test-all audit ci-local paper-preflight paper-dryrun paper-live paper-stop paper-status
 
-setup:  ## Install locked deps and the pre-push hook.
+# Bare `make` prints this list; it never *does* anything. Before this, the default
+# goal was whatever came first in the file -- `setup` -- so a reflexive `make` ran
+# `uv sync --frozen`, which syncs the environment to the base lockfile and therefore
+# **uninstalls the `alpaca` extra**. Observed, not theorised: it silently removed
+# alpaca-py the day before a live paper run. `make paper-preflight` catches it
+# ([FAIL] alpaca extra), but a default goal with side effects is the wrong default.
+.DEFAULT_GOAL := help
+
+help:  ## Show this list of targets.
+	@echo "Targets (make <target>):"
+	@echo
+	@grep -hE '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) \
+	  | sort \
+	  | awk 'BEGIN {FS = ":.*?## "}; {printf "  \033[36m%-18s\033[0m %s\n", $$1, $$2}'
+	@echo
+	@echo "Dry-run any target without executing it:  make -n <target>"
+
+setup:  ## Install locked deps and the pre-push hook. NOTE: drops optional extras.
 	uv sync --frozen
 	$(MAKE) install-hooks
+	@echo
+	@echo "NOTE: 'uv sync --frozen' installs the LOCKED BASE deps only, so any"
+	@echo "      optional extra you had is now gone. Re-add what you need, e.g."
+	@echo "      uv sync --extra alpaca      (live paper trading)"
+	@echo "      uv sync --extra dashboard   (the web dashboard server)"
 
 install-hooks:  ## Point git at the versioned hooks in .githooks/.
 	git config core.hooksPath .githooks
