@@ -63,6 +63,23 @@ want that in a file, redirect stderr; `2>session.log` will not disturb the stdou
 report you are watching. `--log-level` and `--log-format json` exist and neither is
 needed here — the defaults are what the command above gets.
 
+## Times in this runbook are ET; the terminal prints UTC
+
+Every time below is New York market time, because that is how the session is
+described. Every timestamp the bench *prints* is UTC — bar stamps, log records,
+`result.json`, the warmup span. Nothing converts between them, deliberately: one
+clock everywhere beats two that can disagree.
+
+| what | ET | UTC, as it appears on screen |
+|---|---|---|
+| Open, session starts | 09:30 | **13:30** |
+| First trade | ~09:35 | **~13:35** |
+| Close, last bar | 16:00 | **20:00** |
+| Session ends by itself | ~17:00 | **~21:00** |
+
+So the first per-bar line you are waiting for reads `2026-08-10 13:35`, not
+`09:35`. (Daylight saving: ET is UTC-4 in August. In winter it is UTC-5.)
+
 ## What should happen, in order
 
 **09:30.** The session starts and prints two lines: how long it will tolerate silence
@@ -101,6 +118,13 @@ start it under `nohup` or `tmux`.
 Once it is finalizing, a second `kill` is ignored on purpose, so that writing
 `equity_curve.csv` and `result.json` cannot be interrupted half way. It takes
 milliseconds. If you truly need it gone, `kill -9`.
+
+One wrinkle if you launched with `uv run`, which the command above does: **`uv run`
+forks**, so there are two processes and the one you see in `ps` is the wrapper. A
+plain `kill` on the wrapper is fine — uv forwards SIGTERM and the session finalizes,
+verified against this exact command. `kill -9` is not: SIGKILL cannot be forwarded, so
+you kill the wrapper and leave the session running orphaned. If you ever need to be
+certain you are signalling the session itself, target the `.venv/bin/python` child.
 
 **Check the first order's timestamp.** If anything in `fill_divergence.csv` has a
 `submitted_ts` before 09:30, the warmup fix did not take and the sample is
