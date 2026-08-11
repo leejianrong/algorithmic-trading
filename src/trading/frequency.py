@@ -34,9 +34,10 @@ from datetime import timedelta
 from trading.calendar import US_EQUITY, MarketCalendar
 
 # The US-equity calendar's two numbers, kept as module constants because callers
-# import them (``report.py``'s frequency fallback, ``data/synthetic.py``'s
-# weekday-walk GBM scaling). They are now a view onto US_EQUITY rather than the
-# definition of annualization: see ADR-0054.
+# import them (``report.py``'s frequency fallback is the only one left; the
+# synthetic generator read them until ADR-0056 gave it the calendar directly).
+# They are now a view onto US_EQUITY rather than the definition of annualization:
+# see ADR-0054.
 TRADING_DAYS_PER_YEAR = US_EQUITY.days_per_year
 REGULAR_SESSION_MINUTES = US_EQUITY.minutes_per_day
 
