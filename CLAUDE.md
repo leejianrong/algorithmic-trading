@@ -677,6 +677,36 @@ As of this writing:
   *absent symbol* are different conditions. **Monday's run now self-terminates about
   17:00–17:05 rather than 16:10–16:15, and is silent by design in between**; the runbook
   says so. Known gap: nothing tells the operator *why* it stopped.
+- **The 5 bps assumption, measured at last (2026-08-10, ADR-0052):** the question the
+  whole bench was built to answer. `sma_crossover` over `@blue20` at 5m ran live against
+  the Alpaca paper account from 12:05 ET to the close — started 2h35m late and still
+  cleared the bar: 53 bars, 63 orders, **60 paired fills** against `MIN_PAIRED_FILLS =
+  30`. **Realized slippage 0.51 bps mean (median 0.59, stdev 3.75) against the model's
+  5.00 — the cost model is conservative by ~4.5 bps**, with 54 of 60 fills better than
+  modelled and both sides agreeing (buy +0.02, sell +1.20). So backtests have been
+  **understating** returns, most for high-turnover strategies: the safe direction, and
+  not a correctness bug. `slippage_bps` **stays at 5.0** on three grounds, all in the
+  ADR: the measured mean is the same order as the IEX-vs-consolidated reference error
+  (~0.4 bps on a mega-cap, ADR-0034), so the *level* is unresolved (95% interval −0.44
+  to +1.46, though 5.00 sits 9.3 standard errors away, so "well below 5" is robust);
+  **these are paper fills**, i.e. our cost model against *Alpaca's* fill model, since a
+  paper account simulates rather than routes; and it is one afternoon, one venue, twenty
+  mega-caps, ~$4,700 orders. KAN-618's sensitivity sweep is the honest next step, not a
+  re-tuned constant. The run was clean — zero guardrail rejections, clamps, venue
+  refusals, absent symbols, warnings or errors — and every weekend guard held: the
+  bounded window primed 631 bars (ADR-0047), rows were durable as they settled
+  (ADR-0048), the session self-terminated 60 min after the last bar (ADR-0049), and
+  `make paper-live` survived a closed terminal (ADR-0051). Two things the run taught
+  that no test had: the **parked-order case is persistent** — the session's NVDA sell
+  was still working hours later, is the report's single outcome mismatch, and refused
+  the flattening duplicate with the venue's own `held_for_orders` message through
+  ADR-0041's classifier — and **a session ends holding its book plus any working
+  orders**, so two stray BUYs would have rebuilt positions at the next open. Flattening
+  is manual; the runbook now documents it. Known gaps the run exposed: no market
+  calendar (KAN-687) let 6 extended-hours bars through `_step` (no orders on them, so
+  the sample is clean — luck, not design), and a part-day run still prints
+  `Sharpe 10.04` / `Annualized +35.25%` / `Turnover 107,106%` with nothing saying it is
+  too short to annualize (KAN-705).
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);

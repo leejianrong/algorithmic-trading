@@ -1,7 +1,20 @@
-# The Monday divergence run
+# The divergence run
 
-A runbook for 2026-08-10, written 2026-08-09. Delete or fold into an ADR once the
-run has happened and the answer is recorded.
+> **The 2026-08-10 run has happened. The answer is in
+> [ADR-0052](adr/0052-measured-fill-slippage.md): 60 paired fills, realized slippage
+> 0.51 bps against the model's 5.00, so the cost model is conservative by ~4.5 bps —
+> with the caveats there, of which "these are paper fills" is the one that matters.**
+>
+> This page said to delete itself once that was recorded. It is kept instead, because
+> it acquired dependents in the meantime: `make paper-live` (ADR-0051) runs the
+> command below, `scripts/paper_session.sh` and the `Makefile` cite it, and five ADRs
+> reference it. It is now the **operating procedure for repeating the measurement**,
+> not a one-off plan — pooling more sessions is how the interval in ADR-0052 gets
+> narrower. Read the timings as "a US session", not as that specific Monday.
+>
+> One thing the 2026-08-10 run changed about the procedure: **a session ends holding
+> its book**, and leaves working orders that fill at the next open. Flattening is a
+> manual step afterwards — see "After the run".
 
 ## What we are measuring
 
@@ -283,10 +296,31 @@ small caps, where spreads are far wider, and nothing about crypto. It is a
 measurement of this venue under these conditions, which is exactly what we need
 before trusting any backtest number, and no more than that.
 
+## After the run
+
+**The session ends holding its book.** Nothing liquidates — correct for a strategy,
+inconvenient for a test bench — so the account is left with open positions *and* with
+any orders that were still working when it stopped. Those working orders fill at the
+next open unless you cancel them. Observed on 2026-08-10: 10 positions held, plus two
+BUY orders (HON, V) that would have rebuilt positions the following morning.
+
+To flatten, with the venue shut (orders park and fill at the next open, ADR-0036):
+
+1. Cancel every working **BUY** first, or it will re-open a position you just sold.
+2. Submit a **SELL** for the full quantity of each position.
+3. Expect a refusal on any symbol that already has a working sell — the venue answers
+   `403 / 40310000 insufficient qty available … held_for_orders`, which arrives as a
+   classified `OrderRejectedError` (ADR-0041). That is the parked-order case, not an
+   error: the position is already being flattened by the earlier order.
+4. Re-check with `make paper-preflight` once the market has opened and the sells have
+   filled; it exits non-zero until the account is flat.
+
+Do this *before* the next session, not after, so a run starts from a known state.
+
 ## If it goes wrong
 
-Run it again Tuesday. Nothing about the setup is single-use, and the only cost of a
-failed run is the day. If Monday shows the feed dropping out for longer than an hour,
+Run it again the next trading day. Nothing about the setup is single-use, and the only
+cost of a failed run is the day. If Monday shows the feed dropping out for longer than an hour,
 `--max-empty-polls N` overrides the tolerance for the retry (`N` polls, so at `5m` a
 value of 24 buys two hours; `make paper-live PAPER_EXTRA_ARGS="--max-empty-polls 24"`);
 the default is what should be used otherwise. Sample size can also be pooled across sessions by hand:
