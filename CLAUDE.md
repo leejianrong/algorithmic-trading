@@ -810,22 +810,108 @@ As of this writing:
   nothing here can size it. The posture beats the latch on 10/10 seeds but beats *no* halt
   on only 4/10, asserted as a coin flip in both directions so it can never be read as free
   return.
-- **What phase 1 left open, deliberately:** nothing selects a market — no `--market` flag,
-  so the three seams are reachable only from Python and a real-crypto `--source csv` run
-  today still annualizes on 252 days, inherits the session completeness rule, and latches in
-  its first year. `result.json` carries a bare interval label with **no market**, so
-  `report._resolve_periods_per_year` parses it on the equity calendar; a crypto run must
-  pass `periods_per_year=` explicitly at the `write_result_json` call site in `cli.py`. The
-  same hardcoded 252 still sits in `risk.py` (`_TRADING_DAYS`, vol-target realized vol —
-  latent only because `target_volatility` is off in both postures; on a 365-bar year it
-  would allow a vol-targeted book **20.4% more gross** than it asked for) and in
-  `data/recent_window.py` (`RTH_SESSION`/`CALENDAR_DAYS_PER_SESSION`). `halt_cooldown_bars`
-  is a **count, not a duration** — ADR-0049's unit mistake again: 30 bars is six weeks of an
-  equity calendar, 30 days of a 24/7 one and 2.5 hours at `5m`. And **`SyntheticAdapter`
-  cannot generate 24/7 bars** (measured: weekday-only daily bars, intraday confined to
-  13:30–20:00 UTC), so there is **no offline continuous fixture** — which matters because
-  the required `integration` job must stay offline (ADR-0040) and a differently-shaped
-  stand-in passes whether or not the bug exists. Filed as **KAN-830**, blocking the adapter.
+- **An offline series for a market that never closes (2026-08-12, ADR-0056, KAN-830):**
+  EPIC-87 was scoped believing `SyntheticAdapter` could already do this; running it said
+  otherwise — **11 weekday-only bars** for 2021-01-01..15 at 1d, **7 bars stamped
+  13:30..19:30** at 1h. The sharper measurement came after ADR-0054 landed: *the same 11
+  weekday bars when handed a `Frequency` already built on `CRYPTO_24_7`*. The calendar
+  reached the generator and was **silently ignored**, so the annualization basis was
+  per-market while the data it annualized was not — a mismatch this epic's own sequencing
+  created. That blocked KAN-708, because the required `integration` job may not leave the
+  machine (ADR-0040), and it is that ADR's lesson a fourth time. The mode is now **the
+  frequency's calendar and nothing else**: no new constructor parameter, no `get_bars`
+  argument (pinned by signature introspection), no CLI flag, equity still the default. A
+  separate `market=` flag would have kept **"24/7 bars annualized on 252 days"**
+  representable — ADR-0054's exact defect one keyword away — so deriving the day shape from
+  the calendar that already sets `periods_per_year` *removes* the combination rather than
+  documenting it; and because the calendar is part of a `Frequency`'s identity, an equity
+  `"1d"` and a 24/7 `"1d"` are two canonical series ADR-0030 cannot conflate by a dict key.
+  **Exactly two day shapes**, and a third **raises at construction** rather than being given
+  6.5-hour days: `MarketCalendar` carries no opening time, and a 1440-minute window opened at
+  13:30 would spill across the UTC date `get_bars` groups by, corrupting the slot arithmetic.
+  The GBM scaling follows the calendar too — measured, a configured `annual_vol` of 0.60
+  realizes **0.6007** annualized on 365 (crypto) and **0.6014** on 252 (equity), per-step
+  sigma ratio **√(365/252)**, so both markets get the volatility they asked for; the old 252
+  divisor on a 365-day year produced **0.7091**. ADR-0053's **UTC midnight** is adopted for
+  generation deliberately, not inherited: the daily bar and its intraday grid must share an
+  anchor or the bridge's last bar would not land on the daily close. Verified — 15 bars for a
+  15-day span **including Saturdays and Sundays**, hourly bars covering 00:00→23:00 with
+  **zero** non-1h gaps, and the last hourly close equal to the daily close on **11 of 11**
+  days. **Proving the guard produced the better finding:** reverting the index to the weekday
+  count left *every* range-independence test green, because a wrong-but-pure position
+  function is still pure — **ADR-0030 constrains purity, not injectivity** — and under the
+  weekday index a Saturday and Sunday returned byte-identical bars with nothing objecting.
+  Injectivity is now pinned directly (212 consecutive days, all distinct). Reverts turn
+  3/19/4/14 red per hunk; 45 new fast tests; equity byte-identical across all eight
+  artifacts. **Unverified against any crypto venue** (no credentials, no network call):
+  whether a real provider stamps daily bars at UTC midnight, and whether a crypto endpoint
+  answers an absurd start with an empty response — **this adapter clips to `EPOCH` in both
+  modes**, so it is *more forgiving than a provider may be* and must not be used to test
+  bounded-window behaviour, which is pinned by a test rather than left to be discovered.
+  Also pinned as characterizations: no inception date, no maintenance window, still GBM (a
+  20% down day is ~6.4σ at 60% vol, where real crypto has them).
+- **Selecting a market is one explicit flag, with a guard for the day someone forgets it
+  (2026-08-12, ADR-0057, KAN-835):** `--market us_equity|crypto_24_7` (aliases
+  `equity`/`crypto`) on `backtest`/`paper`/`sweep` selects the **calendar** (ADR-0054), the
+  **completeness policy** (ADR-0053 — a continuous market gets `interval_is_complete` at
+  *every* interval, daily included) and the **risk posture** (ADR-0055) at once. The values
+  *are* the calendar registry's names, so a market has one spelling; an unknown market exits
+  2, and a calendar with **no posture cannot be selected at all** rather than inheriting
+  equity's limits — `get_calendar`'s rule applied to postures. **Explicit, not derived from
+  symbol shape**, because Alpaca's crypto format is unmeasured (KAN-708) and derivation would
+  make the annualization basis a property of a *filename* under `--source csv`. But
+  forgetting the flag is exactly the silent flattering number this epic exists to prevent, so
+  a **shape guard refuses** crypto-shaped symbols (the segment after `/`, `-` or `_` is a
+  known quote currency) on a market that closes — **exit 2 before any fetch, no artifact
+  written**, naming each offending symbol and the fix, with **no override flag** (a flag you
+  set once is a flag you forget is set; the cure for a false positive is narrowing the rule).
+  Narrow by design and verified: `BRK-B` and `BF-B` run untouched, and all 30 curated basket
+  symbols are pure alpha. One-directional, because an equity-shaped ticker under `--market
+  crypto` is a typed choice and a legitimate continuous symbol may be a bare `BTC`.
+  **Precedence is stated rather than accidental: an explicitly-passed risk flag always wins,
+  every limit left unset comes from the posture** (the cap flags now default to `None`, the
+  "not chosen here" idiom `--target-vol` already used, and on `us_equity` they resolve to the
+  old literals), with `--no-guardrails` beating both — so **a crypto run cannot be talked
+  into a latching halt from the CLI**, there being no flag that spells cooldown `None` and
+  `0` failing validation. `result.json` gains one additive `market` key and
+  `_resolve_periods_per_year` parses the label **on that market's calendar**, closing the gap
+  ADR-0054 recorded against itself; `RESULT_SCHEMA_VERSION` stays **1**. Equity is
+  byte-identical apart from that single JSON line — `equity_curve.csv` ×3, `paper_state.json`
+  and `paper_session.log` all match the `cfb4d85` baselines, the diff is exactly
+  `> "market": "us_equity",` in all three runs, and **popping the key reproduces the
+  baseline payload digest exactly**, so no metric moved. Landing on ADR-0056 made `--market
+  crypto --source synthetic` a genuinely continuous run with **no CLI change of its own**:
+  181 bars including **52 weekend bars** where equity gives 129 weekday-only. It also turned
+  two of this lane's own tests red on CI's merge with the new `main` — a real semantic
+  collision that file-level ownership could not prevent and only CI-tests-the-merge caught,
+  so the rescaling claim was rewritten onto `--source csv` where the bars are identical
+  across markets by construction. Six mutations turn 1/3/4/3/2/11 red. Still open: no real
+  continuous data source (KAN-708); `gen-data`/`dashboard`/`verify-universe` have no
+  `--market` and exit 2 if given one; the dashboard carries `market` but does not render it;
+  `gen-data` cannot write 24/7 bars though the generator now can; `fetch_span` and
+  `MIN_LIVE_EMPTY_POLLS` are still equity-shaped; and `risk.py`'s `_TRADING_DAYS = 252` is
+  now *reachable in combination* with a 365-day market via `--market crypto --target-vol`.
+- **Where the crypto groundwork stands, and what is still equity-shaped:** an **offline
+  crypto backtest runs end to end today** — `trading backtest --market crypto --source
+  synthetic` produces a continuous series, annualizes it on 365 × 1440, runs it under the
+  bounded-halt posture, and records the market in `result.json`. What is **not** built is any
+  **real** continuous data: no crypto adapter or broker (**KAN-708**), so `--source csv` is
+  the only route to real crypto bars, and every claim about a live crypto venue in ADR-0053
+  through ADR-0057 is **arithmetic and generated data, never observed** — no crypto
+  credentials exist and no crypto network call has been made. Specifically unverified:
+  whether a provider stamps daily bars at UTC midnight, whether a crypto endpoint answers an
+  absurdly early start with an empty response (ADR-0047's equity finding), and what Alpaca's
+  crypto symbol format actually is — the ADR-0057 shape guard's rule rests on that guess.
+  Still equity-shaped in shared code: `data/recent_window.py`'s `fetch_span`
+  (`RTH_SESSION`/`CALENDAR_DAYS_PER_SESSION` — over-asks a 24/7 source 5.79× at 1d and
+  21.39× sub-daily, the safe direction, assessed not refactored) and `MIN_LIVE_EMPTY_POLLS`;
+  `risk.py`'s `_TRADING_DAYS = 252`, which ADR-0055 left documented rather than fixed and
+  ADR-0057 made **reachable in combination** with a 365-day market via `--market crypto
+  --target-vol`, where it would allow a vol-targeted book **20.4% more gross** than it asked
+  for; and `halt_cooldown_bars`, still a **count not a duration** — ADR-0049's unit mistake
+  again, 30 bars being six weeks of an equity calendar, 30 days of a 24/7 one and 2.5 hours
+  at `5m`, with no conversion and no warning. Also unwired: `gen-data` cannot write 24/7 bars
+  though the generator now can, and the dashboard carries `market` without rendering it.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -1009,7 +1095,9 @@ src/trading/
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
                            #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed,
                            #    --divergence, --bootstrap, --lookback, --log-level, --log-format,
-                           #    --max-empty-polls);
+                           #    --max-empty-polls, --market);
+                           #   --market selects calendar + completeness + risk posture at once, and
+                           #   refuses crypto-shaped symbols on a session market (ADR-0057);
                            #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032);
                            #   owns the SIGTERM handler + logging config — a library owns neither (ADR-0043);
                            #   derives the live silence tolerance from the interval (ADR-0049)
@@ -1026,7 +1114,9 @@ src/trading/
   data/fake.py             # in-memory adapter for the fast test layer
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
   data/synthetic.py        # deterministic GBM adapter, daily+intraday — offline (ADR-0012/0022);
-                           #   range-independent: one canonical series from EPOCH (ADR-0030)
+                           #   range-independent: one canonical series from EPOCH (ADR-0030);
+                           #   day shape follows the frequency's calendar — 24/7 emits every
+                           #   calendar day across 1440 min; a third shape raises (ADR-0056)
   data/csv_adapter.py      # bring-your-own-data OHLCV CSV DataAdapter (--source csv)
   data/alpaca_client.py    # AlpacaClient seam + Fake/Real clients (ADR-0017/0018);
                            #   terminal order statuses (ADR-0033) + feed choice (ADR-0034)
