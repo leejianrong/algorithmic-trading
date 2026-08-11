@@ -25,6 +25,17 @@ class CostConfig:
             raise ValueError("slippage_bps must be non-negative")
 
 
+# The one number the 24/7 (crypto) posture changes (ADR-0055). Everything else in
+# :meth:`RiskConfig.crypto` is the equity default, deliberately: the measurement
+# behind this card found the *latch*, not the levels, is what breaks at crypto
+# volatility, and widening a cap until nothing trips is a disabled guardrail with
+# extra steps. The floor is arithmetic — a cooldown shorter than
+# ``(max_drawdown_pct / per-bar sigma)²`` bars re-arms inside the same move that
+# tripped the switch; at 80% annualized vol on daily bars that is ~16 bars, and 30
+# is the next legible unit above it (a month of a market that never closes).
+CRYPTO_HALT_COOLDOWN_BARS = 30
+
+
 @dataclass(frozen=True, slots=True)
 class RiskConfig:
     """Enforced risk limits (ADR-0009, ADR-0013).
@@ -58,6 +69,13 @@ class RiskConfig:
     exit but not enter, so it drains to cash and its equity — hence its drawdown —
     freezes, and a drawdown condition not already met at that moment can never be
     met. AND would therefore silently reinstate the permanent latch.
+
+    **The defaults above are an equity posture (ADR-0055).** They are calibrated for
+    mega-cap US equities at roughly 20% annualized volatility, and the field defaults
+    do not move. :meth:`equity` names that posture explicitly and returns exactly
+    ``RiskConfig()``; :meth:`crypto` is the 24/7 posture, which differs in **one
+    field** — it makes halt recovery mandatory rather than optional. Measured, the
+    levels are not what breaks at four times the volatility; the *latch* is.
     """
 
     max_position_pct: float = 0.25
@@ -123,6 +141,71 @@ class RiskConfig:
             max_drawdown_pct=1.0,
             max_daily_loss_pct=None,
         )
+
+    @classmethod
+    def equity(cls) -> RiskConfig:
+        """The equity posture — exactly the field defaults, named (ADR-0055).
+
+        Returns ``cls()``. It exists so a caller choosing a market chooses one
+        *explicitly*, instead of the equity assumption being the unnamed thing that
+        happens when nobody chooses. Pinned equal to ``RiskConfig()`` by a test, so
+        this can never quietly become a third posture.
+        """
+        return cls()
+
+    @classmethod
+    def crypto(cls, *, halt_cooldown_bars: int | None = CRYPTO_HALT_COOLDOWN_BARS) -> RiskConfig:
+        """The 24/7 posture: the equity levels, but the kill switch may not latch.
+
+        ADR-0055. This differs from :meth:`equity` in **exactly one field** —
+        ``halt_cooldown_bars`` — and a test asserts that, so widening a cap here
+        turns red. Nothing is loosened: ``max_position_pct`` (25%),
+        ``max_gross_exposure`` (100%, i.e. no leverage) and ``max_drawdown_pct``
+        (20%) are the equity numbers, unchanged.
+
+        The reason is measured rather than assumed. Driven through the real
+        :class:`~trading.engine.Engine` on a synthetic series at 80% annualized
+        volatility (four times the equity default, drift held equal so volatility is
+        the only change), the default latching config halted in **20 of 20 seeds**,
+        typically about 250 bars into a 2,610-bar run, and then spent a median
+        **90.5%** of the run refusing entries: median total return **+8.95%** against
+        **+561.93%** with the drawdown halt neutralized. That is ADR-0031's measured
+        failure — the same one that turned ``cross_sectional`` into -3.91% on
+        2000-2020 equities — arriving in the first year instead of the second.
+
+        The fix is therefore *bounding* the halt, not raising the bar it trips over.
+        A 20% drawdown genuinely is ordinary here (84% of bars in that series sit at
+        or below 20% off their running peak, against 30% of the equity-volatility
+        bars), so the switch fires often — roughly 7-8 bounded episodes per ten
+        years, holding a median 8.6% of the run — and that is a working circuit
+        breaker rather than a broken kill switch. Raising the threshold to the same
+        *tail rank* that 20% occupies for equities would mean **78%**, past even a
+        2022-style crypto drawdown: a number that never fires, which is a disabled
+        guardrail, not a calibrated one.
+
+        ``halt_recovery_drawdown_pct`` stays ``None`` deliberately, also on evidence:
+        alone, at this volatility, it re-armed **nothing** (1 halt, never resumed,
+        +11.72% — the permanent latch in disguise), because a halted long-or-flat
+        book drains to cash and freezes its drawdown above the threshold, exactly the
+        deadlock ADR-0031 §2 measured. The cooldown is the liveness guarantee; a
+        recovery threshold is an early re-arm a caller may add.
+
+        ``halt_cooldown_bars`` may be overridden for a different volatility or bar
+        interval, but it may **not** be ``None``: a 24/7 posture whose halt latches
+        for the whole run is the thing this preset exists to prevent. The parameter
+        admits ``None`` in its type only so the refusal is expressible — the field
+        itself is ``int | None``, and an untyped caller (a future CLI flag, a config
+        file) can hand one over. It is a ``ValueError``, not a silently latching
+        config.
+        """
+        if halt_cooldown_bars is None:
+            raise ValueError(
+                "the 24/7 posture requires a halt cooldown: halt recovery is not "
+                "optional there (ADR-0055). A latching kill switch was measured to "
+                "spend ~90% of a crypto-volatility run refusing entries. Use "
+                "RiskConfig() for the latching equity posture instead."
+            )
+        return cls(halt_cooldown_bars=halt_cooldown_bars)
 
 
 @dataclass(frozen=True, slots=True)

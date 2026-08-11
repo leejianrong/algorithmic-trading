@@ -27,6 +27,16 @@ and ``halt_cooldown_bars`` (re-arm only after this many bars in force). Both uns
 *earlier* trigger re-arms. See :meth:`Guardrails.halted` for the anti-flap
 guarantees and :meth:`Guardrails._rearm_due` for why the combination is OR.
 
+**Recovery is optional for equities and mandatory for a 24/7 market (ADR-0055).**
+Nothing in this module knows which market it is guarding — the difference is one
+``RiskConfig``, and :meth:`RiskConfig.crypto` is that config. At four times the
+equity volatility the *levels* here measured fine (the caps clamped 1-13 orders in a
+2,610-bar run) while the latch spent a median 90.5% of the run refusing entries, so
+the crypto posture keeps every cap at its equity number and only stops the halt
+being permanent. A 20% drawdown is then an event that recurs, roughly 7-8 bounded
+episodes per ten years — which is what a circuit breaker looks like, as opposed to a
+kill switch that fires once and ends the run.
+
 A third, opt-in layer (ADR-0015) sits on the same per-bar equity the drawdown
 monitor already observes: when ``RiskConfig.target_volatility`` is set, the
 monitor maintains a rolling window of portfolio returns, estimates realized
@@ -51,6 +61,20 @@ from trading.types import SHARE_EPS, Order, Portfolio, Side
 # standard deviation (same 252 basis as the Sharpe metric, Q17). The floor keeps a
 # near-flat book from dividing by ~zero and demanding infinite leverage, and the
 # max scale caps how far the cap can be levered up when realized vol is very low.
+#
+# Both constants are equity-calendar assumptions, and both are counts of bars rather
+# than durations — the mistake ADR-0049 named for the live silence tolerance, sitting
+# here too. On a market that never closes there are ~365 daily bars a year, not 252,
+# so _TRADING_DAYS understates realized volatility by sqrt(252/365) = 0.8309 and
+# therefore overstates the ``target / realized`` scale by sqrt(365/252) = 1.2035 —
+# a volatility-targeted 24/7 book would be allowed **20.4% more gross** than it asked
+# for. Nothing is mis-annualized today: ``target_volatility`` is off by default and
+# both market postures (ADR-0055) leave it off, so this is a latent seam, not a live
+# bug. It is deliberately NOT fixed here — the periods-per-year of a market is the
+# market calendar's to state (KAN-687/KAN-705), and guessing it a second time inside
+# the guardrails is how two answers to one question get out of step. The same applies
+# to _VOL_WINDOW: 20 bars is four weeks of an equity calendar and 20 days of a 24/7
+# one. When the calendar lands, these two read from it.
 _VOL_WINDOW = 20
 _TRADING_DAYS = 252
 _VOL_FLOOR = 1e-6
