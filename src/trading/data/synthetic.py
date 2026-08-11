@@ -39,6 +39,36 @@ Brownian *bridge* between the previous daily close and that session's daily clos
 so the last intraday bar of a session closes exactly on the daily bar's close and an
 intraday run annualizes to the same shape as the daily one. That also bounds the
 walk: intraday costs ``O(days from the epoch)``, not ``O(minutes)``.
+
+**Which market (ADR-0056).** Everything above describes one market's shape — a
+weekday session — and it was the only shape until KAN-830. The generator now emits
+two, chosen by the :class:`~trading.calendar.MarketCalendar` the construction-time
+``Frequency`` already carries (ADR-0054), so there is no second switch to disagree
+with the annualization basis and "24/7 bars annualized on 252 days" is
+unrepresentable. :data:`~trading.calendar.US_EQUITY` is the default and its series
+is byte-identical to before. :data:`~trading.calendar.CRYPTO_24_7` — any calendar
+whose ``is_continuous`` holds — trades **every calendar day**, and its intraday grid
+steps the whole 1440-minute day from UTC midnight with no overnight gap (ADR-0053's
+convention: a 24/7 daily bar is a rolling 24-hour window closing at UTC midnight).
+The bridge and the daily backbone are unchanged in kind; the day they span is longer
+and there are more of them per year. A calendar that is neither shape is **refused
+at construction** rather than silently emitting 6.5-hour days.
+
+Two consequences worth stating. The GBM scaling follows the calendar too — a bar's
+sigma is ``annual_vol / sqrt(days_per_year)``, so a 365-day year divides by 365, not
+252, and a continuous series realizes the volatility it was configured with. And a
+continuous day is a *different counting function* on the same :data:`EPOCH`:
+calendar days rather than weekdays. ADR-0030's invariant is unchanged — a bar is a
+pure function of its absolute position — but the position is per-market, which is
+also why two calendars are two canonical series (the calendar is part of a
+``Frequency``'s identity).
+
+**This is a fixture, not a venue.** It is deliberately less faithful than a real
+crypto provider in ways ``tests/unit/test_synthetic_247.py`` pins rather than
+hides: a pre-:data:`EPOCH` start is *clipped* (so this cannot stand in for
+ADR-0047's empty-response behaviour), there is no inception date, no maintenance
+window, and it is still GBM — no fat tails, which is a sharper caveat for a market
+that has 20% days than for the one ADR-0012 wrote it about.
 """
 
 from __future__ import annotations
@@ -51,7 +81,8 @@ from datetime import UTC, datetime, time, timedelta
 from itertools import groupby
 from typing import TYPE_CHECKING
 
-from trading.frequency import DAILY, TRADING_DAYS_PER_YEAR, Frequency
+from trading.calendar import US_EQUITY, MarketCalendar
+from trading.frequency import DAILY, Frequency
 from trading.types import Bar
 
 if TYPE_CHECKING:
@@ -71,6 +102,13 @@ _SESSION_LENGTH = timedelta(
     hours=_SESSION_CLOSE.hour - _SESSION_OPEN.hour,
     minutes=_SESSION_CLOSE.minute - _SESSION_OPEN.minute,
 )
+
+# A continuous market's "session" is the whole calendar day, opening at UTC
+# midnight — ADR-0053's convention, so the daily bar and the intraday grid it
+# carries share one anchor and the last intraday bar's window ends exactly where
+# the next daily bar begins (ADR-0056).
+_CONTINUOUS_OPEN = time(0, 0, tzinfo=UTC)
+_ONE_DAY = timedelta(days=1)
 
 # Counter-based draw plumbing: 64-bit words out of blake2b, uniforms in (0, 1).
 _WORD_BYTES = 8
@@ -178,6 +216,19 @@ def _trading_days(start: datetime, end: datetime) -> Iterator[datetime]:
         day += timedelta(days=1)
 
 
+def _calendar_days(start: datetime, end: datetime) -> Iterator[datetime]:
+    """Every day at midnight UTC in ``[start, end]`` — a market that never closes.
+
+    The continuous counterpart of :func:`_trading_days` (ADR-0056). No weekday
+    filter, and no holiday filter either, because a 24/7 venue has neither.
+    """
+    day = datetime(start.year, start.month, start.day, tzinfo=UTC)
+    last = datetime(end.year, end.month, end.day, tzinfo=UTC)
+    while day <= last:
+        yield day
+        day += _ONE_DAY
+
+
 def _session_index(day: datetime) -> int:
     """Absolute index of the trading session ``day``, counted from :data:`EPOCH`.
 
@@ -191,30 +242,74 @@ def _session_index(day: datetime) -> int:
     return weeks * 5 + min(remainder, 5)
 
 
-def _intraday_starts(start: datetime, end: datetime, interval: timedelta) -> Iterator[datetime]:
-    """Bar START times spaced by ``interval`` within each trading day's session.
+def _calendar_day_index(day: datetime) -> int:
+    """Absolute index of ``day`` on a continuous market, counted from :data:`EPOCH`.
 
-    For every weekday in ``[start, end]`` (via :func:`_trading_days`), step from
-    the session open by ``interval`` while the start is strictly before the
-    session close, so a bar's whole ``[ts, ts + interval)`` window is not required
-    to fit — only its start must land inside the session (ADR-0022).
+    The same role :func:`_session_index` plays for a session market — a bar's
+    position, in closed form — on a *different counting function*: every calendar
+    day advances the series by one, so no timestamp is skipped and no two share an
+    index. ADR-0030's invariant is unchanged and only the counting is per-market,
+    which is why the calendar is part of the canonical series' key (ADR-0056).
     """
-    for day in _trading_days(start, end):
-        session_open = datetime.combine(day.date(), _SESSION_OPEN)
-        session_close = datetime.combine(day.date(), _SESSION_CLOSE)
-        ts = session_open
-        while ts < session_close:
-            yield ts
-            ts += interval
+    return (day - EPOCH).days
+
+
+def _day_shape(calendar: MarketCalendar) -> tuple[time, timedelta]:
+    """The ``(open, length)`` of one trading day on ``calendar`` (ADR-0056).
+
+    Two shapes, and only two. A continuous market's day opens at UTC midnight and
+    lasts the full 24 hours (ADR-0053). Anything else is emitted on the nominal
+    US-equity session grid, which is what ``minutes_per_day == 390`` means here.
+
+    A calendar that is neither is **refused** rather than quietly given 6.5-hour
+    days while annualizing on its own minutes — a 24-hour weekday-only market, say.
+    :func:`~trading.calendar.get_calendar` raises rather than falling back to equity
+    for the same reason (ADR-0054): a silent equity default *is* the bug. The
+    limitation this exposes is real and named in ADR-0056 — ``MarketCalendar``
+    carries no opening time, so a non-continuous market cannot be given one here.
+    """
+    if calendar.is_continuous:
+        return _CONTINUOUS_OPEN, _ONE_DAY
+    if calendar.minutes_per_day == US_EQUITY.minutes_per_day:
+        return _SESSION_OPEN, _SESSION_LENGTH
+    raise ValueError(
+        f"SyntheticAdapter models two day shapes — a {US_EQUITY.minutes_per_day:.0f}-minute "
+        f"session (like {US_EQUITY.name}) and a continuous 24-hour day (like crypto_24_7) — "
+        f"and calendar {calendar.name!r} ({calendar.minutes_per_day:.0f} minutes/day, "
+        f"{calendar.days_per_year:.0f} days/year) is neither, so its day shape is undefined"
+    )
+
+
+def _day_starts(
+    day: datetime, open_time: time, length: timedelta, interval: timedelta
+) -> Iterator[datetime]:
+    """Bar START times spaced by ``interval`` inside one day's trading window.
+
+    Step from ``open_time`` by ``interval`` while the start is strictly before the
+    window's end, so a bar's whole ``[ts, ts + interval)`` span is not required to
+    fit — only its start must land inside the window (ADR-0022). On the equity
+    session a 1-hour bar therefore runs short at 19:30; on a continuous day the
+    interval divides 1440 minutes for every supported cadence, so none does.
+    """
+    ts = datetime.combine(day.date(), open_time)
+    close = ts + length
+    while ts < close:
+        yield ts
+        ts += interval
 
 
 class SyntheticAdapter:
     """A :class:`~trading.interfaces.DataAdapter` that fabricates GBM bars.
 
     The bar cadence is fixed at construction by ``frequency`` (default
-    :data:`~trading.frequency.DAILY`, ADR-0022). Every bar is a pure function of
-    ``(symbol, seed, params, frequency, absolute position)``, so a request is a
-    slice of one canonical series (ADR-0030).
+    :data:`~trading.frequency.DAILY`, ADR-0022), and so is the **market**: the
+    frequency carries a :class:`~trading.calendar.MarketCalendar` (ADR-0054), which
+    decides both the day shape the generator emits and the year it scales drift and
+    volatility by (ADR-0056). Every bar is a pure function of ``(symbol, seed,
+    params, frequency, absolute position)``, so a request is a slice of one
+    canonical series (ADR-0030) — and since the calendar is part of a
+    ``Frequency``'s identity, an equity ``"1d"`` and a 24/7 ``"1d"`` are two
+    different canonical series rather than one series read two ways.
 
     The instance memoizes the cumulative daily walk per symbol. That is a cache of
     pure values — it changes speed, never numbers — but it does make an instance
@@ -231,13 +326,23 @@ class SyntheticAdapter:
         self._seed = seed
         self._params = params or SyntheticParams()
         self._frequency = frequency
-        # Bars per session at this cadence (1 for daily). A 1-hour bar over a
-        # 390-minute session gives 7, the last one running short (ADR-0022).
-        self._slots = math.ceil(_SESSION_LENGTH / frequency.delta) if frequency.is_intraday else 1
-        # Daily (backbone) drift/vol per session, and this cadence's per-bar vol:
-        # one session's move is split across its slots, so sigma scales by 1/sqrt(n).
-        self._mu_day = self._params.annual_drift / TRADING_DAYS_PER_YEAR
-        self._sigma_day = self._params.annual_vol / math.sqrt(TRADING_DAYS_PER_YEAR)
+        calendar = frequency.calendar
+        # Which market: the day shape and, below, the year. Raises on a calendar
+        # this generator cannot draw (ADR-0056).
+        self._continuous = calendar.is_continuous
+        self._day_open, self._day_length = _day_shape(calendar)
+        # Bars per trading day at this cadence (1 for daily). A 1-hour bar over a
+        # 390-minute session gives 7, the last one running short (ADR-0022); over a
+        # continuous 1440-minute day it gives 24, none short.
+        self._slots = math.ceil(self._day_length / frequency.delta) if frequency.is_intraday else 1
+        # Daily (backbone) drift/vol per trading day, and this cadence's per-bar vol:
+        # one day's move is split across its slots, so sigma scales by 1/sqrt(n).
+        # The year is the calendar's: 252 for equity — the same float the module
+        # constant always was, so equity numbers cannot move — and 365 for 24/7,
+        # without which a continuous series would realize 1.2035x its configured vol.
+        days_per_year = calendar.days_per_year
+        self._mu_day = self._params.annual_drift / days_per_year
+        self._sigma_day = self._params.annual_vol / math.sqrt(days_per_year)
         self._sigma_bar = self._sigma_day / math.sqrt(self._slots)
         # symbol -> cumulative daily log return from EPOCH through session i.
         self._daily_cumulative: dict[str, list[float]] = {}
@@ -297,6 +402,12 @@ class SyntheticAdapter:
         (ADR-0030). The cost of that choice: a session's total move is pinned before
         its path is drawn, so intraday variance is conditional-on-the-day, which is
         also what a real daily bar's relationship to its intraday bars looks like.
+
+        "Session" here means one *trading day* and nothing about a venue's hours:
+        this method takes an index and knows no timestamps, so it is identical for
+        both markets (ADR-0056). On a continuous market the day is the calendar day
+        and the bridge spans all 1440 of its minutes — the daily close it lands on is
+        the next UTC midnight, so the grid has no overnight gap.
         """
         cumulative = self._cumulative_through(symbol, session)
         opening = cumulative[session - 1] if session else 0.0
@@ -347,11 +458,29 @@ class SyntheticAdapter:
 
     # --- the DataAdapter surface ----------------------------------------------
 
+    def _trading_days_in(self, start: datetime, end: datetime) -> Iterator[datetime]:
+        """The trading days of this adapter's market in ``[start, end]``, midnight UTC."""
+        if self._continuous:
+            return _calendar_days(start, end)
+        return _trading_days(start, end)
+
+    def _day_index(self, day: datetime) -> int:
+        """``day``'s absolute position from :data:`EPOCH` on this adapter's market."""
+        if self._continuous:
+            return _calendar_day_index(day)
+        return _session_index(day)
+
     def _bar_starts(self, start: datetime, end: datetime) -> Iterator[datetime]:
         """Bar START timestamps for this adapter's frequency over ``[start, end]``."""
-        if self._frequency.is_intraday:
-            return _intraday_starts(start, end, self._frequency.delta)
-        return _trading_days(start, end)
+        days = self._trading_days_in(start, end)
+        if not self._frequency.is_intraday:
+            return days
+        interval = self._frequency.delta
+        return (
+            ts
+            for day in days
+            for ts in _day_starts(day, self._day_open, self._day_length, interval)
+        )
 
     def get_bars(
         self,
@@ -367,6 +496,10 @@ class SyntheticAdapter:
         frequency)``, so overlapping ranges agree on every shared timestamp
         (ADR-0030). ``start`` earlier than :data:`EPOCH` is clipped: bars before the
         epoch do not exist, and no range is ever re-anchored to its own first bar.
+
+        Which timestamps exist is the market's business, not this call's: the
+        frequency's calendar fixed both the interval and the day shape at
+        construction (ADR-0022/0056), so ``get_bars`` never learns either.
 
         Synthetic GBM has no corporate actions, so raw == adjusted: ``adjusted`` is
         accepted for :class:`DataAdapter` parity but does not change the numbers,
@@ -387,10 +520,12 @@ class SyntheticAdapter:
         bars: list[Bar] = []
         for _day, day_stamps in groupby(stamps, key=lambda ts: ts.date()):
             session_stamps = list(day_stamps)
-            session = _session_index(session_stamps[0])
+            session = self._day_index(session_stamps[0])
             prev_close, closes = self._session_closes(symbol, session)
-            # A session always begins at its open (:func:`_intraday_starts`), so a
-            # timestamp's place in the group *is* its slot within the session.
+            # A trading day always begins at its open (:func:`_day_starts`), so a
+            # timestamp's place in the group *is* its slot within the day. Grouping
+            # by UTC date is exact for both shapes: the equity session sits inside
+            # one date and a continuous day *is* one (ADR-0056).
             for slot, ts in enumerate(session_stamps):
                 previous = closes[slot - 1] if slot else prev_close
                 position = session * self._slots + slot
