@@ -296,9 +296,19 @@ class TestBacktestIsByteIdentical:
     that cannot be funded, which is the only way to reach ``SimulatedBroker``'s own
     rejection path with the caps on. Computed on ``origin/main`` @ b6399f0, i.e.
     with the fix reverted.
+
+    **Updated once, deliberately, by ADR-0057** (market selection): ``result_to_dict``
+    gained one additive top-level key, ``market``, so these bytes moved while the run
+    did not. That claim is not asserted by assertion — the second test below removes
+    that single key and reproduces the *original* digest exactly, so the golden
+    remains a pin on ``Engine.run`` rather than a hash somebody re-blessed.
     """
 
-    GOLDEN = "c5a97cfc012baa1a7e56174a55e463ffdfccfb7b06928943974dd53045a02012"
+    GOLDEN = "9395b4f2e46134da00a66b53b3d8a4e2ba6a632b991f2d716be8a8e450fcc221"
+
+    # The same two documents before ADR-0057's additive ``market`` key existed
+    # (origin/main @ a157123). Reachable today by deleting that one key.
+    GOLDEN_WITHOUT_MARKET = "c5a97cfc012baa1a7e56174a55e463ffdfccfb7b06928943974dd53045a02012"
 
     def _bars(self) -> list[Bar]:
         # Rising, so a repeated fixed-quantity buy eventually runs out of room.
@@ -335,6 +345,21 @@ class TestBacktestIsByteIdentical:
     def test_the_canonical_documents_match_the_pre_change_golden(self) -> None:
         raw = json.dumps(self._documents(), sort_keys=True).encode()
         assert hashlib.sha256(raw).hexdigest() == self.GOLDEN
+
+    def test_the_only_change_since_that_golden_is_the_additive_market_key(self) -> None:
+        """ADR-0057 added one key and moved nothing else — proved, not asserted.
+
+        Deleting ``market`` from both documents must reproduce the digest taken
+        before that key existed. If any *value* had drifted — a fill price, an
+        exposure, a rejection reason — this would not come back to the old hash, so
+        the golden above is still pinning the run and not merely re-blessed bytes.
+        """
+        documents = self._documents()
+        for document in documents:
+            assert document.pop("market") == "us_equity"
+
+        raw = json.dumps(documents, sort_keys=True).encode()
+        assert hashlib.sha256(raw).hexdigest() == self.GOLDEN_WITHOUT_MARKET
 
     def test_the_fixture_really_exercises_both_reject_paths(self) -> None:
         # A golden over a run that never rejects or clamps would prove nothing

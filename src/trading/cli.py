@@ -42,6 +42,16 @@ The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
 parameters says so (ADR-0029).
 
+``--market`` (ADR-0057) is the one choice that reaches all three of EPIC-87's
+phase-1 seams at once: the :class:`~trading.calendar.MarketCalendar` every
+annualized figure is derived from (ADR-0054), the bar-completeness rule the paper
+feed acts on (ADR-0053), and the :class:`~trading.config.RiskConfig` posture the
+guardrails enforce (ADR-0055). It defaults to ``us_equity``, so every invocation
+that predates it behaves exactly as it did, and it is **explicit** rather than
+sniffed from the data — with one guard on top, because forgetting the flag is the
+silent failure the whole epic was sequenced around: a crypto-shaped symbol
+(``BTC/USD``) under a market that closes is refused, not annualized on 252 days.
+
 This module is also the process's only owner of two things a library must never
 touch (ADR-0043): the **signal disposition** — ``paper`` installs a SIGTERM handler
 for the length of its session so ``docker stop`` / ``systemd stop`` / ``kill`` take
@@ -57,7 +67,8 @@ import json
 import logging
 import os
 import signal
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import FrameType
@@ -66,12 +77,14 @@ import typer
 
 from trading.broker import SimulatedBroker
 from trading.brokers.alpaca import AlpacaBroker
+from trading.calendar import CALENDARS, CRYPTO_24_7, US_EQUITY, MarketCalendar, get_calendar
 from trading.clock import FakeClock, WallClock
-from trading.config import RiskConfig
+from trading.config import CRYPTO_HALT_COOLDOWN_BARS, RiskConfig
 from trading.data.alpaca_adapter import AlpacaAdapter
 from trading.data.csv_adapter import CsvAdapter
 from trading.data.fake import FakeAdapter
 from trading.data.recent_window import (
+    CompletenessPolicy,
     RecentWindowFeed,
     default_is_complete,
     interval_is_complete,
@@ -316,10 +329,219 @@ def _apply_liquidity_screen(
     return screen.kept
 
 
-def _parse_frequency(interval: str) -> Frequency:
-    """Resolve ``--interval`` (e.g. ``1d``/``1h``/``30m``) or exit 2 on a bad label."""
+@dataclass(frozen=True, slots=True)
+class _Market:
+    """One market selection: a calendar, a risk posture, and a completeness rule.
+
+    The three things EPIC-87's phase-1 lanes built as independent library seams
+    (ADR-0053/0054/0055), tied together by the one choice an operator makes
+    (ADR-0057). ``name`` is the :class:`~trading.calendar.MarketCalendar`'s own
+    registry name, so there is exactly one spelling of a market in the codebase and
+    it is the one ``result.json`` records.
+    """
+
+    name: str
+    calendar: MarketCalendar
+    posture: RiskConfig
+
+
+# The risk posture each market trades under (ADR-0055). Keyed by calendar name, so
+# a calendar cannot be selectable without a posture: `_resolve_market` refuses a
+# calendar missing from this table rather than falling back to the equity numbers,
+# which is `get_calendar`'s own rule (ADR-0054) applied one layer up. A third
+# market added to `CALENDARS` therefore fails loudly here until someone decides
+# what risk limits it trades under, instead of silently inheriting equity's.
+_MARKET_POSTURES: dict[str, Callable[[], RiskConfig]] = {
+    US_EQUITY.name: RiskConfig.equity,
+    CRYPTO_24_7.name: RiskConfig.crypto,
+}
+
+# Operator-friendly spellings of the canonical calendar names. Pure input
+# normalization, exactly like the ``@basket`` sigil: the canonical name is what is
+# printed, logged, and written to ``result.json``, so the alias never becomes a
+# second vocabulary that can drift from the registry's.
+_MARKET_ALIASES: dict[str, str] = {
+    "equity": US_EQUITY.name,
+    "us-equity": US_EQUITY.name,
+    "crypto": CRYPTO_24_7.name,
+    "crypto-24-7": CRYPTO_24_7.name,
+}
+
+# The market a run trades when the operator does not say: the only one this bench
+# traded before EPIC-87, and the reason every equity invocation is byte-identical.
+DEFAULT_MARKET = US_EQUITY.name
+
+# Written once and shared by `backtest`, `paper` and `sweep`: three copies of a
+# sentence about precedence is three chances for one of them to go stale.
+MARKET_OPTION_HELP = (
+    f"Market to trade: {' | '.join(sorted(CALENDARS))} (aliases: equity, crypto). "
+    "Selects the annualization calendar, the paper feed's bar-completeness rule, and "
+    f"the risk posture, all at once. Default {DEFAULT_MARKET}."
+)
+MAX_POSITION_HELP = (
+    "Per-symbol position cap, fraction of equity. Unset takes the --market posture's "
+    "value (us_equity: 0.25)."
+)
+MAX_GROSS_HELP = (
+    "Max gross exposure, fraction of equity. Unset takes the --market posture's value "
+    "(us_equity: 1.0)."
+)
+MAX_DRAWDOWN_HELP = (
+    "Drawdown kill-switch threshold, fraction from peak. Unset takes the --market "
+    "posture's value (us_equity: 0.20)."
+)
+HALT_COOLDOWN_HELP = (
+    "Re-arm the halted kill switch after this many bars in force. With "
+    "--halt-recovery-drawdown, whichever triggers first wins. Unset takes the --market "
+    "posture's value: us_equity none (the halt latches), crypto_24_7 "
+    f"{CRYPTO_HALT_COOLDOWN_BARS} (ADR-0055)."
+)
+
+# Quote currencies that make a symbol a *pair* rather than a ticker. Deliberately
+# narrow (ADR-0057): the rule is "the segment after a `/`, `-` or `_` is one of
+# these", so `BRK-B` and `BF-B` (real share-class tickers) and a Bloomberg-style
+# `BRK/B` are all untouched, while `BTC/USD`, `BTC-USD` and `ETH/BTC` are caught.
+# Extending this set is how a missed pair shape (say a `BTC/JPY`-only venue) gets
+# handled; an override flag is not, because a flag is a thing you forget you set.
+_CRYPTO_QUOTE_CODES = frozenset(
+    {"USD", "USDT", "USDC", "USDP", "BUSD", "DAI", "EUR", "GBP", "JPY", "BTC", "ETH"}
+)
+
+_PAIR_SEPARATORS = ("/", "-", "_")
+
+
+def _resolve_market(name: str) -> _Market:
+    """Resolve ``--market`` to a calendar + risk posture, or exit 2.
+
+    Case- and whitespace-insensitive, and aliases (``crypto`` ->
+    ``crypto_24_7``) resolve to the canonical calendar name. An unknown market is
+    a hard error naming what we have, for the reason
+    :func:`~trading.calendar.get_calendar` raises rather than defaulting: a run
+    that quietly annualized a 24/7 market on the equity session, under equity risk
+    limits, would print a confident number nobody could tell was wrong (ADR-0054).
+    """
+    key = name.strip().lower()
+    key = _MARKET_ALIASES.get(key, key)
     try:
-        return Frequency.parse(interval)
+        calendar = get_calendar(key)
+    except ValueError as exc:
+        known = ", ".join(sorted(set(CALENDARS) | set(_MARKET_ALIASES)))
+        typer.echo(f"error: unknown --market {name!r}; known markets: {known}", err=True)
+        raise typer.Exit(2) from exc
+    posture = _MARKET_POSTURES.get(calendar.name)
+    if posture is None:
+        typer.echo(
+            f"error: market {calendar.name!r} has no risk posture, so it cannot be "
+            "selected yet; add one to _MARKET_POSTURES (ADR-0055/0057). Refusing "
+            "rather than falling back to the equity limits.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    return _Market(name=calendar.name, calendar=calendar, posture=posture())
+
+
+def _crypto_shaped(symbol: str) -> str | None:
+    """Why ``symbol`` looks like a crypto pair, or ``None`` if it does not.
+
+    A *shape* test, not a lookup: the segment after a pair separator has to be a
+    known quote currency. That is narrow on purpose — see ``_CRYPTO_QUOTE_CODES``.
+    """
+    upper = symbol.strip().upper()
+    for separator in _PAIR_SEPARATORS:
+        base, found, quote = upper.rpartition(separator)
+        if found and base and quote in _CRYPTO_QUOTE_CODES:
+            return f"{base}{separator}{quote} is a pair quoted in {quote}"
+    return None
+
+
+def _check_symbol_shapes(market: _Market, tickers: list[str]) -> None:
+    """Refuse crypto-shaped symbols on a market that closes (ADR-0057).
+
+    The belt to ``--market``'s braces. An explicit flag is honest and forgettable,
+    and *forgetting* it is the whole failure this epic was sequenced to prevent: the
+    equity calendar understates a winner and flatters a loser, and pairs an honest
+    drawdown with a Sharpe from another market's year (ADR-0054), so the wrong
+    answer arrives looking exactly like a right one.
+
+    One direction only. A crypto-shaped symbol under a session market is a silent
+    wrong number, so it is refused. The reverse — an equity-looking ticker under
+    ``--market crypto`` — is not checked, because the operator typed the market and
+    the signal is weak the other way: a legitimate continuous symbol may be a bare
+    ``BTC`` with no separator at all, so a "no crypto symbols here" warning would
+    fire on correct usage. Chosen loudness follows ADR-0028's split: this is the
+    broker-said-no case (a shape we recognise), not the could-not-ask case.
+    """
+    if market.calendar.is_continuous:
+        return
+    flagged = [(symbol, why) for symbol in tickers if (why := _crypto_shaped(symbol)) is not None]
+    if not flagged:
+        return
+    detail = "; ".join(f"{symbol} ({why})" for symbol, why in flagged)
+    typer.echo(
+        f"error: {len(flagged)} symbol(s) look like crypto pairs but --market is "
+        f"{market.name!r}: {detail}. On this calendar they would be annualized at "
+        f"{market.calendar.days_per_year:g} x {market.calendar.minutes_per_day:g} "
+        f"min/day and run under the {market.name} risk posture — a confident wrong "
+        "number (ADR-0054/0057). Pass --market crypto, or rename the symbols if they "
+        "really do trade on a session market.",
+        err=True,
+    )
+    raise typer.Exit(2)
+
+
+def _market_line(market: _Market, freq: Frequency) -> str:
+    """One line naming a non-equity market's basis, or ``""`` for plain equity.
+
+    Printed only when there *is* something to say, the same rule the absent-symbol
+    and benchmark caveats follow — which is also what keeps every equity run's
+    stdout byte-identical. When it appears it carries the two facts that make the
+    figures below readable: the annualization basis and the halt posture.
+    """
+    if market.name == DEFAULT_MARKET:
+        return ""
+    cooldown = market.posture.halt_cooldown_bars
+    recovery = f"halt re-arms after {cooldown} bar(s)" if cooldown is not None else "halt latches"
+    return (
+        f"Market:        {market.name} "
+        f"({market.calendar.days_per_year:g} days x "
+        f"{market.calendar.minutes_per_day:g} min/day) — "
+        f"{freq.label} annualizes at {freq.periods_per_year:g} bars/year; "
+        f"risk posture: {recovery}"
+    )
+
+
+def _completeness_policy(market: _Market, freq: Frequency) -> CompletenessPolicy:
+    """Which bars the paper feed may act on, per market (ADR-0053).
+
+    A continuous market has **no arms on this expression**:
+    ``interval_is_complete(freq.delta)`` for every interval, daily included, because
+    a 24/7 daily bar is a rolling 24-hour window closing at UTC midnight and
+    ``ts + interval`` needs no calendar. ADR-0053 measured that there is nothing to
+    add — the session rule and the interval rule agree at all 4,320 sampled instants
+    on a midnight-stamped daily bar, and where a provider stamps it off midnight the
+    session rule declares it complete *early*, handing the strategy a forming bar.
+    Deliberately no ``continuous_is_complete`` to call: it would be a second name
+    for one mechanism.
+
+    A market that closes keeps the session rule for daily. That is not symmetry
+    neglected: for a daily bar stamped at the session open, the interval rule would
+    withhold it until 13.5 hours after the real close.
+    """
+    if market.calendar.is_continuous:
+        return interval_is_complete(freq.delta)
+    return interval_is_complete(freq.delta) if freq.is_intraday else default_is_complete
+
+
+def _parse_frequency(interval: str, calendar: MarketCalendar = US_EQUITY) -> Frequency:
+    """Resolve ``--interval`` (e.g. ``1d``/``1h``/``30m``) or exit 2 on a bad label.
+
+    ``calendar`` is the selected market's (ADR-0054): the label fixes the bar
+    *length*, the calendar fixes how many of them a year holds. It defaults to US
+    equity so a caller that has not chosen a market gets exactly what this function
+    always returned.
+    """
+    try:
+        return Frequency.parse(interval, calendar=calendar)
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
@@ -413,9 +635,10 @@ def _parse_sector_map(spec: str) -> dict[str, str] | None:
 def _build_risk(
     *,
     no_guardrails: bool,
-    max_position: float,
-    max_gross: float,
-    max_drawdown: float,
+    posture: RiskConfig,
+    max_position: float | None,
+    max_gross: float | None,
+    max_drawdown: float | None,
     target_vol: float | None,
     sector_map: str,
     max_sector_exposure: float | None,
@@ -424,21 +647,43 @@ def _build_risk(
 ) -> RiskConfig:
     """Assemble the run's RiskConfig, or the permissive opt-out when disabled.
 
+    **Precedence, in one sentence: an explicitly-passed flag always wins, and every
+    limit the operator did not pass comes from the selected market's posture**
+    (ADR-0055/0057). That is why the cap options default to ``None`` rather than to
+    a number — ``None`` means "not chosen here", the idiom ``--target-vol`` and
+    ``--halt-cooldown-bars`` already use, and it is the only way a preset and a
+    per-flag override can compose without one silently shadowing the other. On the
+    equity posture the resolved values are exactly the old literal defaults, so
+    nothing about an existing invocation moves.
+
+    ``--no-guardrails`` still wins over both: it is an explicit opt-out from
+    enforcement, and therefore from the market's posture too.
+
     Raises ValueError (surfaced as a clean CLI error by the caller) on an invalid
     limit, a malformed --sector-map, or a halt-recovery threshold that is not below
-    --max-drawdown (ADR-0031).
+    --max-drawdown (ADR-0031). Note one consequence worth stating: a crypto run
+    cannot be talked into a permanently latching halt from the CLI, because the
+    posture supplies the cooldown and there is no flag that spells ``None`` —
+    ``RiskConfig.crypto(halt_cooldown_bars=None)`` is a ValueError for the same
+    reason (ADR-0055).
     """
     if no_guardrails:
         return RiskConfig.unlimited()
     return RiskConfig(
-        max_position_pct=max_position,
-        max_gross_exposure=max_gross,
-        max_drawdown_pct=max_drawdown,
+        max_position_pct=posture.max_position_pct if max_position is None else max_position,
+        max_gross_exposure=posture.max_gross_exposure if max_gross is None else max_gross,
+        max_drawdown_pct=posture.max_drawdown_pct if max_drawdown is None else max_drawdown,
         target_volatility=target_vol,
         sector_map=_parse_sector_map(sector_map),
         max_sector_exposure=max_sector_exposure,
-        halt_recovery_drawdown_pct=halt_recovery_drawdown,
-        halt_cooldown_bars=halt_cooldown_bars,
+        halt_recovery_drawdown_pct=(
+            posture.halt_recovery_drawdown_pct
+            if halt_recovery_drawdown is None
+            else halt_recovery_drawdown
+        ),
+        halt_cooldown_bars=(
+            posture.halt_cooldown_bars if halt_cooldown_bars is None else halt_cooldown_bars
+        ),
     )
 
 
@@ -595,17 +840,16 @@ def backtest(
         "--interval",
         help="Bar frequency: 1d | 1h | 30m | 5m | 1m. Sub-daily needs --source alpaca|synthetic.",
     ),
+    market: str = typer.Option(
+        DEFAULT_MARKET,
+        "--market",
+        help=MARKET_OPTION_HELP,
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash."),
-    max_position: float = typer.Option(
-        0.25, "--max-position", help="Per-symbol position cap, fraction of equity."
-    ),
-    max_gross: float = typer.Option(
-        1.0, "--max-gross", help="Max gross exposure, fraction of equity."
-    ),
-    max_drawdown: float = typer.Option(
-        0.20, "--max-drawdown", help="Drawdown kill-switch threshold, fraction from peak."
-    ),
+    max_position: float | None = typer.Option(None, "--max-position", help=MAX_POSITION_HELP),
+    max_gross: float | None = typer.Option(None, "--max-gross", help=MAX_GROSS_HELP),
+    max_drawdown: float | None = typer.Option(None, "--max-drawdown", help=MAX_DRAWDOWN_HELP),
     halt_recovery_drawdown: float | None = typer.Option(
         None,
         "--halt-recovery-drawdown",
@@ -617,10 +861,7 @@ def backtest(
     halt_cooldown_bars: int | None = typer.Option(
         None,
         "--halt-cooldown-bars",
-        help=(
-            "Re-arm the halted kill switch after this many bars in force. With "
-            "--halt-recovery-drawdown, whichever triggers first wins. Off by default."
-        ),
+        help=HALT_COOLDOWN_HELP,
     ),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
@@ -686,7 +927,9 @@ def backtest(
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
     tickers = _parse_symbols(symbols)
-    freq = _parse_frequency(interval)
+    chosen_market = _resolve_market(market)
+    _check_symbol_shapes(chosen_market, tickers)
+    freq = _parse_frequency(interval, chosen_market.calendar)
     _check_bootstrap_options(bootstrap=bootstrap, resamples=bootstrap_resamples)
 
     try:
@@ -698,6 +941,7 @@ def backtest(
     try:
         risk = _build_risk(
             no_guardrails=no_guardrails,
+            posture=chosen_market.posture,
             max_position=max_position,
             max_gross=max_gross,
             max_drawdown=max_drawdown,
@@ -743,6 +987,10 @@ def backtest(
     # The strategy's tunable-argument count turns on the trades-per-parameter
     # sample-size check and its warning (ADR-0029).
     free_params = free_parameter_count(strat)
+    # Empty on the equity default, so an equity run's stdout is untouched (ADR-0057).
+    market_line = _market_line(chosen_market, freq)
+    if market_line:
+        typer.echo(market_line)
     typer.echo(
         summarize(
             result,
@@ -765,6 +1013,10 @@ def backtest(
         result_json,
         mode="backtest",
         frequency=freq.label,
+        # An interval label alone cannot say whether "1d" meant 252 bars a year or
+        # 365, and every risk-adjusted figure in the document depends on which
+        # (ADR-0054's own recorded gap, ADR-0057).
+        market=chosen_market.name,
         metrics=metrics,
         benchmark_curve=bench_result.equity_curve if bench_result is not None else None,
         significance=significance,
@@ -913,17 +1165,16 @@ def paper(
         "--interval",
         help="Bar frequency: 1d | 1h | 30m | 5m | 1m. Sub-daily needs --source alpaca|synthetic.",
     ),
+    market: str = typer.Option(
+        DEFAULT_MARKET,
+        "--market",
+        help=MARKET_OPTION_HELP,
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash."),
-    max_position: float = typer.Option(
-        0.25, "--max-position", help="Per-symbol position cap, fraction of equity."
-    ),
-    max_gross: float = typer.Option(
-        1.0, "--max-gross", help="Max gross exposure, fraction of equity."
-    ),
-    max_drawdown: float = typer.Option(
-        0.20, "--max-drawdown", help="Drawdown kill-switch threshold, fraction from peak."
-    ),
+    max_position: float | None = typer.Option(None, "--max-position", help=MAX_POSITION_HELP),
+    max_gross: float | None = typer.Option(None, "--max-gross", help=MAX_GROSS_HELP),
+    max_drawdown: float | None = typer.Option(None, "--max-drawdown", help=MAX_DRAWDOWN_HELP),
     halt_recovery_drawdown: float | None = typer.Option(
         None,
         "--halt-recovery-drawdown",
@@ -935,10 +1186,7 @@ def paper(
     halt_cooldown_bars: int | None = typer.Option(
         None,
         "--halt-cooldown-bars",
-        help=(
-            "Re-arm the halted kill switch after this many bars in force. With "
-            "--halt-recovery-drawdown, whichever triggers first wins. Off by default."
-        ),
+        help=HALT_COOLDOWN_HELP,
     ),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
@@ -1011,7 +1259,9 @@ def paper(
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
     tickers = _parse_symbols(symbols)
-    freq = _parse_frequency(interval)
+    chosen_market = _resolve_market(market)
+    _check_symbol_shapes(chosen_market, tickers)
+    freq = _parse_frequency(interval, chosen_market.calendar)
 
     try:
         strat = get_strategy(strategy)
@@ -1022,6 +1272,7 @@ def paper(
     try:
         risk = _build_risk(
             no_guardrails=no_guardrails,
+            posture=chosen_market.posture,
             max_position=max_position,
             max_gross=max_gross,
             max_drawdown=max_drawdown,
@@ -1049,8 +1300,10 @@ def paper(
     # and a fake clock parked just past the range so every bar reads as complete —
     # the loop drains them one _step at a time and stops, offline and deterministic.
     # Sub-daily bars need the interval-aware completeness policy (ADR-0022); daily
-    # keeps the default policy so the daily path stays byte-identical to V5.
-    is_complete = interval_is_complete(freq.delta) if freq.is_intraday else default_is_complete
+    # keeps the default policy so the daily path stays byte-identical to V5 — unless
+    # the market never closes, which drops the daily special case entirely because a
+    # session rule has nothing to ask about there (ADR-0053, selected by ADR-0057).
+    is_complete = _completeness_policy(chosen_market, freq)
     window = DEFAULT_PAPER_LOOKBACK if lookback is None else lookback
 
     # How much silence ends the session, decided here because this is where the
@@ -1135,6 +1388,10 @@ def paper(
     state_path = out / "paper_state.json"
     mode = "live" if live else "once"
     typer.echo(f"Paper session ({mode}) — strategy={strategy} symbols={','.join(tickers)}\n")
+    # Empty on the equity default, so both paper modes' stdout is untouched there.
+    market_line = _market_line(chosen_market, freq)
+    if market_line:
+        typer.echo(market_line + "\n")
     if live:
         # An unattended session ends by *policy*, and the operator watching it needs
         # to be able to tell that from a crash or a hang before it happens rather
@@ -1242,7 +1499,14 @@ def paper(
         free_params = free_parameter_count(strat)
         metrics = compute_metrics(result, freq.periods_per_year, free_parameters=free_params)
         result_json = out / "result.json"
-        write_result_json(result, result_json, mode="paper", frequency=freq.label, metrics=metrics)
+        write_result_json(
+            result,
+            result_json,
+            mode="paper",
+            frequency=freq.label,
+            market=chosen_market.name,
+            metrics=metrics,
+        )
 
         typer.echo(
             "\n"
@@ -1401,6 +1665,32 @@ def _sweep_significance_block(summary: SweepSummary, rank_by: str, periods_per_y
     )
 
 
+def _sweep_basis_caveat(freq: Frequency) -> str:
+    """Name the one figure ``--market`` does *not* reach inside a sweep (ADR-0057).
+
+    ``sweep.py``'s per-run metrics come from ``metrics.compute(result)`` with the
+    default 252 basis, so a sweep's ``sharpe`` / ``annualized_return`` columns are
+    the equity daily year whatever ``--interval`` or ``--market`` says. That is
+    pre-existing and equally true of ``sweep --interval 5m`` today; fixing it means
+    threading the frequency into ``run_sweep``, which is that module's change to
+    make. What must not happen is a crypto sweep printing an equity-annualized
+    Sharpe with nothing saying so, so the caveat is printed rather than the number
+    quietly left wrong.
+
+    The ranking is unaffected: Sharpe ordering across runs does not depend on the
+    basis (it multiplies every candidate by the same root), and ``total_return`` and
+    ``max_drawdown`` do not scale with it at all — which is exactly ADR-0054's
+    observation about a report pairing an honest drawdown with a foreign Sharpe.
+    """
+    return (
+        f"  ⚠ the sharpe / annualized columns below are annualized on the "
+        f"{US_EQUITY.name} basis ({US_EQUITY.days_per_year:g} bars/year): a sweep's "
+        "per-run metrics do not take the market's calendar (pre-existing, and true of "
+        "--interval too). Ranking is unaffected; the deflation block uses "
+        f"{freq.periods_per_year:g} bars/year"
+    )
+
+
 def _format_param(value: object) -> str:
     """Compact rendering of one parameter value for the table (empty for None)."""
     if value is None:
@@ -1452,17 +1742,16 @@ def sweep(
         "--interval",
         help="Bar frequency: 1d | 1h | 30m | 5m | 1m. Sub-daily needs --source alpaca|synthetic.",
     ),
+    market: str = typer.Option(
+        DEFAULT_MARKET,
+        "--market",
+        help=MARKET_OPTION_HELP,
+    ),
     seed: int = typer.Option(0, "--seed", help="RNG seed when --source synthetic."),
     cash: float = typer.Option(1_000.0, "--cash", help="Starting cash per run."),
-    max_position: float = typer.Option(
-        0.25, "--max-position", help="Per-symbol position cap, fraction of equity."
-    ),
-    max_gross: float = typer.Option(
-        1.0, "--max-gross", help="Max gross exposure, fraction of equity."
-    ),
-    max_drawdown: float = typer.Option(
-        0.20, "--max-drawdown", help="Drawdown kill-switch threshold, fraction from peak."
-    ),
+    max_position: float | None = typer.Option(None, "--max-position", help=MAX_POSITION_HELP),
+    max_gross: float | None = typer.Option(None, "--max-gross", help=MAX_GROSS_HELP),
+    max_drawdown: float | None = typer.Option(None, "--max-drawdown", help=MAX_DRAWDOWN_HELP),
     halt_recovery_drawdown: float | None = typer.Option(
         None,
         "--halt-recovery-drawdown",
@@ -1474,10 +1763,7 @@ def sweep(
     halt_cooldown_bars: int | None = typer.Option(
         None,
         "--halt-cooldown-bars",
-        help=(
-            "Re-arm the halted kill switch after this many bars in force. With "
-            "--halt-recovery-drawdown, whichever triggers first wins. Off by default."
-        ),
+        help=HALT_COOLDOWN_HELP,
     ),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
@@ -1510,7 +1796,9 @@ def sweep(
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
     tickers = _parse_symbols(symbols)
-    freq = _parse_frequency(interval)
+    chosen_market = _resolve_market(market)
+    _check_symbol_shapes(chosen_market, tickers)
+    freq = _parse_frequency(interval, chosen_market.calendar)
     grid = _parse_grid(param)
     if rank_by not in {"sharpe", "total_return"}:
         typer.echo(
@@ -1528,6 +1816,7 @@ def sweep(
     try:
         risk = _build_risk(
             no_guardrails=no_guardrails,
+            posture=chosen_market.posture,
             max_position=max_position,
             max_gross=max_gross,
             max_drawdown=max_drawdown,
@@ -1551,6 +1840,11 @@ def sweep(
     if wf_mode not in {"anchored", "rolling"}:
         typer.echo(f"error: --wf-mode must be 'anchored' or 'rolling', got {wf_mode!r}", err=True)
         raise typer.Exit(2)
+
+    market_line = _market_line(chosen_market, freq)
+    if market_line:
+        typer.echo(market_line)
+        typer.echo(_sweep_basis_caveat(freq) + "\n")
 
     adapter = _make_adapter(source, cache_dir, seed, freq)
 
