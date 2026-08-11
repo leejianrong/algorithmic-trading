@@ -15,6 +15,28 @@ excluded until the clock crosses into the next day. For sub-daily bars, use
 and is complete once ``now >= ts + interval`` (ADR-0022). The policy is injectable
 so a real market calendar can replace either comparison later.
 
+Which rule a market gets is a **choice, not an inheritance** (ADR-0053). The daily
+default above is a *session* rule: it asks whether the venue's calendar day has
+turned over, which is a coherent question only for a venue that closes. A market
+that never closes has no session, so its daily bar is just a rolling 24-hour window
+and the instant it closes on is a convention someone has to pick. **The convention
+here is UTC midnight** — and it needs no new policy, because
+:func:`interval_is_complete` with a one-day interval already expresses exactly that.
+For a bar stamped at UTC midnight the two rules agree at *every* instant (swept
+minute by minute over three days in ``tests/unit/test_completeness_247.py``). Off
+midnight they diverge in one direction only: :func:`default_is_complete` calls the
+bar complete **early**, by exactly the stamp's offset from midnight, which for a
+24/7 venue means handing a still-forming bar to the strategy. So a continuous
+market drops the daily special case rather than adding a policy — every interval,
+daily included, gates on ``ts + interval``.
+
+Nothing in this module detects which kind of market a symbol trades on, and it
+should not: the completeness rule is an axis of its own, independent of any market
+calendar, and joining the two is a later slice's job. Today the CLI selects
+``default_is_complete`` for daily and ``interval_is_complete`` for intraday, so a
+24/7 daily feed built through the CLI would still inherit the session rule — the
+seam is proved and documented here, not yet wired.
+
 The second risk is a *fetch* that fails. A poll asks the adapter for every symbol
 in the universe, and one broken symbol used to take the whole poll — and therefore
 the whole live session — down with it (ADR-0032 recorded this as a known gap).
@@ -64,6 +86,10 @@ CompletenessPolicy = Callable[[Bar, datetime], bool]
 
 # US regular trading hours, 09:30-16:00 ET. Also `synthetic._SESSION_LENGTH`; kept
 # as a local constant so this module keeps its single-purpose import list.
+#
+# Both constants below describe the **US equity calendar** specifically. For a
+# market that never closes they are wrong in the safe direction — see the 24/7
+# paragraph in `fetch_span` (ADR-0053), which measures by how much.
 RTH_SESSION = timedelta(hours=6, minutes=30)
 
 # 365 calendar days hold ~252 trading sessions; weekends and the ~9 market
@@ -107,6 +133,19 @@ def fetch_span(lookback: int, interval: timedelta) -> timedelta:
     Worked, for the ``lookback=512`` default: daily -> ~2,967 days (~8 years,
     ~2,050 bars); 1h -> ~456 days; 5m -> ~38 days; 1m -> ~7.6 days. Each lands
     near four times the requested bars, which is one provider page.
+
+    **On a market that never closes both conversions are wrong, and both are wrong
+    wide** (ADR-0053, assessed rather than changed). A continuous day holds 24 h of
+    bars, not 6.5, and every calendar day is a session, so at ``lookback=512`` the
+    span exceeds the ``512 x interval`` a 24/7 source actually needs by **5.79x** at
+    1d (2,966 days for 512) and **21.39x** at every sub-daily interval
+    (``(24/6.5) x (365/252) x 4``). Wide is the direction this function is
+    deliberately tuned toward — a short window silently truncates the ADR-0042
+    warmup, an over-wide one costs a fetch — so nothing is adjusted here for 24/7,
+    and no market-specific branch is introduced. The one cost worth naming: a 24/7
+    sub-daily window holds ~10,953 bars per symbol per poll against ADR-0047's
+    "one provider page" reasoning (Alpaca's limit is 10,000), so such a poll becomes
+    two pages rather than one. That is a fetch cost, not a correctness problem.
     """
     if interval <= timedelta(0):
         raise ValueError(f"interval must be positive, got {interval!r}")
@@ -150,6 +189,18 @@ def default_is_complete(bar: Bar, now: datetime) -> bool:
     The bar's session (its calendar day) must lie strictly before the clock's
     current day; a bar dated on the clock's own still-forming day is not yet
     complete.
+
+    **This is a session rule, and it is for a venue that closes** (ADR-0053). It is
+    safe for US equities whatever hour the provider stamps a daily bar at, because
+    the session ends at 20:00/21:00 UTC and the UTC date always turns over *after*
+    that — the rule errs late, never early. It is the wrong rule for a market that
+    never closes: there the daily bar is a rolling 24-hour window, and unless the
+    provider anchors it at UTC midnight this rule declares it complete early by
+    exactly the stamp's offset from midnight (measured: 4 h, 8 h and 13 h stamps
+    give 240, 480 and 780 minutes of disagreement). Use
+    ``interval_is_complete(timedelta(days=1))`` for a continuous market; on a
+    midnight-anchored bar the two are indistinguishable, and off midnight it is the
+    one that waits for the window to actually elapse.
     """
     return now.astimezone(UTC).date() > bar.ts.astimezone(UTC).date()
 
@@ -167,6 +218,11 @@ def interval_is_complete(interval: timedelta) -> IntervalCompleteness:
     Returns an :class:`IntervalCompleteness`, which behaves identically to the
     closure this used to return and additionally carries ``interval`` so the feed
     can size its fetch window from it (ADR-0047).
+
+    ``ts + interval`` needs no calendar, so this is **also the daily rule for a
+    market that never closes**: ``interval_is_complete(timedelta(days=1))`` is a
+    rolling 24-hour window closing at UTC midnight, which is the convention ADR-0053
+    picks. No separate 24/7 policy exists, because this one already is it.
     """
     return IntervalCompleteness(interval)
 
@@ -179,6 +235,11 @@ def _policy_interval(policy: CompletenessPolicy) -> timedelta:
     (most forgiving) window of the supported set. Erring wide costs a larger fetch;
     erring narrow costs history the strategy needed, so the fallback goes wide. A
     caller who knows better passes ``interval=`` to :class:`RecentWindowFeed`.
+
+    Note that the 24/7 daily policy — ``interval_is_complete(timedelta(days=1))``,
+    ADR-0053 — *states* one day, and the fallback reads one day too, so swapping a
+    continuous market onto it changes which bars are complete and leaves the window
+    the poll requests byte-identical.
     """
     if isinstance(policy, IntervalCompleteness):
         return policy.interval
