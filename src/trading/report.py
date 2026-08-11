@@ -26,10 +26,12 @@ from __future__ import annotations
 import csv
 import json
 from dataclasses import asdict
+from datetime import timedelta
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
-from trading.frequency import TRADING_DAYS_PER_YEAR, Frequency
+from trading.calendar import US_EQUITY, get_calendar
+from trading.frequency import Frequency
 from trading.metrics import (
     DEFLATED_SHARPE_CONFIDENCE,
     MIN_TRADES_PER_PARAMETER,
@@ -55,8 +57,15 @@ if TYPE_CHECKING:
 # a consumer must notice. Purely *additive* keys are not such a change — a v1
 # reader keeps working untouched — and the dashboard's check is exact equality
 # (``payload._check_schema``), so a gratuitous bump would reject every result.json
-# already on disk. ADR-0031's halt episodes are additive and left it at 1.
+# already on disk. ADR-0031's halt episodes are additive and left it at 1, and so
+# is ADR-0057's ``market``.
 RESULT_SCHEMA_VERSION = 1
+
+# The market a run is assumed to have traded when nobody says otherwise: the only
+# one this bench traded before EPIC-87. It is ``US_EQUITY.name`` rather than a
+# string literal so there is exactly one spelling of "us_equity" in the codebase —
+# the calendar registry's (ADR-0054/0057).
+DEFAULT_MARKET = US_EQUITY.name
 
 
 def summarize(
@@ -489,19 +498,31 @@ def _equity_curve_to_list(curve: list[EquityPoint]) -> list[dict[str, Any]]:
     ]
 
 
-def _resolve_periods_per_year(frequency: str, override: float | None) -> float:
-    """Annualization factor for a run, from an explicit value or the interval label.
+def _resolve_periods_per_year(
+    frequency: str, override: float | None, market: str = DEFAULT_MARKET
+) -> float:
+    """Annualization factor for a run, from an explicit value or interval + market.
 
-    ``frequency`` is a free string in the schema, so an unrecognized label falls
-    back to the daily 252 basis rather than raising: this is a reporting detail,
-    and refusing to write ``result.json`` over it would be the wrong trade.
+    The interval label alone is not enough: ``"5m"`` is 19,656 bars a year on the
+    US-equity session and 105,120 on a market that never closes, so parsing the
+    label on a fixed calendar is how a crypto run ends up with an equity Sharpe
+    (ADR-0054's own recorded gap, closed by ADR-0057). ``market`` names a registered
+    :class:`~trading.calendar.MarketCalendar` and an **unknown one raises**, exactly
+    as :func:`~trading.calendar.get_calendar` does — falling back to equity here
+    would reinstate the silent default the calendar registry exists to refuse.
+
+    ``frequency`` remains a free string in the schema, so an unrecognized *label*
+    still falls back rather than raising — to that market's daily basis (252 on
+    equity, unchanged; 365 on a 24/7 market). A label is a reporting detail; the
+    market is not.
     """
     if override is not None:
         return override
+    calendar = get_calendar(market)
     try:
-        return Frequency.parse(frequency).periods_per_year
+        return Frequency.parse(frequency, calendar=calendar).periods_per_year
     except ValueError:
-        return TRADING_DAYS_PER_YEAR
+        return calendar.periods_per_year(timedelta(days=1))
 
 
 def _benchmark_metrics_block(
@@ -532,6 +553,7 @@ def result_to_dict(
     *,
     mode: str,
     frequency: str = "1d",
+    market: str = DEFAULT_MARKET,
     metrics: PerformanceMetrics | None = None,
     benchmark_curve: list[EquityPoint] | None = None,
     benchmark_metrics: BenchmarkComparison | None = None,
@@ -554,6 +576,7 @@ def result_to_dict(
           "schema_version": int,      # RESULT_SCHEMA_VERSION constant
           "mode": str,                # "backtest" | "paper"
           "frequency": str,           # interval label, e.g. "1d" (free string)
+          "market": str,              # MarketCalendar name; ADR-0057, additive
           "symbols": list[str],
           "starting_cash": float,
           "final_equity": float,
@@ -610,8 +633,9 @@ def result_to_dict(
 
     The ``episode_count``/``episodes`` keys (ADR-0031), the top-level ``absent``
     list (ADR-0032), the top-level ``benchmark_metrics`` block plus the
-    ``metrics.return_per_unit_exposure`` field (ADR-0037), and the top-level
-    ``significance`` block (ADR-0039) are purely additive:
+    ``metrics.return_per_unit_exposure`` field (ADR-0037), the top-level
+    ``significance`` block (ADR-0039), and the top-level ``market`` name
+    (ADR-0057) are purely additive:
     every pre-existing key keeps its exact meaning and value — ``symbols`` is
     still the *requested* universe, ``metrics`` is still exactly
     ``dataclasses.asdict`` of what the caller passed — so
@@ -633,6 +657,14 @@ def result_to_dict(
     frequency:
         A plain interval label (default ``"1d"``). Kept a free string so a later
         intraday lane forward-fits without a schema change.
+    market:
+        The name of the :class:`~trading.calendar.MarketCalendar` the run traded
+        (default ``"us_equity"``). Recorded so a reader never has to *remember*
+        which market produced a document: ``frequency`` alone cannot say whether
+        ``"1d"`` meant 252 bars a year or 365, and every risk-adjusted figure in
+        ``metrics`` depends on that (ADR-0054/0057). It is also what resolves the
+        annualization for the derived ``benchmark_metrics`` block below, so an
+        unknown name raises rather than defaulting to equity.
     metrics:
         An already-computed :class:`~trading.metrics.PerformanceMetrics`, or
         ``None``. Serialized generically via :func:`dataclasses.asdict` so new
@@ -648,8 +680,10 @@ def result_to_dict(
         over the derivation above when supplied.
     periods_per_year:
         Annualization factor for that derivation. ``None`` (the default) resolves
-        it from the ``frequency`` label, so a daily run keeps the 252 basis and an
-        intraday one scales correctly without the caller repeating itself.
+        it from the ``frequency`` label **on the ``market``'s calendar**, so a
+        daily equity run keeps the 252 basis, an intraday one scales correctly,
+        and a 24/7 run is not silently annualized on the equity session — all
+        without the caller repeating itself.
     significance:
         An already-computed :class:`~trading.metrics.SignificanceReport`
         (ADR-0039), or ``None`` (emits ``null``). Unlike ``benchmark_metrics`` this
@@ -661,6 +695,10 @@ def result_to_dict(
         "schema_version": RESULT_SCHEMA_VERSION,
         "mode": mode,
         "frequency": frequency,
+        # Which market's year the metrics below were annualized on. An interval
+        # label cannot carry that, and a reader who has to remember it will
+        # eventually remember it wrong (ADR-0057).
+        "market": market,
         "symbols": list(result.symbols),
         "starting_cash": result.starting_cash,
         "final_equity": result.final_equity,
@@ -677,7 +715,7 @@ def result_to_dict(
             result,
             benchmark_curve,
             benchmark_metrics,
-            _resolve_periods_per_year(frequency, periods_per_year),
+            _resolve_periods_per_year(frequency, periods_per_year, market),
         ),
         "fills": [
             {
@@ -743,6 +781,7 @@ def write_result_json(
     *,
     mode: str,
     frequency: str = "1d",
+    market: str = DEFAULT_MARKET,
     metrics: PerformanceMetrics | None = None,
     benchmark_curve: list[EquityPoint] | None = None,
     benchmark_metrics: BenchmarkComparison | None = None,
@@ -758,6 +797,7 @@ def write_result_json(
         result,
         mode=mode,
         frequency=frequency,
+        market=market,
         metrics=metrics,
         benchmark_curve=benchmark_curve,
         benchmark_metrics=benchmark_metrics,
