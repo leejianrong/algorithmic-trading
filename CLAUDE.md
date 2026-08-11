@@ -706,7 +706,126 @@ As of this writing:
   calendar (KAN-687) let 6 extended-hours bars through `_step` (no orders on them, so
   the sample is clean — luck, not design), and a part-day run still prints
   `Sharpe 10.04` / `Annualized +35.25%` / `Turnover 107,106%` with nothing saying it is
-  too short to annualize (KAN-705).
+  too short to annualize (KAN-705). (That annualization *caveat* is still unbuilt; the
+  252-day calendar underneath it is fixed — see ADR-0054 below.)
+- **Crypto groundwork — the equity assumptions baked into shared code (2026-08-11, three
+  ADRs, three PRs, EPIC-87 phase 1):** deliberately landed **before** any crypto adapter
+  exists, because the failure they prevent is silent: a first crypto backtest would
+  annualize a 365-day market on a 252-day calendar under equity-tuned risk caps and print
+  a confident number. All three are **library seams only — nothing is wired to the CLI**
+  (`cli.py` and `engine.py` are untouched by all three), so a crypto run built through
+  today's CLI still gets every equity default; the selection surface is one integration PR
+  still to come. The whole batch is byte-identical to `cfb4d85` across a daily backtest, a
+  **5m** backtest and a `paper --once` (8 artifacts hashed, plus `diff -r` on the paper
+  `--out`) — verified per lane *and* on merged `main`, since three lanes each clean alone
+  do not guarantee clean together.
+- **A 24/7 daily bar closes at UTC midnight, and that was a choice (ADR-0053, KAN-706):**
+  `default_is_complete` calls a daily bar finished once the clock's UTC **date** passes the
+  bar's — a *session* rule, coherent only because the venue closes, and inherited by
+  accident by anything that does not. A market with no close has no session: its daily bar
+  is a rolling 24-hour window and the instant it shuts is a convention. **No new policy was
+  needed** — `interval_is_complete(timedelta(days=1))` (ADR-0022) already *is* that rule,
+  because `ts + interval` needs no calendar. Swept minute by minute over three days: on a
+  midnight-stamped bar the two rules agree at **every one of 4,320** instants; at 4h/8h/13h
+  stamps they disagree for **240/480/780** minutes and **every** disagreement runs one way —
+  the session rule says *complete* while the window has not elapsed, i.e. it is early by
+  exactly the stamp's offset and would hand a 24/7 strategy a forming bar. For US equities
+  the same rule errs **late** whatever hour the provider stamps (a 20:00/21:00 UTC close
+  precedes the date rollover), which is why the equity default **stays**: the interval rule
+  on a session-open-stamped bar would withhold it 13.5 h past the real close. So a
+  continuous market **drops the daily special case** rather than gaining a policy, and no
+  `continuous_is_complete` was added — it would be a one-line delegation and a second
+  callable `_policy_interval` must recognise (ADR-0035's reuse rule). The production diff is
+  **docstrings and comments only: the AST is identical once docstrings are stripped**. The
+  seam is genuinely reachable — `is_complete` is a `RecentWindowFeed` constructor parameter.
+  `fetch_span`'s hardcoded equity calendar was **assessed, not refactored**: at
+  `lookback=512` it over-asks a 24/7 source by **5.79x** at 1d and **21.39x** sub-daily
+  (`(24/6.5) x (365/252) x 4`), the safe direction, so a continuous lookback cannot be
+  truncated — one cost named, ~**10,953** bars/symbol/poll is **two** provider pages, not
+  ADR-0047's one. 27 new fast tests, none using `SyntheticAdapter` or `FakeAdapter` for a
+  24/7 claim (ADR-0040's lesson, third sighting), with both stand-ins' equity-shaped limits
+  pinned so the file cannot be simplified back onto them; mutating the interval boundary
+  turns 12 red, mutating it *into* the date rule 9, tightening `WINDOW_SLACK` 5.
+- **Annualization was the US-equity session, hard-coded (ADR-0054, KAN-705):**
+  `frequency.py` carried `TRADING_DAYS_PER_YEAR = 252` and `REGULAR_SESSION_MINUTES = 390`
+  and returned `252 * (390 / interval_minutes)`, so `periods_per_year` — the **single** knob
+  behind Sharpe, Sortino, Calmar, annualized return, turnover, return per unit exposure,
+  alpha, IR and every ADR-0039 significance figure — was one market's year by construction.
+  A 24/7 venue trades **365 x 1440**: at 5m the factor should be **105,120** and the code
+  gave **19,656**, a **5.3480x** error and **2.3126x** in every Sharpe — and because the
+  interval cancels, that ratio is identical at 1h, 30m, 5m and 1m, not just 5m; daily is
+  1.4484x / 1.2035x. New `calendar.py` owns the vocabulary — a frozen validated
+  `MarketCalendar(name, days_per_year, minutes_per_day)` with `US_EQUITY` (252 x 390, the
+  former constants *exactly*) and `CRYPTO_24_7` (365 x 1440), and a registry whose
+  `get_calendar` **raises rather than falling back to equity**, because a silent equity
+  default *is* the bug. `Frequency` carries its calendar as a defaulted fourth field, so a
+  `"5m"` on 24/7 is **unequal** to a `"5m"` on equity and the two cannot be conflated by a
+  dict key; the crypto path is **keyword-only** (`parse(label, *, calendar=...)`), which is
+  why **`cli.py` needed no change at all** — pinned by a test that introspects the
+  signature. **The direction of the error is not what it looks like:** the equity factor is
+  the *smaller* one, so it shrinks the magnitude — a profitable strategy is *understated*
+  (conservative) while a **losing** one is flattered. Measured: a −3.73% 5m month scores
+  Sharpe **−8.34** on 252 x 390 against **−19.28** on 365 x 1440 (annualized −34.05% vs
+  −89.21%). And since total return and max drawdown do not scale with `periods_per_year` at
+  all, a mis-annualized report pairs an **honest drawdown with a Sharpe from another
+  market's year** — incoherent rather than merely biased. Additive throughout: `metrics.py`
+  already threaded `periods_per_year` as a plain float and the two old constants survive as
+  views onto `US_EQUITY`, so `report.py`/`data/synthetic.py` needed no change and **no
+  existing test or golden was modified**. Reverting the derivation turns **16** red, all 16
+  in the new module and none in the other 1,108 — which is itself the finding: nothing the
+  bench already had could see this defect.
+- **The risk defaults were an equity posture, and crypto got a bounded halt rather than
+  wider numbers (ADR-0055, KAN-709):** measured through the real `Engine` on a synthetic
+  series at **80% annualized volatility** (four times the default, drift held equal so vol
+  is the only changed variable), the drawdown latch tripped in **20 of 20 seeds** — median
+  first halt bar **250 of 2,610** — and then spent a median **90.5%** of the run refusing
+  entries: independently reproduced on three seeds at 88.6–96.7% of the run halted, first
+  halts at bars 85/196/298, returns **+11.72% / +1.02% / −17.72%** with **327/318/356**
+  rejections, against **0 of 3** halts at equity volatility. ADR-0031's measured failure,
+  arriving in year one and unanimously instead of merely likely — and **the caps are not the
+  defect**, clamping 1–13 orders in 2,610 bars. So **halt recovery stops being optional and
+  no number is widened**: `RiskConfig.crypto()` differs from `RiskConfig.equity()` (which is
+  exactly the existing defaults, named so that choosing a market is a choice) in **one
+  field**, `halt_cooldown_bars = 30`, pinned by a test that diffs the two configs.
+  `crypto(halt_cooldown_bars=None)` is a **`ValueError`** — a 24/7 posture whose switch is
+  permanent is the thing the preset exists to prevent. **Widening was measured and
+  refused**, and the measurement is stronger than the argument: `max_drawdown_pct = 0.50`
+  with recovery produced **0 halts and +539.93%** (a disabled guardrail with extra steps)
+  and `0.35` still latching gave **−13.41%**, while the calibrated posture — the *unchanged*
+  0.20 threshold plus the cooldown — produced **8 bounded halt episodes and +578.94%**, so
+  it beats the widened one on return *while keeping the guardrail live*. The cooldown's
+  floor is **arithmetic**: under `(threshold / per-bar sigma)²` bars it re-arms inside the
+  move that tripped it (**16** bars here), and 30 is the next legible unit above; return
+  falls monotonically past 30, so a return-maximizer would pick 5, which is below the floor
+  and refused — **the criterion picked the number, not the return column**.
+  `halt_recovery_drawdown_pct` stays `None` on evidence: alone at this volatility it
+  re-armed *nothing* (ADR-0031 §2's deadlock under OR). Exits stay allowed while halted,
+  asserted end to end — all 44 rejections in a crypto-posture run are BUYs, **zero** SELLs.
+  `risk.py` gains **no executable line** (AST identical once docstrings are stripped): a
+  posture is a `RiskConfig`, so there is no `if crypto:` and no second path. **The honest
+  limit, in the ADR and in the tests:** a GBM series at crypto-like volatility **is not
+  crypto** — no fat tails, no regime breaks, worst single-bar portfolio loss 9.29% across
+  26,090 returns where real crypto has 20% days — so this establishes the *shape* of the
+  failure, not the right level, and `max_daily_loss_pct` is left **off** precisely because
+  nothing here can size it. The posture beats the latch on 10/10 seeds but beats *no* halt
+  on only 4/10, asserted as a coin flip in both directions so it can never be read as free
+  return.
+- **What phase 1 left open, deliberately:** nothing selects a market — no `--market` flag,
+  so the three seams are reachable only from Python and a real-crypto `--source csv` run
+  today still annualizes on 252 days, inherits the session completeness rule, and latches in
+  its first year. `result.json` carries a bare interval label with **no market**, so
+  `report._resolve_periods_per_year` parses it on the equity calendar; a crypto run must
+  pass `periods_per_year=` explicitly at the `write_result_json` call site in `cli.py`. The
+  same hardcoded 252 still sits in `risk.py` (`_TRADING_DAYS`, vol-target realized vol —
+  latent only because `target_volatility` is off in both postures; on a 365-bar year it
+  would allow a vol-targeted book **20.4% more gross** than it asked for) and in
+  `data/recent_window.py` (`RTH_SESSION`/`CALENDAR_DAYS_PER_SESSION`). `halt_cooldown_bars`
+  is a **count, not a duration** — ADR-0049's unit mistake again: 30 bars is six weeks of an
+  equity calendar, 30 days of a 24/7 one and 2.5 hours at `5m`. And **`SyntheticAdapter`
+  cannot generate 24/7 bars** (measured: weekday-only daily bars, intraday confined to
+  13:30–20:00 UTC), so there is **no offline continuous fixture** — which matters because
+  the required `integration` job must stay offline (ADR-0040) and a differently-shaped
+  stand-in passes whether or not the bug exists. Filed as **KAN-830**, blocking the adapter.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -848,6 +967,23 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   means ten minutes at 5m and two days at 1d. Tune it toward the cheap error: stopping
   late costs a few polls of a shut venue, stopping early costs the whole day's
   measurement (ADR-0049).
+- **The annualization basis belongs to the market, not to the module** — `periods_per_year`
+  is the single knob behind every risk-adjusted figure, so a hard-coded 252 x 390 silently
+  reports one market's year for another. It comes from a `MarketCalendar`, and a lookup that
+  cannot resolve one **raises rather than falling back to equity** (ADR-0054). Note the
+  direction before trusting a figure: the equity basis is the smaller one, so it understates
+  a winner and **flatters a loser**, and because total return and max drawdown do not scale
+  at all, a mis-annualized report pairs an honest drawdown with a foreign Sharpe.
+- **Completeness is a per-market policy, and a market that never closes has no session** —
+  a 24/7 daily bar is a rolling 24-hour window (`ts + interval`, closing at UTC midnight by
+  convention), never "the UTC date has turned over". The equity session rule errs *late* and
+  stays; the same rule on a continuous venue errs **early** and hands the strategy a forming
+  bar (ADR-0053).
+- **Calibrate a guardrail; never widen it until nothing trips.** A limit chosen so it stops
+  firing is a disabled guardrail with extra steps, and it was measured to be worse on return
+  as well as dishonest — a bounded halt beat a widened threshold both ways. Where a market's
+  ordinary volatility makes a latch permanent, the fix is that **recovery stops being
+  optional**, not a looser level (ADR-0055). Exits stay allowed while halted, always.
 
 ## Layout
 
@@ -881,7 +1017,11 @@ src/trading/
                            #   stderr, UTC, text|json lines; --log-level governs `trading`, not the world
   sizing.py                # target-weight → fractional-share orders (V2)
   clock.py                 # Clock seam: WallClock / ImmediateClock / FakeClock (V5)
-  frequency.py             # Frequency value: label/delta/periods_per_year — interval abstraction (ADR-0022)
+  frequency.py             # Frequency value: label/delta/periods_per_year — interval abstraction (ADR-0022);
+                           #   carries its MarketCalendar; parse(label, *, calendar=…) (ADR-0054)
+  calendar.py              # MarketCalendar: US_EQUITY (252x390) / CRYPTO_24_7 (365x1440) — the annualization
+                           #   basis is a property of the market, and get_calendar raises rather than
+                           #   defaulting to equity (ADR-0054)
   dashboard/               # web dashboard (ADR-0023): payload + static_export (stdlib) + server (lazy FastAPI)
   data/fake.py             # in-memory adapter for the fast test layer
   data/yfinance_adapter.py # cached, adjusted yfinance adapter (injectable fetcher)
