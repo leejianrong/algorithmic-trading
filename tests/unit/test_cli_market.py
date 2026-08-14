@@ -29,6 +29,7 @@ thing it stands for cannot test the thing).
 
 from __future__ import annotations
 
+import csv
 import json
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -136,6 +137,12 @@ def _one_bar_result() -> BacktestResult:
 def _document(out: Path) -> dict[str, Any]:
     document: dict[str, Any] = json.loads((out.parent / "result.json").read_text())
     return document
+
+
+def _sweep_rows(out: Path) -> list[dict[str, str]]:
+    """The sweep results CSV, in the rank order it was written in."""
+    with out.open(newline="") as fh:
+        return list(csv.DictReader(fh))
 
 
 # --- Resolving the choice -----------------------------------------------------
@@ -280,6 +287,63 @@ class TestTheCalendarSeam:
             equity["metrics"]["sharpe"] * _EQUITY_SHARPE_RATIO
         )
         assert crypto["metrics"]["sharpe"] != equity["metrics"]["sharpe"]
+
+    def _csv_sweep(self, data_dir: Path, out: Path, *extra: str) -> Result:
+        return runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "sma_crossover",
+                "--source",
+                "csv",
+                "--cache-dir",
+                str(data_dir),
+                "--symbols",
+                "AAA",
+                "--param",
+                "fast=3,5",
+                "--param",
+                "slow=10,20",
+                "--out",
+                str(out),
+                "--from",
+                "2021-01-04",
+                "--to",
+                "2021-03-31",
+                *extra,
+            ],
+        )
+
+    def test_a_sweep_is_annualized_on_the_markets_basis(self, tmp_path: Path) -> None:
+        """KAN-840: the same bars, the same ranking, a different year.
+
+        ``sweep.py`` used to call ``metrics.compute(result)`` with no basis, so every
+        trial took the 252.0 default however the bars were spaced or whatever market
+        was chosen. The same CSV on both markets isolates the basis exactly as
+        :meth:`test_crypto_rescales_only_the_annualized_figures` does for a backtest.
+        """
+        data = tmp_path / "data"
+        self._write_csv(data, "AAA", base=100.0)
+        equity_out = tmp_path / "equity.csv"
+        crypto_out = tmp_path / "crypto.csv"
+
+        assert self._csv_sweep(data, equity_out).exit_code == 0
+        assert self._csv_sweep(data, crypto_out, "--market", "crypto").exit_code == 0
+
+        equity = _sweep_rows(equity_out)
+        crypto = _sweep_rows(crypto_out)
+        assert len(equity) == len(crypto) == 4
+        for slow, fast in zip(equity, crypto, strict=True):
+            # Identical bars and fills: the ranking and the unscaled columns hold.
+            assert (fast["fast"], fast["slow"]) == (slow["fast"], slow["slow"])
+            assert fast["total_return"] == slow["total_return"]
+            assert fast["max_drawdown"] == slow["max_drawdown"]
+            # ...and the annualized ones move by sqrt(365/252) = 1.2035x.
+            assert float(fast["sharpe"]) == pytest.approx(
+                float(slow["sharpe"]) * _EQUITY_SHARPE_RATIO
+            )
+            assert float(fast["sharpe"]) != float(slow["sharpe"])
 
     def test_the_intraday_factor_is_the_bigger_one(self) -> None:
         """5m is 5.348x out on the factor, 2.3126x in every Sharpe (ADR-0054).
@@ -750,18 +814,20 @@ class TestUnsupportedSurfacesError:
         assert result.exit_code == 2
         assert "No such option" in result.output
 
-    def test_a_sweep_says_which_figure_the_market_does_not_reach(self, tmp_path: Path) -> None:
-        """``sweep.py`` annualizes each run at 252 whatever the market says.
+    def test_a_sweep_no_longer_carries_a_basis_caveat(self, tmp_path: Path) -> None:
+        """The market now *does* reach a sweep's per-run metrics (KAN-840).
 
-        Pre-existing and equally true of ``--interval``; fixing it is that module's
-        change. What must not happen is a crypto sweep printing an equity-basis
-        Sharpe with nothing saying so.
+        This surface used to print a caveat naming the one figure ``--market`` could
+        not reach, because ``sweep.py`` annualized every trial at 252. The basis is
+        threaded now, so the caveat would be a false statement rather than an honest
+        one — the claim it made is asserted positively in
+        :meth:`TestTheCalendarSeam.test_a_sweep_is_annualized_on_the_markets_basis`.
         """
         result = _sweep(tmp_path / "sweep.csv", "--market", "crypto")
 
         assert result.exit_code == 0, result.output
-        assert "annualized on the us_equity basis" in result.output
-        assert "Ranking is unaffected" in result.output
+        assert "Market:" in result.output
+        assert "annualized on the us_equity basis" not in result.output
 
     def test_an_equity_sweep_prints_neither_line(self, tmp_path: Path) -> None:
         result = _sweep(tmp_path / "sweep.csv")

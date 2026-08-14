@@ -30,6 +30,16 @@ competed**. :attr:`SweepSummary.trial_count` and
 is pure arithmetic — no RNG — and only the bootstrap in :mod:`trading.metrics`
 draws random numbers, always from an explicitly seeded generator.
 
+Both loops annualize on a basis their caller names — ``periods_per_year``, recorded
+on the summary they return (KAN-840). It is not a detail: it is the single knob under
+Sharpe, Sortino, Calmar, annualized return and turnover, and this module used to take
+:func:`~trading.metrics.compute`'s 252.0 default for every trial however the bars were
+spaced, so ``trading sweep --interval 5m`` reported a US-equity *daily* year. Because
+one constant factor across trials cannot reorder them the ranking always looked
+self-consistent, which is why the table stayed wrong through several releases. The
+interval itself never arrives here — ADR-0022 keeps the bar length an
+adapter-construction property — only the basis does.
+
 Everything here is pure with respect to the inputs: no wall clock, no RNG, no
 network. Determinism comes entirely from the injected adapter (seed a
 ``SyntheticAdapter`` for offline, repeatable sweeps) and the deterministic grid
@@ -48,6 +58,7 @@ from typing import TYPE_CHECKING, cast
 from trading.broker import SimulatedBroker
 from trading.config import RiskConfig
 from trading.engine import EmptyUniverseError, Engine
+from trading.frequency import TRADING_DAYS_PER_YEAR
 from trading.metrics import (
     DeflatedSharpe,
     PerformanceMetrics,
@@ -67,6 +78,15 @@ if TYPE_CHECKING:
 
 # A single parameter combination, e.g. ``{"fast": 5, "slow": 30}``.
 ParamCombo = dict[str, object]
+
+# The annualization basis a sweep assumes when its caller names none: the US-equity
+# *daily* year, which is what :func:`trading.metrics.compute` defaults to and what a
+# ``trading sweep --interval 1d`` on ``--market us_equity`` genuinely is. Spelled as
+# the calendar view rather than a bare ``252.0`` so the assumption is legible at the
+# point it is made (ADR-0054). The CLI never relies on it — it passes the run's own
+# ``Frequency.periods_per_year`` — but a library caller sweeping daily equity bars
+# gets the right answer without having to say so.
+DEFAULT_PERIODS_PER_YEAR = TRADING_DAYS_PER_YEAR
 
 # The two ways a walk-forward's in-sample window can be shaped (ADR-0026).
 WALK_FORWARD_MODES = ("anchored", "rolling")
@@ -230,7 +250,14 @@ class SweepRun:
 
 @dataclass(frozen=True, slots=True)
 class SweepSummary:
-    """The full set of runs a sweep produced, rankable by a headline metric."""
+    """The full set of runs a sweep produced, rankable by a headline metric.
+
+    ``periods_per_year`` is the annualization basis **every** run in ``runs`` was
+    scored on, carried on the summary rather than left for a reader to infer
+    (KAN-840). It is what makes the object self-describing: ``metrics.sharpe`` is a
+    bare float with no unit attached, so a summary that did not say which year it
+    used could only be read correctly by someone who already knew.
+    """
 
     strategy: str
     symbols: list[str]
@@ -241,6 +268,10 @@ class SweepSummary:
     # Windows dropped because no symbol had data in them (ADR-0032) — e.g. an early
     # window predating a whole universe's listings. Reported, never silent.
     empty_windows: list[str] = field(default_factory=list)
+    # The year every run's annualized figures are expressed in. Defaulted so a
+    # hand-built summary stays valid and every existing caller is unaffected; the
+    # CLI always sets it from the run's own Frequency.
+    periods_per_year: float = DEFAULT_PERIODS_PER_YEAR
 
     def ranked(self, by: str = "sharpe") -> list[SweepRun]:
         """Runs sorted best-first by ``by`` ('sharpe' or 'total_return').
@@ -276,13 +307,16 @@ class SweepSummary:
         The input :func:`~trading.metrics.expected_max_sharpe` needs: both the
         *count* of trials and their *spread* determine how high the luckiest
         skill-free candidate would have scored.
+
+        Annualized **on this summary's** :attr:`periods_per_year`, which is why
+        :meth:`deflated_winner` may not be handed a different one.
         """
         return [run.metrics.sharpe for run in self.runs]
 
     def deflated_winner(
         self,
         by: str = "sharpe",
-        periods_per_year: float = 252.0,
+        periods_per_year: float | None = None,
     ) -> DeflatedSharpe | None:
         """Deflate the top-ranked run's Sharpe for the whole search (ADR-0039).
 
@@ -291,14 +325,42 @@ class SweepSummary:
         edge at all. ``None`` when there are no runs, or when the winner's moments
         were not recorded (a hand-built summary) — an honest absence, never a
         flattering skip.
+
+        ``periods_per_year`` defaults to :attr:`periods_per_year`, the basis the runs
+        were actually scored on, and an explicit value that *disagrees* with it
+        raises. That is KAN-840's subtler half. This method used to default to a bare
+        252.0 while the CLI passed the run's true basis, so a single calculation
+        mixed two years: :func:`~trading.metrics.deflated_sharpe` de-annualized
+        :meth:`trial_sharpes` by ``sqrt(periods_per_year)`` while those Sharpes had
+        been annualized at 252, leaving ``null_best_sharpe`` pinned to the equity
+        daily year and ``observed_sharpe`` following the interval. On a 5m sweep the
+        two disagreed by 8.83x *on the same printed block*, and the winner cleared a
+        bar 8.83x too low. Uniformly wrong would at least have been monotonic;
+        this was incoherent, the way ADR-0054 describes a report pairing an honest
+        drawdown with a foreign Sharpe.
+
+        Raising rather than quietly re-annualizing is deliberate: the trial Sharpes
+        are already fixed at the basis they were computed on, so "deflate these at a
+        different year" has no correct answer to give — a caller bug, in the same
+        class as :func:`~trading.metrics.deflated_sharpe` raising on an empty
+        ``trial_sharpes``.
         """
+        basis = self.periods_per_year if periods_per_year is None else periods_per_year
+        if basis != self.periods_per_year:
+            raise ValueError(
+                f"cannot deflate at {basis:g} bars/year: these {len(self.runs)} trial "
+                f"Sharpe(s) are annualized at {self.periods_per_year:g} bars/year, and "
+                "mixing the two bases yields a null threshold on one calendar and an "
+                "observed Sharpe on another (KAN-840). Re-run the sweep on the basis "
+                "you want."
+            )
         winners = self.ranked(by)
         if not winners:
             return None
         moments = winners[0].moments
         if moments is None:
             return None
-        return deflated_sharpe(moments, self.trial_sharpes(), periods_per_year)
+        return deflated_sharpe(moments, self.trial_sharpes(), basis)
 
 
 def _build_strategy(name: str, combo: ParamCombo) -> Strategy:
@@ -322,6 +384,7 @@ def _run_combo(
     *,
     cash: float,
     risk: RiskConfig,
+    periods_per_year: float,
 ) -> tuple[PerformanceMetrics, int, ReturnMoments | None]:
     """Run one combo over one span; return its metrics, bar count, and moments.
 
@@ -332,6 +395,22 @@ def _run_combo(
     the return-series moments (ADR-0039) so the winner can later be deflated
     without re-running anything or retaining the whole curve.
 
+    ``periods_per_year`` is **required**, not defaulted, and that is the whole of
+    KAN-840: this call used to read ``compute(result)``, taking
+    :func:`~trading.metrics.compute`'s 252.0 whatever the bars were spaced at, so a
+    ``--interval 5m`` sweep reported a US-equity *daily* year — every Sharpe,
+    Sortino, Calmar, annualized return and turnover in the table understated by
+    ``sqrt(19656 / 252)`` = 8.83x. Defaulting it here would leave the same silence
+    one layer down; the two public entry points default it once, visibly, and
+    nothing between them may.
+
+    Note what the interval does *not* do: it never reaches this function as an
+    interval. ADR-0022 makes the bar length an adapter-construction property, so the
+    adapter already holds it and the ``DataAdapter`` protocol deliberately does not
+    expose it. What travels is the annualization *basis* — the one number the
+    metrics need — never the frequency, so sweep still knows nothing about bar
+    lengths.
+
     A span in which *no* symbol has data raises
     :class:`~trading.engine.EmptyUniverseError` from the engine (ADR-0032). That is
     fatal to one run but not to a sweep: an early walk-forward fold can legitimately
@@ -341,7 +420,11 @@ def _run_combo(
     broker = SimulatedBroker(Portfolio(cash=cash))
     engine = Engine(adapter, broker, Guardrails(risk))
     result = engine.run(_build_strategy(strategy, combo), tickers, start, end)
-    return compute(result), len(result.equity_curve), curve_moments(result.equity_curve)
+    return (
+        compute(result, periods_per_year),
+        len(result.equity_curve),
+        curve_moments(result.equity_curve),
+    )
 
 
 def _partition_grid(
@@ -385,6 +468,7 @@ def run_sweep(
     cash: float = 1_000.0,
     risk: RiskConfig | None = None,
     windows: int = 1,
+    periods_per_year: float = DEFAULT_PERIODS_PER_YEAR,
 ) -> SweepSummary:
     """Run ``strategy`` over every grid combination (x every window) and rank.
 
@@ -398,6 +482,15 @@ def run_sweep(
     ``risk`` defaults to the enforced :class:`~trading.config.RiskConfig`
     defaults; pass ``RiskConfig.unlimited()`` to sweep unconstrained. Determinism
     is inherited from ``adapter`` — nothing here consults a clock or RNG.
+
+    ``periods_per_year`` is the annualization basis every trial is scored on, and it
+    must match the interval the ``adapter`` was built at (KAN-840). It defaults to
+    the equity daily year, which is what a daily equity sweep is; ``trading sweep``
+    always passes the run's own ``Frequency.periods_per_year``, so ``--interval`` and
+    ``--market`` both reach the table. The choice is recorded on
+    :attr:`SweepSummary.periods_per_year`, and the ranking is invariant to it — one
+    constant factor applied to every trial cannot reorder them, which is exactly why
+    the wrong basis went unnoticed for so long while every absolute figure was off.
 
     Every metric this returns is **in-sample**: the same bars that ranked a combo
     also produced its numbers. For an out-of-sample estimate use
@@ -424,6 +517,7 @@ def run_sweep(
                     win_end,
                     cash=cash,
                     risk=risk_config,
+                    periods_per_year=periods_per_year,
                 )
             except EmptyUniverseError as exc:
                 # A window predating the universe's listings is not a sweep failure
@@ -449,6 +543,7 @@ def run_sweep(
         runs=runs,
         skipped=skipped,
         empty_windows=empty_windows,
+        periods_per_year=periods_per_year,
     )
 
 
@@ -495,6 +590,12 @@ class WalkForwardSummary:
     ``unusable_folds`` carries ``(fold_index, reason)`` for folds that could not
     produce an OOS test at all, and ``warnings`` carries range-level or
     too-little-data notes.
+
+    ``periods_per_year`` names the year every IS and OOS figure is annualized in, for
+    the same reason :class:`SweepSummary` carries it (KAN-840). It matters more here,
+    not less: a sweep at least printed a deflation block whose observed Sharpe openly
+    disagreed with the ranking table, whereas a walk-forward prints ``IS sharpe
+    +1.45 -> OOS sharpe -1.08`` with nothing on screen to contradict it.
     """
 
     strategy: str
@@ -505,6 +606,8 @@ class WalkForwardSummary:
     skipped: list[tuple[ParamCombo, str]] = field(default_factory=list)
     unusable_folds: list[tuple[int, str]] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
+    # The year every fold's annualized figures are expressed in; see SweepSummary.
+    periods_per_year: float = DEFAULT_PERIODS_PER_YEAR
 
     @property
     def fold_count(self) -> int:
@@ -609,6 +712,7 @@ def run_walk_forward(
     rank_by: str = "sharpe",
     cash: float = 1_000.0,
     risk: RiskConfig | None = None,
+    periods_per_year: float = DEFAULT_PERIODS_PER_YEAR,
 ) -> WalkForwardSummary:
     """Walk ``[start, end]`` forward, optimizing on IS and testing once on OOS.
 
@@ -626,6 +730,12 @@ def run_walk_forward(
     (fixed-length, sliding) IS window. Each run gets a fresh broker and guardrails,
     and nothing here reads a clock or an RNG, so the same inputs always yield an
     equal summary.
+
+    ``periods_per_year`` is the annualization basis for every IS and OOS figure,
+    exactly as in :func:`run_sweep`, and it must match the interval ``adapter`` was
+    built at (KAN-840). The *selection* is invariant to it — one constant factor
+    across the candidates cannot reorder them — so the winner a fold picks does not
+    change; what changes is whether the Sharpes it reports mean anything.
 
     Degenerate input is reported on the result rather than raised: a range that
     cannot form even one IS/OOS pair, a grid whose every combination the strategy
@@ -679,6 +789,7 @@ def run_walk_forward(
                     span.is_end,
                     cash=cash,
                     risk=risk_config,
+                    periods_per_year=periods_per_year,
                 )
                 scored.append(_Scored(combo=combo, metrics=metrics, points=points))
         except EmptyUniverseError as exc:
@@ -699,6 +810,7 @@ def run_walk_forward(
                 span.oos_end,
                 cash=cash,
                 risk=risk_config,
+                periods_per_year=periods_per_year,
             )
         except EmptyUniverseError as exc:
             unusable.append((span.index, f"out-of-sample span has no data for any symbol: {exc}"))
@@ -740,4 +852,5 @@ def run_walk_forward(
         skipped=skipped,
         unusable_folds=unusable,
         warnings=warnings,
+        periods_per_year=periods_per_year,
     )

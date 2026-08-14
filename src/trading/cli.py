@@ -1665,32 +1665,6 @@ def _sweep_significance_block(summary: SweepSummary, rank_by: str, periods_per_y
     )
 
 
-def _sweep_basis_caveat(freq: Frequency) -> str:
-    """Name the one figure ``--market`` does *not* reach inside a sweep (ADR-0057).
-
-    ``sweep.py``'s per-run metrics come from ``metrics.compute(result)`` with the
-    default 252 basis, so a sweep's ``sharpe`` / ``annualized_return`` columns are
-    the equity daily year whatever ``--interval`` or ``--market`` says. That is
-    pre-existing and equally true of ``sweep --interval 5m`` today; fixing it means
-    threading the frequency into ``run_sweep``, which is that module's change to
-    make. What must not happen is a crypto sweep printing an equity-annualized
-    Sharpe with nothing saying so, so the caveat is printed rather than the number
-    quietly left wrong.
-
-    The ranking is unaffected: Sharpe ordering across runs does not depend on the
-    basis (it multiplies every candidate by the same root), and ``total_return`` and
-    ``max_drawdown`` do not scale with it at all — which is exactly ADR-0054's
-    observation about a report pairing an honest drawdown with a foreign Sharpe.
-    """
-    return (
-        f"  ⚠ the sharpe / annualized columns below are annualized on the "
-        f"{US_EQUITY.name} basis ({US_EQUITY.days_per_year:g} bars/year): a sweep's "
-        "per-run metrics do not take the market's calendar (pre-existing, and true of "
-        "--interval too). Ranking is unaffected; the deflation block uses "
-        f"{freq.periods_per_year:g} bars/year"
-    )
-
-
 def _format_param(value: object) -> str:
     """Compact rendering of one parameter value for the table (empty for None)."""
     if value is None:
@@ -1843,8 +1817,7 @@ def sweep(
 
     market_line = _market_line(chosen_market, freq)
     if market_line:
-        typer.echo(market_line)
-        typer.echo(_sweep_basis_caveat(freq) + "\n")
+        typer.echo(market_line + "\n")
 
     adapter = _make_adapter(source, cache_dir, seed, freq)
 
@@ -1862,11 +1835,23 @@ def sweep(
             cash=cash,
             risk=risk,
             out=out,
+            periods_per_year=freq.periods_per_year,
         )
         return
 
+    # The run's own basis, from the --interval x --market Frequency: the sweep's
+    # metrics used to take metrics.compute's 252.0 whatever the bars were (KAN-840).
     summary = run_sweep(
-        strategy, grid, adapter, tickers, start, end, cash=cash, risk=risk, windows=windows
+        strategy,
+        grid,
+        adapter,
+        tickers,
+        start,
+        end,
+        cash=cash,
+        risk=risk,
+        windows=windows,
+        periods_per_year=freq.periods_per_year,
     )
 
     param_keys = list(grid)
@@ -1987,6 +1972,7 @@ def _run_walk_forward_command(
     cash: float,
     risk: RiskConfig,
     out: Path,
+    periods_per_year: float,
 ) -> None:
     """Run and print a true in-sample -> out-of-sample walk-forward (ADR-0026).
 
@@ -1995,6 +1981,12 @@ def _run_walk_forward_command(
     produce: mean OOS performance and the IS->OOS degradation. The out-of-sample
     figures are the honest ones; the in-sample figures are shown only so the gap
     between them is visible.
+
+    ``periods_per_year`` is the run's ``Frequency`` basis, threaded through for the
+    same reason the plain sweep threads it (KAN-840). The walk-forward path is the
+    quieter half of that defect: every Sharpe on these fold lines was annualized at
+    252 whatever ``--interval`` said, and unlike the sweep there is no deflation
+    block underneath printing a contradictory figure to notice it by.
     """
     summary = run_walk_forward(
         strategy,
@@ -2008,6 +2000,7 @@ def _run_walk_forward_command(
         rank_by=rank_by,
         cash=cash,
         risk=risk,
+        periods_per_year=periods_per_year,
     )
 
     typer.echo(
