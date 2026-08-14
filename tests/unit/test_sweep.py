@@ -766,3 +766,198 @@ def test_deflation_is_deterministic_and_needs_no_rng() -> None:
         "sma_crossover", {"fast": [5, 10], "slow": [30, 50]}, _adapter(), _SYMBOLS, _START, _END
     )
     assert first.deflated_winner() == second.deflated_winner()
+
+
+# --- the annualization basis reaches every trial (KAN-840, ADR-0059) ----------
+#
+# ``_run_combo`` called ``compute(result)`` with no basis, so every trial took
+# ``metrics.compute``'s 252.0 default however the bars were spaced. A sweep at
+# ``--interval 5m`` therefore reported a US-equity *daily* year for 5-minute bars,
+# understating Sharpe by ``sqrt(19656 / 252)`` = 8.83x. ADR-0054's defect, one
+# module along.
+
+# A US-equity 5-minute year: 252 sessions x (390 min / 5 min).
+_FIVE_MINUTE_YEAR = 252.0 * (390.0 / 5.0)
+# What every risk-adjusted figure is out by when 5m bars are annualized daily.
+_FIVE_MINUTE_RATIO = math.sqrt(_FIVE_MINUTE_YEAR / 252.0)
+
+_GRID = {"fast": [5, 10], "slow": [30, 50]}
+
+
+def _swept(periods_per_year: float | None = None) -> SweepSummary:
+    """The same sweep, optionally on a non-default annualization basis."""
+    if periods_per_year is None:
+        return run_sweep("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END)
+    return run_sweep(
+        "sma_crossover",
+        _GRID,
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+        periods_per_year=periods_per_year,
+    )
+
+
+def test_the_basis_reaches_every_trials_metrics() -> None:
+    """The defect itself: a sweep's Sharpe must follow the interval it ran at."""
+    daily = _swept()
+    five_minute = _swept(_FIVE_MINUTE_YEAR)
+
+    assert len(daily.runs) == len(five_minute.runs) == 4
+    for slow, fast in zip(daily.runs, five_minute.runs, strict=True):
+        assert slow.params == fast.params
+        # Identical bars, identical fills — only the year they are annualized on.
+        assert fast.metrics.sharpe == pytest.approx(slow.metrics.sharpe * _FIVE_MINUTE_RATIO)
+        assert fast.metrics.sortino == pytest.approx(slow.metrics.sortino * _FIVE_MINUTE_RATIO)
+
+
+def test_total_return_and_drawdown_do_not_move_with_the_basis() -> None:
+    """Why a mis-annualized sweep is incoherent, not merely biased (ADR-0054).
+
+    The unscaled figures stay put while the annualized ones move, so a wrong basis
+    pairs an honest drawdown with a Sharpe from another market's year.
+    """
+    daily = _swept()
+    five_minute = _swept(_FIVE_MINUTE_YEAR)
+
+    for slow, fast in zip(daily.runs, five_minute.runs, strict=True):
+        assert fast.metrics.total_return == slow.metrics.total_return
+        assert fast.metrics.max_drawdown == slow.metrics.max_drawdown
+        assert fast.metrics.win_rate == slow.metrics.win_rate
+        # ...while these two do.
+        assert fast.metrics.annualized_return != slow.metrics.annualized_return
+        assert fast.metrics.turnover == pytest.approx(slow.metrics.turnover * 78.0)
+
+
+def test_a_summary_records_the_basis_its_metrics_were_computed_on() -> None:
+    """The number is on the summary, so nothing downstream has to guess it."""
+    assert _swept().periods_per_year == 252.0
+    assert _swept(_FIVE_MINUTE_YEAR).periods_per_year == _FIVE_MINUTE_YEAR
+
+
+def test_the_default_basis_is_the_equity_daily_year() -> None:
+    """Unchanged for every existing caller: a daily equity sweep still reads 252."""
+    summary = _swept()
+    for run in summary.runs:
+        assert run.moments is not None
+        annualized = run.moments.mean / run.moments.stdev * math.sqrt(252.0)
+        assert annualized == pytest.approx(run.metrics.sharpe)
+
+
+def test_the_deflation_reads_the_basis_the_trials_were_scored_on() -> None:
+    """The incoherence KAN-840 actually shipped.
+
+    ``deflated_winner`` received the *correct* ``periods_per_year`` from the CLI and
+    applied it to ``trial_sharpes()`` — which were annualized at 252. One calculation,
+    two years. The symptom was visible on stdout: the ranking table printed the
+    winner at ``0.593`` while the deflation block under it called the same run
+    ``observed +5.24``.
+    """
+    summary = _swept(_FIVE_MINUTE_YEAR)
+    deflated = summary.deflated_winner()
+
+    assert deflated is not None
+    winner = summary.ranked()[0]
+    assert deflated.observed_sharpe == pytest.approx(winner.metrics.sharpe)
+
+
+def test_the_null_best_sharpe_moves_with_the_basis_too() -> None:
+    """Not just the observed figure: the bar it must clear is annualized as well.
+
+    ``null_best_sharpe`` is built from the spread of ``trial_sharpes()``, so leaving
+    those at 252 pinned the null to the equity daily year while the observed Sharpe
+    followed the interval — making the winner look 8.83x more significant than it is.
+    """
+    daily = _swept().deflated_winner()
+    five_minute = _swept(_FIVE_MINUTE_YEAR).deflated_winner()
+
+    assert daily is not None
+    assert five_minute is not None
+    assert daily.null_best_sharpe > 0.0
+    assert five_minute.null_best_sharpe == pytest.approx(
+        daily.null_best_sharpe * _FIVE_MINUTE_RATIO
+    )
+    assert five_minute.trial_sharpe_stdev is not None
+    assert daily.trial_sharpe_stdev is not None
+    assert five_minute.trial_sharpe_stdev == pytest.approx(
+        daily.trial_sharpe_stdev * _FIVE_MINUTE_RATIO
+    )
+
+
+def test_the_deflation_probability_is_basis_free() -> None:
+    """The one figure that must *not* move: a probability is not annualized.
+
+    PSR compares the winner's per-bar moments against a per-bar threshold. Both
+    de-annualize by the same root, so the answer is invariant — which is precisely
+    what a mixed-basis calculation broke.
+    """
+    daily = _swept().deflated_winner()
+    five_minute = _swept(_FIVE_MINUTE_YEAR).deflated_winner()
+
+    assert daily is not None
+    assert five_minute is not None
+    assert daily.probability is not None
+    assert five_minute.probability == pytest.approx(daily.probability)
+
+
+def test_deflating_on_a_basis_the_runs_were_not_scored_on_is_refused() -> None:
+    """The mixed-basis calculation is now unrepresentable, not merely unlikely.
+
+    A caller bug, in the same class as ``deflated_sharpe`` raising on an empty
+    ``trial_sharpes``: the trial Sharpes are fixed at the basis they were computed
+    on, so re-deflating them at another year is arithmetic on two calendars.
+    """
+    summary = _swept()
+
+    assert summary.deflated_winner("sharpe", 252.0) == summary.deflated_winner()
+    with pytest.raises(ValueError, match="annualized at 252"):
+        summary.deflated_winner("sharpe", _FIVE_MINUTE_YEAR)
+
+
+def test_walk_forward_folds_are_annualized_on_the_basis_too() -> None:
+    """``--folds`` shares ``_run_combo``, so it had the same defect — silently.
+
+    A sweep at least printed a deflation block whose observed Sharpe disagreed with
+    the table. A walk-forward prints IS/OOS Sharpes and nothing to contradict them.
+    """
+    daily = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=2)
+    five_minute = run_walk_forward(
+        "sma_crossover",
+        _GRID,
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+        folds=2,
+        periods_per_year=_FIVE_MINUTE_YEAR,
+    )
+
+    assert daily.fold_count == five_minute.fold_count == 2
+    assert daily.periods_per_year == 252.0
+    assert five_minute.periods_per_year == _FIVE_MINUTE_YEAR
+    for slow, fast in zip(daily.folds, five_minute.folds, strict=True):
+        # The same fold picked the same winner — only the year moved.
+        assert fast.params == slow.params
+        assert fast.out_of_sample_metrics.total_return == slow.out_of_sample_metrics.total_return
+        assert fast.in_sample_metrics.sharpe == pytest.approx(
+            slow.in_sample_metrics.sharpe * _FIVE_MINUTE_RATIO
+        )
+        assert fast.out_of_sample_metrics.sharpe == pytest.approx(
+            slow.out_of_sample_metrics.sharpe * _FIVE_MINUTE_RATIO
+        )
+
+
+def test_the_basis_never_changes_which_combination_wins() -> None:
+    """Why this survived: one constant factor across trials is monotonic.
+
+    The ranking is genuinely unaffected — which is what made the table look
+    self-consistent while every absolute figure in it was wrong.
+    """
+    daily = _swept()
+    five_minute = _swept(_FIVE_MINUTE_YEAR)
+
+    assert [run.params for run in daily.ranked()] == [run.params for run in five_minute.ranked()]
+    assert [run.params for run in daily.ranked("total_return")] == [
+        run.params for run in five_minute.ranked("total_return")
+    ]

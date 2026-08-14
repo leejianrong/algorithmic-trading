@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import csv
+from datetime import UTC, datetime
 from pathlib import Path
 
+import pytest
 from typer.testing import CliRunner, Result
 
 from trading.cli import app
+from trading.data.synthetic import SyntheticAdapter
+from trading.frequency import Frequency
+from trading.sweep import run_walk_forward
 
 runner = CliRunner()
 
@@ -330,3 +336,132 @@ class TestWalkForwardCli:
         assert result.exit_code == 0, result.output
         assert "Walk-forward:" not in result.output
         assert "Sweep:" in result.output
+
+
+class TestTheIntervalReachesTheTable:
+    """``--interval`` must reach the sweep's own metrics, not just the engine.
+
+    KAN-840. ``sweep.py`` called ``metrics.compute(result)`` with no basis, so every
+    trial was annualized on the US-equity *daily* year however the bars were spaced —
+    ``--interval 5m`` understated Sharpe, Sortino, Calmar, annualized return and
+    turnover by ``sqrt(19656 / 252)`` = 8.83x.
+    """
+
+    # One month of 5-minute bars is ~2,000 of them: plenty for four sma_crossover
+    # trials to diverge. The same month of *daily* bars is 21, which never clears a
+    # slow=30 warmup, so the daily control below needs the two-year range.
+    _INTRADAY_SPAN = ("--from", "2021-06-01", "--to", "2021-07-01")
+
+    @staticmethod
+    def _sweep(tmp_path: Path, *extra: str) -> Result:
+        return runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "sma_crossover",
+                "--param",
+                "fast=5,10",
+                "--param",
+                "slow=30,50",
+                "--source",
+                "synthetic",
+                "--seed",
+                "5",
+                "--symbols",
+                "AAA,BBB",
+                "--out",
+                str(tmp_path / "sweep.csv"),
+                *extra,
+            ],
+        )
+
+    @staticmethod
+    def _winner_sharpe(result: Result) -> float:
+        """The top-ranked run's Sharpe, read off the printed table."""
+        lines = result.output.splitlines()
+        header = next(i for i, line in enumerate(lines) if line.startswith("rank  fast"))
+        return float(lines[header + 2].split()[4])
+
+    @staticmethod
+    def _observed_sharpe(result: Result) -> float:
+        """The Sharpe the deflation block calls the winner's, from ``(observed +X)``."""
+        line = next(li for li in result.output.splitlines() if li.startswith("Trials:"))
+        return float(line.rsplit("(observed ", 1)[1].rstrip(")"))
+
+    def test_the_table_and_the_deflation_block_agree_on_the_winner(self, tmp_path: Path) -> None:
+        """The symptom, on one screen.
+
+        Before the fix a 5m sweep printed the winner at ``0.593`` in the table and
+        ``observed +5.24`` in the block directly beneath it — the same run, the same
+        moments, two annualization bases, differing by exactly 8.83x. Uniformly wrong
+        would have been monotonic and self-consistent; this was incoherent, in
+        ADR-0054's sense of an honest drawdown beside a foreign Sharpe.
+        """
+        result = self._sweep(tmp_path, "--interval", "5m", *self._INTRADAY_SPAN)
+
+        assert result.exit_code == 0, result.output
+        assert self._observed_sharpe(result) == pytest.approx(self._winner_sharpe(result), abs=0.01)
+
+    def test_a_daily_sweep_agrees_too(self, tmp_path: Path) -> None:
+        """The equity daily path was always coherent, and stays that way."""
+        result = self._sweep(tmp_path, *_COMMON[2:])
+
+        assert result.exit_code == 0, result.output
+        assert self._observed_sharpe(result) == pytest.approx(self._winner_sharpe(result), abs=0.01)
+
+    def test_the_annualized_column_of_an_intraday_sweep_is_a_year(self, tmp_path: Path) -> None:
+        """The absurdity the wrong basis produced, in the CSV rather than the table.
+
+        This is a one-month 5-minute run. Annualizing a month must *grow* its
+        magnitude toward a year's. On the daily basis it shrank instead — a +2.52%
+        month came out as ``annualized_return`` 0.351%, because ~2,000 five-minute
+        bars were being counted as eight years of daily ones.
+        """
+        assert self._sweep(tmp_path, "--interval", "5m", *self._INTRADAY_SPAN).exit_code == 0
+
+        with (tmp_path / "sweep.csv").open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        assert rows
+        for row in rows:
+            total = float(row["total_return"])
+            annualized = float(row["annualized_return"])
+            assert total != 0.0, row
+            assert abs(annualized) > abs(total), row
+
+    def test_the_walk_forward_path_gets_the_basis_too(self, tmp_path: Path) -> None:
+        """``--folds`` shares ``_run_combo``, and is the quieter half of the defect.
+
+        A sweep prints a deflation block whose observed Sharpe contradicted its table;
+        a walk-forward prints ``IS sharpe -> OOS sharpe`` with nothing to disagree
+        with it, so only an exact comparison can catch a wrong basis here. This runs
+        the library entry point on the interval's real basis and requires the CLI's
+        CSV to match it digit for digit.
+        """
+        assert (
+            self._sweep(tmp_path, "--interval", "5m", "--folds", "2", *self._INTRADAY_SPAN)
+        ).exit_code == 0
+
+        freq = Frequency.parse("5m")
+        expected = run_walk_forward(
+            "sma_crossover",
+            {"fast": [5, 10], "slow": [30, 50]},
+            SyntheticAdapter(seed=5, frequency=freq),
+            ["AAA", "BBB"],
+            datetime(2021, 6, 1, tzinfo=UTC),
+            datetime(2021, 7, 1, tzinfo=UTC),
+            folds=2,
+            periods_per_year=freq.periods_per_year,
+        )
+
+        with (tmp_path / "sweep.csv").open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        assert len(rows) == expected.fold_count == 2
+        for row, fold in zip(rows, expected.folds, strict=True):
+            assert float(row["is_sharpe"]) == pytest.approx(fold.in_sample_metrics.sharpe, abs=5e-5)
+            assert float(row["oos_sharpe"]) == pytest.approx(
+                fold.out_of_sample_metrics.sharpe, abs=5e-5
+            )
+        # And the basis really is the intraday one, not the daily year it defaulted
+        # to: at 5m these Sharpes are 8.83x what 252 would have produced.
+        assert abs(expected.folds[0].in_sample_metrics.sharpe) > 5.0
