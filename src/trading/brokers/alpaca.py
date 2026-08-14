@@ -20,10 +20,15 @@ be driven through the timeout branch deterministically under
 
 from __future__ import annotations
 
+import logging
+from dataclasses import replace
 from datetime import timedelta
 
+from trading.calendar import US_EQUITY, MarketCalendar
 from trading.clock import Clock, WallClock
 from trading.data.alpaca_client import (
+    ASSET_CLASS_CRYPTO,
+    ASSET_CLASS_US_EQUITY,
     STATUS_FILLED,
     TERMINAL_STATUSES,
     AlpacaClient,
@@ -31,7 +36,28 @@ from trading.data.alpaca_client import (
     OrderRejectedError,
     RealAlpacaClient,
 )
+from trading.sizing import SHARE_PRECISION
 from trading.types import Bar, Fill, Order, Portfolio, Position, Side
+
+logger = logging.getLogger(__name__)
+
+# The most a *rounded* exit can exceed the holding it was rounded from: half a
+# unit at the sizer's precision (ADR-0058).
+#
+# `sizing.size` emits `round(desired - current, SHARE_PRECISION)`, and on US
+# equities that is exact, because Alpaca quantizes fractional shares at six
+# decimals or fewer -- so `current` already has no seventh digit to round. Crypto
+# publishes `min_trade_increment = 1e-9`, so a reconciled quantity routinely
+# carries nine decimals and rounding to six rounds **up** about half the time.
+#
+# Observed live on 2026-08-14, a full exit of a real position::
+#
+#     insufficient balance for ETH (requested: 13.338989, available: 13.33898895)
+#
+# That is a long-or-flat position this bench could not sell -- ADR-0011's only exit
+# blocked by arithmetic, which ADR-0013/0031 and ADR-0036 each go out of their way
+# to prevent.
+_MAX_ROUNDING_OVERSELL = 0.5 * 10.0**-SHARE_PRECISION
 
 # How long a single ``on_bar`` will poll a pending order before giving up and
 # leaving it to a later bar, and how long to wait between polls. Kept short
@@ -71,6 +97,23 @@ class AlpacaBroker:
     the bench needs this -- :class:`~trading.broker.SimulatedBroker` fills within
     the bar, so it never has a working order to duplicate -- which is why the guard
     lives here and the backtest path is untouched.
+
+    ``calendar`` selects the venue for a client this broker builds itself
+    (ADR-0058), the same value and for the same reason
+    :class:`~trading.data.alpaca_adapter.AlpacaAdapter` takes one. **No logic in
+    this class is asset-class aware**, which is the finding rather than the
+    omission: the poll loop, the terminal-status set, the duplicate guard's
+    ``(symbol, side)`` key (ADR-0036) and the reconcile-from-the-account rule
+    (ADR-0020) were all written without a market in mind and all held against a
+    real crypto fill. Everything that had to change lives one layer down in the
+    client, where the venue's own inconsistencies are.
+
+    One consequence of the venue and not of this code, recorded in ADR-0058: a
+    crypto order is ``GTC`` because the venue refuses ``DAY``, so an unfilled one
+    **never expires**. On equities a parked order is cleaned up by the close
+    (ADR-0036); here it is not, so a session that ends with a working crypto order
+    leaves it working. ADR-0052 already learned that a session ends holding its
+    book; on this venue that is now also true of its orders indefinitely.
     """
 
     def __init__(
@@ -80,10 +123,14 @@ class AlpacaBroker:
         clock: Clock | None = None,
         poll_timeout: timedelta = DEFAULT_POLL_TIMEOUT,
         poll_interval: timedelta = DEFAULT_POLL_INTERVAL,
+        calendar: MarketCalendar = US_EQUITY,
     ) -> None:
         # Default to a live client / wall clock only when nothing is injected, so
         # the fast test layer never touches the network or a real clock.
-        self._client: AlpacaClient = client if client is not None else RealAlpacaClient()
+        asset_class = ASSET_CLASS_CRYPTO if calendar.is_continuous else ASSET_CLASS_US_EQUITY
+        self._client: AlpacaClient = (
+            client if client is not None else RealAlpacaClient(asset_class=asset_class)
+        )
         self._clock: Clock = clock if clock is not None else WallClock()
         self._poll_timeout = poll_timeout
         self._poll_interval = poll_interval
@@ -134,6 +181,7 @@ class AlpacaBroker:
         the engine and ending the session (ADR-0041). A failure that means *we
         could not ask* still propagates: it is not a decision about this order.
         """
+        order = self._trim_rounding_oversell(order)
         working_id = self._working_order_id(order.symbol, order.side)
         if working_id is not None:
             working = self._requested[working_id]
@@ -204,6 +252,54 @@ class AlpacaBroker:
 
     # -- internals --
 
+    def _trim_rounding_oversell(self, order: Order) -> Order:
+        """Trim an exit that rounding pushed a hair past the holding (ADR-0058).
+
+        **Narrow on purpose, in three ways**, because silently rewriting an order
+        is exactly the kind of helpfulness this bench refuses:
+
+        * **SELL only.** A BUY has no holding it could exceed.
+        * **Only when the excess is at most half a unit at
+          :data:`~trading.sizing.SHARE_PRECISION`.** An exit for twice what is held
+          is a bug upstream, and halving it would hide that — it goes to the venue,
+          which refuses it, and the refusal is recorded (ADR-0041).
+        * **Only against a position that exists.** Selling something unheld is not
+          a rounding artifact; it is the implicit short ADR-0011 forbids, and the
+          venue is the right thing to say so.
+
+        The trim is logged rather than recorded as a rejection or a clamp: the exit
+        *happens*, at the only quantity that could have worked, so calling it a
+        guardrail action would misdescribe it. The guardrail clamps (ADR-0009) are
+        policy decisions about how much to hold; this is arithmetic about how much
+        exists.
+
+        **The root cause is one layer up and is not fixed here.**
+        ``SHARE_PRECISION = 6`` is a US-equity fractional-share convention applied
+        to every market, and the honest fix is for the sizer to round *toward zero*
+        (or to the venue's own ``min_trade_increment``). That lives in
+        ``sizing.py``, is shared by the backtest path, and would move every equity
+        figure this repo has published — so it belongs to a card that owns that
+        file and can re-baseline the goldens. This guard is the symptom-level
+        defence, the same shape ADR-0036 chose over KAN-678.
+        """
+        if order.side is not Side.SELL:
+            return order
+        held = self._portfolio.position(order.symbol).qty
+        excess = order.qty - held
+        if held <= 0.0 or not (0.0 < excess <= _MAX_ROUNDING_OVERSELL):
+            return order
+        logger.info(
+            "trimmed %s exit from %.9f to the %.9f actually held (%.2e over, "
+            "sizer rounding at %d decimals); a long-or-flat position must stay "
+            "sellable (ADR-0058)",
+            order.symbol,
+            order.qty,
+            held,
+            excess,
+            SHARE_PRECISION,
+        )
+        return replace(order, qty=held)
+
     def _working_order_id(self, symbol: str, side: Side) -> str | None:
         """The id of an order in ``symbol`` on ``side`` the venue is still working.
 
@@ -264,6 +360,24 @@ class AlpacaBroker:
 
         Defensive against a ``filled`` status with no usable price/quantity yet
         (which would violate :class:`~trading.types.Fill`'s positivity invariants).
+
+        **``commission=0.0`` is true of equities and false of crypto** (ADR-0058,
+        measured 2026-08-14). Alpaca's paper crypto venue charges roughly 25 bps
+        and takes it **in the received asset**, not in cash and not in any field
+        the order carries: four BUYs totalling ``0.000617391`` BTC produced a
+        position of ``0.000615847`` (ratio ``0.99749936``), and an independent
+        ``0.00016`` BUY added ``0.0001596`` (ratio ``0.99750000``). The venue
+        reports ``filled_qty`` **gross**, so nothing here can compute the fee, and
+        inventing a 25 bps constant from one afternoon is exactly the re-tuning
+        ADR-0052 refused.
+
+        Two consequences, both recorded rather than fixed. The account stays
+        correct — the portfolio reconciles from Alpaca, never from this
+        :class:`~trading.types.Fill` (ADR-0020) — but the **blotter overstates the
+        received quantity by the fee**, and any fill-divergence measurement
+        (ADR-0038, KAN-710) is comparing a 5 bps slippage-only model against a
+        venue charging ~25 bps plus slippage. That is a five-fold gap in the
+        *unsafe* direction, and the first crypto divergence number will show it.
         """
         if order.filled_avg_price is None or order.filled_qty <= 0:
             return None
@@ -272,7 +386,7 @@ class AlpacaBroker:
             side=order.side,
             qty=order.filled_qty,
             price=order.filled_avg_price,
-            commission=0.0,  # Alpaca paper commission is zero; real costs are in the fill.
+            commission=0.0,  # see the docstring: true for equities, understated for crypto.
         )
 
     def _reconcile(self) -> Portfolio:

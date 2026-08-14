@@ -595,8 +595,14 @@ def _make_adapter(
         # Bring-your-own-data: reads <cache_dir>/<SYMBOL>.csv in the standard schema.
         return CsvAdapter(cache_dir)
     if source == "alpaca":
+        # The venue comes from the frequency's calendar, which `--market` already
+        # set (ADR-0057) — there is deliberately no separate asset-class flag, for
+        # the reason ADR-0056 gave the synthetic generator: a second flag would
+        # keep "crypto bars on a 252-day year" representable one keyword away.
         try:
-            return AlpacaAdapter(interval=frequency.delta, feed=data_feed)
+            return AlpacaAdapter(
+                interval=frequency.delta, feed=data_feed, calendar=frequency.calendar
+            )
         except (ValueError, ImportError) as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(2) from exc
@@ -687,11 +693,18 @@ def _build_risk(
     )
 
 
-def _make_paper_broker(name: str, live: bool, cash: float) -> Broker:
+def _make_paper_broker(
+    name: str, live: bool, cash: float, calendar: MarketCalendar = US_EQUITY
+) -> Broker:
     """Select the paper execution venue: the simulator, or the live Alpaca broker.
 
     Alpaca is real paper trading, so it requires --live and valid credentials; a
     missing key or the absent SDK surfaces as a clean CLI error, not a traceback.
+
+    ``calendar`` reaches the Alpaca broker for the same reason it reaches the
+    adapter (ADR-0058): the venue's crypto orders need a different time-in-force
+    and its positions come back under a different symbol spelling. The simulator
+    ignores it — it has no venue.
     """
     if name == "simulated":
         return SimulatedBroker(Portfolio(cash=cash))
@@ -700,7 +713,7 @@ def _make_paper_broker(name: str, live: bool, cash: float) -> Broker:
             typer.echo("error: --broker alpaca requires --live (real paper trading).", err=True)
             raise typer.Exit(2)
         try:
-            return AlpacaBroker(clock=WallClock())
+            return AlpacaBroker(clock=WallClock(), calendar=calendar)
         except (ValueError, ImportError) as exc:
             typer.echo(f"error: {exc}", err=True)
             raise typer.Exit(2) from exc
@@ -1289,10 +1302,24 @@ def paper(
     # A live Alpaca feed polls right up to `now`, which a free data plan refuses on
     # the SIP tape (HTTP 403); IEX is what it does serve in real time, so that is
     # the live default while historical/replay runs keep the SIP default (ADR-0034).
-    if data_feed is None and live and source == "alpaca":
+    #
+    # **Equity only** (ADR-0058). ADR-0034 predates any second venue, and a tape
+    # choice is a property of the equity market data API: `CryptoBarsRequest` has no
+    # `feed` field, crypto market data needs no subscription at all, and the venue
+    # was measured serving a 5m bar 3m54s old — so there is nothing here for the
+    # free-plan restriction to work around. Left unguarded this made
+    # `paper --market crypto --live` impossible: the client refuses feed+crypto, so
+    # the run died at construction. That refusal is the guard working — loud, before
+    # any network call — but the default is what had no business being set.
+    if (
+        data_feed is None
+        and live
+        and source == "alpaca"
+        and not chosen_market.calendar.is_continuous
+    ):
         data_feed = "iex"
     adapter = _make_adapter(source, cache_dir, seed, freq, data_feed)
-    broker = _make_paper_broker(broker_name, live, cash)
+    broker = _make_paper_broker(broker_name, live, cash, chosen_market.calendar)
 
     # The clock and feed are the *only* difference between backtest and paper
     # (ADR-0002/0014). Live: wall clock over a recent-window feed, runs until

@@ -75,6 +75,19 @@ class AssetInfo:
     recorded for completeness and is unused by this long-or-flat bench (ADR-0011).
     Values are reported exactly as the broker gives them — no field is "fixed up"
     into a more usable-looking combination.
+
+    ``min_order_size`` is the smallest quantity the venue publishes for the asset,
+    ``None`` when it publishes none (every US equity). It is **recorded, not
+    enforced** (ADR-0058), and the reason is a measurement rather than a
+    preference: on 2026-08-14 the paper venue refused a ``BTC/USD`` order of
+    ``0.000155`` (~$9.73) with ``403``/``40310000`` *"cost basis must be >= minimal
+    amount of order 10"* and accepted ``0.00016`` (~$10.05), while the published
+    ``min_order_size`` for the same asset was ``1.5739e-05`` (~$0.99). The binding
+    floor is therefore a **$10 notional** the metadata does not carry, so a
+    client-side gate built on this number would pass orders the venue then
+    refuses — a false negative dressed as a safety check. The venue's own refusal
+    already reaches ``rejections`` verbatim through
+    :func:`_classify_order_error` (ADR-0041), which is the legible answer.
     """
 
     symbol: str
@@ -83,6 +96,7 @@ class AssetInfo:
     exchange: str = ""
     name: str = ""
     shortable: bool = False
+    min_order_size: float | None = None
 
     def __post_init__(self) -> None:
         if not self.symbol:
@@ -141,6 +155,113 @@ TERMINAL_STATUSES = frozenset({STATUS_FILLED, STATUS_REJECTED}) | TERMINAL_UNFIL
 # Exchange string :class:`FakeAlpacaClient` stamps on the assets it invents. It is
 # a placeholder, not a claim about where a symbol really lists.
 _FAKE_EXCHANGE = "FAKE"
+
+
+# --- Asset classes: one client serves one venue (ADR-0058) --------------------
+# Alpaca's crypto and equity tapes are *different services*, not a parameter on
+# one: crypto bars come from ``CryptoHistoricalDataClient.get_crypto_bars`` and
+# the stock client answers a slash symbol with ``APIError: invalid symbol:
+# BTC/USD`` (measured 2026-08-14). So the asset class is a **construction**
+# property of the client, exactly as ``feed`` is (ADR-0034) and the interval is of
+# an adapter (ADR-0022): one client serves one venue, and the run's ``--market``
+# picks it. Plain strings rather than an enum, matching ``feed``.
+ASSET_CLASS_US_EQUITY = "us_equity"
+ASSET_CLASS_CRYPTO = "crypto"
+ASSET_CLASSES: frozenset[str] = frozenset({ASSET_CLASS_US_EQUITY, ASSET_CLASS_CRYPTO})
+
+# The order duration each venue accepts. Not a style choice — measured against the
+# paper venue on 2026-08-14: a crypto market order with ``TimeInForce.DAY`` is
+# refused ``422``/``42210000`` *"invalid crypto time_in_force"*, and the same order
+# with ``GTC`` is accepted and fills. Because that refusal is a 4xx carrying an
+# Alpaca error code, ADR-0041's classifier would have turned it into a perfectly
+# legible :class:`OrderRejectedError` on **every single order**, so a crypto
+# session would have traded nothing while narrating a rejection per bar.
+#
+# ``IOC`` is the considered alternative and is deliberately not used: it would
+# cancel an unfilled remainder immediately, turning every partial fill (ADR-0033)
+# into a permanent one and quietly changing what a fill means between markets.
+# ``GTC`` is the closest analogue of the equity ``DAY`` order — the cost is that a
+# crypto order that does *not* fill never expires either (ADR-0058).
+_TIME_IN_FORCE: dict[str, str] = {
+    ASSET_CLASS_US_EQUITY: "day",
+    ASSET_CLASS_CRYPTO: "gtc",
+}
+
+
+def require_asset_class(name: str) -> str:
+    """Normalize and validate an asset class, or raise naming the known ones.
+
+    Raises rather than falling back to equity, for the reason
+    :func:`~trading.calendar.get_calendar` does (ADR-0054): an unrecognised venue
+    that silently became the equity one would send crypto orders to the stock tape
+    and get "invalid symbol" on every bar.
+    """
+    key = name.strip().lower()
+    if key not in ASSET_CLASSES:
+        known = ", ".join(sorted(ASSET_CLASSES))
+        raise ValueError(f"unknown asset class {name!r}; known asset classes: {known}")
+    return key
+
+
+def time_in_force_for(asset_class: str) -> str:
+    """The order duration ``asset_class`` accepts (``"day"`` / ``"gtc"``)."""
+    return _TIME_IN_FORCE[require_asset_class(asset_class)]
+
+
+def is_crypto_asset_class(raw: object) -> bool:
+    """Whether an SDK-reported asset class means crypto, however it renders.
+
+    alpaca-py's ``AssetClass`` enum stringifies as ``"AssetClass.CRYPTO"`` on some
+    versions and ``"crypto"`` on others — the same ambiguity :meth:`_to_order` and
+    :meth:`_to_asset` already handle for sides, statuses and exchanges.
+    """
+    return "crypto" in str(raw).lower()
+
+
+def canonical_crypto_symbol(symbol: str, asset_class: object, symbol_map: dict[str, str]) -> str:
+    """Restore the venue's canonical slash form for a position symbol (ADR-0058).
+
+    **Alpaca disagrees with itself about how a crypto symbol is spelled**, and this
+    is the load-bearing consequence. Measured on 2026-08-14 against the paper
+    account, for one round trip in one asset: ``submit_order`` was given
+    ``"BTC/USD"``, the order it echoed back said ``symbol='BTC/USD'``, and the
+    position that fill created reported ``symbol='BTCUSD'``.
+
+    :meth:`AlpacaBroker._reconcile <trading.brokers.alpaca.AlpacaBroker._reconcile>`
+    keys its :class:`~trading.types.Portfolio` on whatever this returns, and the
+    engine, the sizer and the guardrails all key on the symbol the *bars* carry —
+    ``BTC/USD``. Left concatenated, a held position is invisible to every one of
+    them: gross exposure reads zero, the target-weight sizer sees an unmet target
+    forever, and the run buys the same coin every bar until the cash runs out. It
+    is silent, and it is the exact shape ADR-0036 fixed for parked orders arriving
+    through a different door.
+
+    The map is the **venue's own asset listing** (``get_all_assets`` with
+    ``asset_class=crypto``), not a suffix rule, so there is nothing to keep in sync
+    and a pair Alpaca adds tomorrow resolves without a code change. A suffix rule
+    over the four live quote currencies was checked against it and agrees on all
+    73 pairs with no collisions — that agreement is pinned as a *nightly contract
+    test* rather than shipped as a second mechanism (ADR-0035's reuse rule).
+
+    A symbol that is already canonical passes through. A symbol absent from the map
+    that the venue *calls crypto* raises: reconciling a crypto position under a key
+    nothing else uses is worse than stopping (ADR-0028's bias toward propagating).
+    Anything else — a stock position sitting on the same account — is returned
+    unchanged, because it is not ours to rewrite.
+    """
+    if "/" in symbol:
+        return symbol
+    mapped = symbol_map.get(symbol)
+    if mapped is not None:
+        return mapped
+    if is_crypto_asset_class(asset_class):
+        raise ValueError(
+            f"Alpaca reported a crypto position in {symbol!r}, which is not in its own "
+            f"crypto asset listing, so its canonical pair symbol is unknown. Refusing to "
+            f"reconcile it: a position keyed differently from the bars is invisible to "
+            f"sizing and the guardrails, and the run would keep buying it (ADR-0058)."
+        )
+    return symbol
 
 
 class OrderRejectedError(RuntimeError):
@@ -331,6 +452,7 @@ class FakeAlpacaClient:
         shortable: bool = True,
         exchange: str = _FAKE_EXCHANGE,
         name: str = "",
+        min_order_size: float | None = None,
     ) -> AssetInfo:
         """Script the :meth:`get_asset` answer for ``symbol`` and return it.
 
@@ -344,6 +466,7 @@ class FakeAlpacaClient:
             exchange=exchange,
             name=name,
             shortable=shortable,
+            min_order_size=min_order_size,
         )
         self._assets[symbol] = asset
         self._asset_failures.pop(symbol, None)
@@ -746,6 +869,22 @@ class RealAlpacaClient:
     needs ``"iex"`` for anything inside the last ~15 minutes, which is exactly
     what the live paper feed asks for. The feed is a *construction* property, like
     the interval (ADR-0022): one client serves one tape.
+
+    ``asset_class`` picks the venue (ADR-0058), and is a construction property for
+    the same reason: Alpaca's crypto bars live behind a **different SDK client**
+    (``CryptoHistoricalDataClient.get_crypto_bars``), and the stock client answers a
+    slash symbol with ``invalid symbol: BTC/USD``. Selecting crypto also changes the
+    order duration the venue will accept, restores the canonical pair symbol on
+    positions, and drops the corporate-actions cross-check — see each method. Three
+    things it does **not** change: the trading endpoint (one ``TradingClient`` serves
+    both), the credentials, and this class's public surface.
+
+    One asymmetry worth knowing: **crypto market data needs no credentials at all**
+    (measured — a bare ``CryptoHistoricalDataClient()`` returned bars byte-identical
+    to a keyed one), and there is no ``feed`` to choose, so ADR-0034's free-plan SIP
+    restriction has no crypto analogue. Credentials are still required here because
+    the trading client needs them; passing ``feed`` alongside crypto is a
+    ``ValueError`` rather than a silently ignored argument.
     """
 
     def __init__(
@@ -755,6 +894,7 @@ class RealAlpacaClient:
         *,
         paper: bool = True,
         feed: str | None = None,
+        asset_class: str = ASSET_CLASS_US_EQUITY,
     ) -> None:
         key = api_key or os.environ.get("ALPACA_API_KEY")
         secret = secret_key or os.environ.get("ALPACA_SECRET_KEY")
@@ -763,14 +903,29 @@ class RealAlpacaClient:
                 "Alpaca credentials required: set ALPACA_API_KEY and "
                 "ALPACA_SECRET_KEY (or pass them explicitly)"
             )
+        self._asset_class = require_asset_class(asset_class)
+        if self._asset_class == ASSET_CLASS_CRYPTO and feed is not None:
+            raise ValueError(
+                f"feed={feed!r} does not apply to the crypto venue: CryptoBarsRequest has "
+                "no feed field at all (its fields are currency, end, limit, sort, start, "
+                "symbol_or_symbols, timeframe), so there is no IEX/SIP choice to make and "
+                "ADR-0034's data-plan restriction has no crypto analogue (ADR-0058)."
+            )
         try:
-            from alpaca.data.historical import StockHistoricalDataClient
+            from alpaca.data.historical import (
+                CryptoHistoricalDataClient,
+                StockHistoricalDataClient,
+            )
             from alpaca.trading.client import TradingClient
         except ImportError as exc:  # pragma: no cover - alpaca-py not installed here
             raise ImportError(
                 "alpaca-py is required for live trading; pip install alpaca-py"
             ) from exc
-        self._data = StockHistoricalDataClient(key, secret)
+        self._data: Any = (
+            CryptoHistoricalDataClient()
+            if self._asset_class == ASSET_CLASS_CRYPTO
+            else StockHistoricalDataClient(key, secret)
+        )
         self._trading = TradingClient(key, secret, paper=paper)
         self._feed = feed
         # Built on first use only: the corporate-actions endpoint is a *different*
@@ -779,11 +934,19 @@ class RealAlpacaClient:
         self._key = key
         self._secret = secret
         self._corporate_actions: Any | None = None
+        # Concatenated -> slash pair symbols, from the venue's own asset listing.
+        # One request per client, and only when a crypto position is first read.
+        self._crypto_symbols: dict[str, str] | None = None
 
     @property
     def feed(self) -> str | None:
         """The market-data feed bar requests use (``None`` = the SDK default tape)."""
         return self._feed
+
+    @property
+    def asset_class(self) -> str:
+        """The venue this client serves: ``"us_equity"`` or ``"crypto"`` (ADR-0058)."""
+        return self._asset_class
 
     def _feed_kwargs(self) -> dict[str, Any]:
         """The ``feed=`` keyword for a bars request, empty when unset (ADR-0034).
@@ -801,25 +964,9 @@ class RealAlpacaClient:
     def get_daily_bars(
         self, symbol: str, start: datetime, end: datetime, *, adjusted: bool = True
     ) -> list[Bar]:
-        from alpaca.data.enums import Adjustment
-        from alpaca.data.requests import StockBarsRequest
         from alpaca.data.timeframe import TimeFrame
 
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=TimeFrame.Day,
-            start=start,
-            end=end,
-            adjustment=Adjustment.ALL if adjusted else Adjustment.RAW,
-            **self._feed_kwargs(),
-        )
-        try:
-            response = self._data.get_stock_bars(request)
-        except Exception as exc:
-            raise _classify_data_error(exc, symbol, self._feed) from exc
-        barset = _require_model(response, "daily bars")
-        rows: list[Any] = barset.data.get(symbol, [])
-        return self._rows_to_bars(symbol, rows)
+        return self._fetch_bars(symbol, start, end, TimeFrame.Day, adjusted, "daily bars")
 
     def get_bars(
         self,
@@ -830,22 +977,67 @@ class RealAlpacaClient:
         adjusted: bool = True,
         interval: timedelta = timedelta(days=1),
     ) -> list[Bar]:  # pragma: no cover - needs the alpaca-py SDK and the network
-        from alpaca.data.enums import Adjustment
-        from alpaca.data.requests import StockBarsRequest
-
-        request = StockBarsRequest(
-            symbol_or_symbols=symbol,
-            timeframe=self._to_timeframe(interval),
-            start=start,
-            end=end,
-            adjustment=Adjustment.ALL if adjusted else Adjustment.RAW,
-            **self._feed_kwargs(),
+        return self._fetch_bars(
+            symbol, start, end, self._to_timeframe(interval), adjusted, "intraday bars"
         )
-        try:
-            response = self._data.get_stock_bars(request)
-        except Exception as exc:
-            raise _classify_data_error(exc, symbol, self._feed) from exc
-        barset = _require_model(response, "intraday bars")
+
+    def _fetch_bars(
+        self,
+        symbol: str,
+        start: datetime,
+        end: datetime,
+        timeframe: Any,
+        adjusted: bool,
+        what: str,
+    ) -> list[Bar]:  # pragma: no cover - needs the alpaca-py SDK and the network
+        """One bar request against whichever tape this client serves (ADR-0058).
+
+        The equity arm is exactly what ``get_daily_bars``/``get_bars`` sent before
+        this branch existed — same request type, same ``Adjustment``, same
+        ``feed`` kwarg — so no equity request byte moves.
+
+        The crypto arm asks a **different client** with a **different request
+        type**, and it deliberately carries neither of the equity arm's two extras:
+
+        * **No ``adjustment``.** ``CryptoBarsRequest`` has no such field, so
+          ``adjusted=True`` and ``adjusted=False`` return the same bars. That is
+          not the flag being ignored — a crypto pair has no splits and no
+          dividends, so raw prices *are* the total-return series and ADR-0008 and
+          ADR-0021 ask for the same thing here. The honest limit, recorded in
+          ADR-0058: a token redenomination or an exchange rewriting its history
+          would arrive as an unadjusted cliff, Alpaca publishes no
+          corporate-actions record for crypto to catch it with (measured: the
+          endpoint answers a crypto symbol with empty data, not an error), and
+          nothing in this bench would notice.
+        * **No ``feed``.** Rejected at construction; see ``__init__``.
+        """
+        if self._asset_class == ASSET_CLASS_CRYPTO:
+            from alpaca.data.requests import CryptoBarsRequest
+
+            crypto_request = CryptoBarsRequest(
+                symbol_or_symbols=symbol, timeframe=timeframe, start=start, end=end
+            )
+            try:
+                response = self._data.get_crypto_bars(crypto_request)
+            except Exception as exc:
+                raise _classify_data_error(exc, symbol, self._feed) from exc
+        else:
+            from alpaca.data.enums import Adjustment
+            from alpaca.data.requests import StockBarsRequest
+
+            request = StockBarsRequest(
+                symbol_or_symbols=symbol,
+                timeframe=timeframe,
+                start=start,
+                end=end,
+                adjustment=Adjustment.ALL if adjusted else Adjustment.RAW,
+                **self._feed_kwargs(),
+            )
+            try:
+                response = self._data.get_stock_bars(request)
+            except Exception as exc:
+                raise _classify_data_error(exc, symbol, self._feed) from exc
+        barset = _require_model(response, what)
         rows: list[Any] = barset.data.get(symbol, [])
         return self._rows_to_bars(symbol, rows)
 
@@ -867,8 +1059,25 @@ class RealAlpacaClient:
         return TimeFrame(total_minutes, TimeFrameUnit.Minute)
 
     @staticmethod
-    def _rows_to_bars(symbol: str, rows: list[Any]) -> list[Bar]:  # pragma: no cover - SDK only
-        """Convert SDK bar rows into our :class:`~trading.types.Bar`, ascending by time."""
+    def _rows_to_bars(symbol: str, rows: list[Any]) -> list[Bar]:
+        """Convert SDK bar rows into our :class:`~trading.types.Bar`, ascending by time.
+
+        **Known lossy conversion on crypto, recorded not fixed (ADR-0058):**
+        :class:`~trading.types.Bar` types ``volume`` as an ``int`` because a share
+        count is one, and ``int()`` truncates. Crypto volume is a *coin* count and
+        is fractional — the venue served ``BTC/USD`` daily volumes of ``1.205``
+        and ``0.147`` on 2026-08-13/14, which land here as ``1`` and **``0``**. A
+        zero-volume bar is a lie about a day that did trade.
+
+        The blast radius is exactly one caller: ``volume`` is read only by
+        :mod:`trading.liquidity`'s ADV screen (ADR-0029), which is opt-in via
+        ``--min-adv``. That screen is unusable on this tape for a larger and
+        separate reason anyway — Alpaca's crypto venue volume is its own, not the
+        global market's, so BTC/USD averages tens of thousands of dollars a day
+        against an equity-calibrated $20M floor. Widening ``Bar.volume`` to a float
+        touches ``types.py`` and every adapter, so it is a follow-up card rather
+        than this lane's to land.
+        """
         bars = [
             Bar(
                 symbol=symbol,
@@ -900,6 +1109,16 @@ class RealAlpacaClient:
         propagate: a plan or transport error means "we could not ask", which the
         caller must not read as "there were no splits" (ADR-0028).
         """
+        if self._asset_class == ASSET_CLASS_CRYPTO:
+            # Not "we could not ask" (ADR-0028) and not a skipped request we are
+            # guessing about: Alpaca's corporate-actions endpoint *was* asked for
+            # BTC/USD on 2026-08-14 and answered cleanly with **no data keys at
+            # all**. A crypto pair has no splits or dividends to back out, so
+            # there is nothing here to report and no request worth paying for.
+            # The limit ADR-0058 records rather than solves: a token
+            # redenomination is a real rescaling that this endpoint does not
+            # carry, so it would reach a backtest as an uncaught cliff.
+            return []
         from alpaca.data.historical.corporate_actions import CorporateActionsClient
         from alpaca.data.requests import CorporateActionsRequest
 
@@ -932,6 +1151,18 @@ class RealAlpacaClient:
         A venue refusal is *classified*, not leaked: without this the SDK's
         ``APIError`` travelled out of the seam, out of ``AlpacaBroker.submit`` and
         out of a live session, taking the run's artifacts with it (ADR-0041).
+
+        The order's **duration comes from the asset class** (``day`` for equities,
+        ``gtc`` for crypto — see :data:`_TIME_IN_FORCE`). Hard-coding ``DAY`` made
+        every crypto order a venue refusal; the quantity, side and order type are
+        unchanged across venues.
+
+        The venue also **truncates the quantity** rather than refusing an
+        over-precise one: ``0.00021739130434782607`` (what the target-weight sizer
+        actually emits) came back as ``0.000217391``, i.e. rounded to the nine
+        decimals ``min_trade_increment`` publishes. So no rounding happens on this
+        side, and none should be added — but a venue that started refusing instead
+        would break every order, which is why the nightly contract test pins it.
         """
         from alpaca.trading.enums import OrderSide, TimeInForce
         from alpaca.trading.requests import MarketOrderRequest
@@ -940,7 +1171,7 @@ class RealAlpacaClient:
             symbol=symbol,
             qty=qty,
             side=OrderSide.BUY if side is Side.BUY else OrderSide.SELL,
-            time_in_force=TimeInForce.DAY,
+            time_in_force=TimeInForce(time_in_force_for(self._asset_class)),
         )
         try:
             placed = self._trading.submit_order(request)
@@ -962,13 +1193,44 @@ class RealAlpacaClient:
         matching :meth:`get_asset`; anything else -- auth, rate limit, transport,
         or a venue that refuses the cancel -- propagates unchanged, so "we could
         not ask" is never mistaken for "it is cancelled".
+
+        **Idempotence is now enforced here rather than assumed of the venue**
+        (ADR-0058 amending ADR-0036). ADR-0036 recorded a repeat cancel as
+        succeeding silently, and it does -- for an order that is already
+        ``canceled``. A **filled** order is different: measured 2026-08-14, the
+        venue answers ``422``/``42210000`` *"order is already in \\"filled\\"
+        state"*. That case had simply never been executed, because the equity test
+        that established the contract ran with the market shut, where nothing
+        fills. It is not crypto-specific as far as anyone can tell; crypto is just
+        the first venue on which this bench could fill an order on demand.
+
+        The distinction is drawn on the order's **state**, not on the error text:
+        a failed cancel re-reads the order, and a terminal one means the caller
+        already has what they asked for -- nothing is working. ADR-0041's rule
+        against matching message substrings is why this is a second request rather
+        than a cheaper string check, and the request is only paid on the failure
+        path. If the re-read says the order is still working, the original failure
+        propagates unchanged.
         """
         try:
             self._trading.cancel_order_by_id(order_id)
         except Exception as exc:  # narrowed below: only a 404 becomes LookupError
             if getattr(exc, "status_code", None) == 404:
                 raise LookupError(f"unknown Alpaca order {order_id!r}") from exc
+            if self._is_already_terminal(order_id):
+                return
             raise
+
+    def _is_already_terminal(self, order_id: str) -> bool:  # pragma: no cover - SDK only
+        """Whether a cancel failed only because the order had already settled.
+
+        A best-effort re-read: if *this* lookup fails too, the honest answer is
+        "we do not know", which means the original cancel failure must stand.
+        """
+        try:
+            return self.get_order(order_id).status in TERMINAL_STATUSES
+        except Exception:
+            return False
 
     def get_account(self) -> AccountSnapshot:
         account = _require_model(self._trading.get_account(), "get_account")
@@ -978,15 +1240,62 @@ class RealAlpacaClient:
         )
 
     def list_positions(self) -> list[PositionSnapshot]:
+        """Open positions, with crypto symbols restored to the venue's slash form.
+
+        On the equity venue this is exactly what it always was. On crypto it is
+        not cosmetic: Alpaca echoes ``BTC/USD`` on the order and ``BTCUSD`` on the
+        position it creates, and the concatenated key would make the holding
+        invisible to sizing and the guardrails. See
+        :func:`canonical_crypto_symbol` for the measurement and the consequence.
+        """
         positions = _require_model(self._trading.get_all_positions(), "get_all_positions")
         return [
             PositionSnapshot(
-                symbol=str(position.symbol),
+                symbol=self._position_symbol(position),
                 qty=_require_float(position.qty, "Position.qty"),
                 avg_price=_require_float(position.avg_entry_price, "Position.avg_entry_price"),
             )
             for position in positions
         ]
+
+    def _position_symbol(self, position: Any) -> str:  # pragma: no cover - SDK only
+        """The canonical symbol for one reported position (ADR-0058)."""
+        symbol = str(position.symbol)
+        if self._asset_class != ASSET_CLASS_CRYPTO:
+            return symbol
+        return canonical_crypto_symbol(
+            symbol, getattr(position, "asset_class", ""), self._crypto_symbol_map()
+        )
+
+    def _crypto_symbol_map(self) -> dict[str, str]:  # pragma: no cover - SDK only
+        """Concatenated -> slash pair symbols, from the venue's own asset listing.
+
+        Built lazily and cached for the client's lifetime: one extra request per
+        session, paid the first time a crypto position is read, never per bar. A
+        failure propagates rather than degrading to the concatenated key — a run
+        that cannot name what it holds must stop, not narrate (ADR-0028).
+        """
+        if self._crypto_symbols is None:
+            from alpaca.trading.enums import AssetClass
+            from alpaca.trading.requests import GetAssetsRequest
+
+            assets = self._trading.get_all_assets(GetAssetsRequest(asset_class=AssetClass.CRYPTO))
+            symbol_map: dict[str, str] = {}
+            for asset in assets:
+                # alpaca-py types the listing as ``list[Asset | str]``; the str arm
+                # is the raw-data mode we never enable, so it is unreachable by our
+                # construction and asserted rather than assumed (see _require_model).
+                raw_symbol = getattr(asset, "symbol", None)
+                if raw_symbol is None:
+                    raise TypeError(
+                        "Alpaca returned a crypto asset listing entry with no symbol "
+                        f"({type(asset).__name__}); crypto position symbols cannot be "
+                        "mapped without it"
+                    )
+                symbol = str(raw_symbol)
+                symbol_map[symbol.replace("/", "")] = symbol
+            self._crypto_symbols = symbol_map
+        return self._crypto_symbols
 
     def get_asset(self, symbol: str) -> AssetInfo:  # pragma: no cover - needs the SDK
         """Look up broker-authoritative asset metadata for ``symbol`` (ADR-0028).
@@ -1016,8 +1325,13 @@ class RealAlpacaClient:
         ``"NASDAQ"``, so every field is read defensively and the exchange enum
         prefix is stripped. Missing ``tradable`` / ``fractionable`` default to
         ``False``: absent permission is not permission.
+
+        ``min_order_size`` is crypto-only in practice (every US equity omits it)
+        and is carried through as ``None`` when absent — not as ``0.0``, which
+        would read as "no minimum" rather than "the venue did not say".
         """
         exchange = str(getattr(raw, "exchange", "") or "")
+        min_size = getattr(raw, "min_order_size", None)
         return AssetInfo(
             symbol=str(getattr(raw, "symbol", "") or symbol),
             tradable=bool(getattr(raw, "tradable", False)),
@@ -1025,6 +1339,7 @@ class RealAlpacaClient:
             exchange=exchange.split(".")[-1] if exchange else "",
             name=str(getattr(raw, "name", "") or ""),
             shortable=bool(getattr(raw, "shortable", False)),
+            min_order_size=None if min_size is None else float(min_size),
         )
 
     @staticmethod

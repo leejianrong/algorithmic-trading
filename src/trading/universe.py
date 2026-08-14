@@ -5,10 +5,16 @@ by name from the CLI (``--symbols @blue20``, ``--sector-map @blue20``). It seeds
 run with a diversified, liquid candidate set without hard-coding a comma list, and
 gives the sector-cap guardrail (ADR-0019) a matching, hand-checkable map.
 
-Two baskets ship today: ``blue20`` (20 of today's mega-cap US single stocks) and
+Three baskets ship today: ``blue20`` (20 of today's mega-cap US single stocks),
 ``core10`` (10 long-lived, broad ETFs across asset classes, built for
-long-horizon runs). The map values are *bucket labels*, not necessarily GICS
-sectors — see caveat 3.
+long-horizon runs), and ``crypto10`` (10 USD-quoted pairs from Alpaca's crypto
+venue, for ``--market crypto``). The map values are *bucket labels*, not
+necessarily GICS sectors — see caveat 3.
+
+``crypto10`` is the only basket whose symbols are **pairs** (``BTC/USD``), which
+is what the ADR-0057 shape guard reads: passing it under a session market is
+refused before any fetch. Its survivorship problem is the worst of the three —
+see caveat 4.
 
 Honesty caveat 1 — tradability is the broker's fact, checked once on 2026-08-04
 ------------------------------------------------------------------------------
@@ -79,6 +85,28 @@ It is **not** survivorship-bias-free:
 
 So: bias reduced, not removed. Everything in ADR-0027 still applies — read the
 numbers as an upper bound and weight forward paper results more heavily.
+
+Honesty caveat 4 — ``crypto10``'s survivorship bias is the worst of the three
+----------------------------------------------------------------------------
+``crypto10`` (ADR-0058) is the same hindsight problem as ``blue20``, in a market
+where the failure rate is far higher and the record far thinner. Three
+compounding layers, and they are worth separating:
+
+1. **The tokens are 2026's survivors.** Tens of thousands of tokens have gone to
+   zero, been abandoned, or been exit-scammed since 2021. None of them are here.
+2. **The venue is a survivor filter of its own.** Alpaca lists 73 crypto assets
+   and delists ones that fail, so "what Alpaca will trade today" is already a
+   curated set of winners before anyone picks ten from it — a filter ``blue20``
+   does not have, since a US exchange lists the losers too until they die.
+3. **The history has no graveyard at all.** yfinance at least *has* delisted US
+   tickers in principle; Alpaca's crypto tape starts at 2021-01-01 and serves only
+   currently-listed pairs, so there is no way to put the dead names back even
+   manually.
+
+So a ``crypto10`` backtest is an upper bound on an upper bound. Everything in
+ADR-0027 applies with more force, and forward paper results — which are
+survivorship-free by construction — should outweigh it by more here than
+anywhere else in this bench.
 
 Inception dates: expect a shorter universe in the early years
 ------------------------------------------------------------
@@ -192,6 +220,44 @@ _CORE10_SECTORS: dict[str, str] = {
     "XLF": "financials",  # Financial Select Sector SPDR — 1998
 }
 
+# ``crypto10`` — 10 USD-quoted pairs from Alpaca's 73-asset crypto venue, for
+# `--market crypto --source alpaca` (ADR-0058). Symbols are in the venue's own
+# canonical slash form, which is the only form its **data** API accepts
+# (`CryptoBarsRequest` refuses `BTCUSD` with `does not match ^[A-Z]+x?/[A-Z]+$`),
+# and which the ADR-0057 shape guard is built to recognise.
+#
+# Every one of these was checked against a real Alpaca paper account on
+# 2026-08-14 and came back `tradable` **and** `fractionable` — the same snapshot
+# caveat as caveat 1 applies, and `trading verify-universe --symbols @crypto10`
+# re-runs it. Across all 73 crypto assets exactly one is unusable, and the flag
+# that fails is not the one you would guess: `SHIB/USDT` is tradable but **not
+# fractionable** (its `min_order_size` is 86,880 SHIB). So ADR-0028's two flags do
+# mean the same thing on this venue, and they do have work to do.
+#
+# The inception dates below are the first daily bar Alpaca actually serves, read
+# off the venue rather than off the token's launch: its crypto history starts
+# 2021-01-01 whatever the coin's real age, and several pairs start much later. A
+# run beginning before a pair's first bar trades a smaller universe (exactly the
+# `core10` behaviour) — and note SOL is listed from 2021-01-01 but returns 1,634
+# bars in a 2,052-day span, i.e. this tape has genuine holes, unlike
+# `SyntheticAdapter`, which has none.
+#
+# Stablecoins (`USDC/USD`, `USDT/USD`, `USDG/USD`) and the gold-backed `PAXG/USD`
+# are deliberately excluded: a pegged asset has no trend or relative strength to
+# rank, so it would sit in a cross-sectional basket contributing only turnover.
+_CRYPTO10_SECTORS: dict[str, str] = {
+    "BTC/USD": "store_of_value",  # 2021-01-01
+    "ETH/USD": "smart_contract",  # 2021-01-01
+    "SOL/USD": "smart_contract",  # 2021-01-01 (gaps: 1,634 bars of 2,052 days)
+    "LINK/USD": "infrastructure",  # 2021-01-01
+    "LTC/USD": "payments",  # 2021-01-01
+    "BCH/USD": "payments",  # 2021-01-01
+    "DOGE/USD": "payments",  # 2021-01-01
+    "UNI/USD": "defi",  # 2021-01-01
+    "AAVE/USD": "defi",  # 2021-07-15
+    "AVAX/USD": "smart_contract",  # 2021-11-18
+}
+
 BASKETS: dict[str, Basket] = {
     "blue20": Basket(
         name="blue20",
@@ -202,6 +268,11 @@ BASKETS: dict[str, Basket] = {
         name="core10",
         symbols=tuple(_CORE10_SECTORS),
         sectors=dict(_CORE10_SECTORS),
+    ),
+    "crypto10": Basket(
+        name="crypto10",
+        symbols=tuple(_CRYPTO10_SECTORS),
+        sectors=dict(_CRYPTO10_SECTORS),
     ),
 }
 
