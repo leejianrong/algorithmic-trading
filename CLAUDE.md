@@ -891,17 +891,21 @@ As of this writing:
   `gen-data` cannot write 24/7 bars though the generator now can; `fetch_span` and
   `MIN_LIVE_EMPTY_POLLS` are still equity-shaped; and `risk.py`'s `_TRADING_DAYS = 252` is
   now *reachable in combination* with a 365-day market via `--market crypto --target-vol`.
-- **Where the crypto groundwork stands, and what is still equity-shaped:** an **offline
-  crypto backtest runs end to end today** — `trading backtest --market crypto --source
-  synthetic` produces a continuous series, annualizes it on 365 × 1440, runs it under the
-  bounded-halt posture, and records the market in `result.json`. What is **not** built is any
-  **real** continuous data: no crypto adapter or broker (**KAN-708**), so `--source csv` is
-  the only route to real crypto bars, and every claim about a live crypto venue in ADR-0053
-  through ADR-0057 is **arithmetic and generated data, never observed** — no crypto
-  credentials exist and no crypto network call has been made. Specifically unverified:
-  whether a provider stamps daily bars at UTC midnight, whether a crypto endpoint answers an
-  absurdly early start with an empty response (ADR-0047's equity finding), and what Alpaca's
-  crypto symbol format actually is — the ADR-0057 shape guard's rule rests on that guess.
+- **Where the crypto groundwork stands, and what is still equity-shaped:** a **real crypto
+  backtest runs end to end today** — `trading backtest --market crypto --source alpaca
+  --symbols @crypto10` fetches live continuous bars, annualizes on 365 × 1440, runs under the
+  bounded-halt posture, and records the market in `result.json`; `--source synthetic` does the
+  same offline. ADR-0058 (KAN-708) closed the "no real continuous data" gap and **converted
+  most of ADR-0053..0057 from arithmetic into observation** — UTC-midnight daily stamping, no
+  weekend gap, the forming bar ADR-0053 withholds, ADR-0057's shape rule (complete: all 73
+  venue assets slash-separated, all four quote codes already listed), and ADR-0055's posture
+  on real data. Verified independently by the PM on `43a7d0c`: a 2024 `@crypto10` run gives
+  **367 continuous bars** with **2 halt episodes, both re-armed, 0 in force**, and
+  `verify-universe --symbols @crypto10` returns **10/10 usable** with no `--market` needed.
+  What is still **not** measured is the *cost* side (**KAN-707**) and the divergence number
+  (**KAN-710**) — and note the venue's ~25 bps fee is taken **in the received asset**, so
+  `Fill.commission` is `0.0`, `filled_qty` is gross, and ADR-0038's report **structurally
+  cannot see it** (it compares prices; the fee is taken in quantity).
   Still equity-shaped in shared code: `data/recent_window.py`'s `fetch_span`
   (`RTH_SESSION`/`CALENDAR_DAYS_PER_SESSION` — over-asks a 24/7 source 5.79× at 1d and
   21.39× sub-daily, the safe direction, assessed not refactored) and `MIN_LIVE_EMPTY_POLLS`;
@@ -910,8 +914,85 @@ As of this writing:
   --target-vol`, where it would allow a vol-targeted book **20.4% more gross** than it asked
   for; and `halt_cooldown_bars`, still a **count not a duration** — ADR-0049's unit mistake
   again, 30 bars being six weeks of an equity calendar, 30 days of a 24/7 one and 2.5 hours
-  at `5m`, with no conversion and no warning. Also unwired: `gen-data` cannot write 24/7 bars
-  though the generator now can, and the dashboard carries `market` without rendering it.
+  at `5m`, with no conversion and no warning — now **witnessed rather than reasoned**: a real
+  2024 `@crypto10` run's two halt episodes ran 04-30→05-30 and 09-01→10-01, i.e. exactly 30
+  calendar days each. Also unwired: `gen-data` cannot write 24/7 bars though the generator now
+  can, and the dashboard carries `market` without rendering it. New since ADR-0058:
+  `sizing.SHARE_PRECISION = 6` rounds a full exit *up* past a 9-decimal crypto holding — the
+  broker trims the dust, but the equity-shaped root cause is named and unfixed because
+  repairing it moves every published equity figure; `Bar.volume: int` truncates fractional
+  crypto volume (`0.147` → `0`, read only by the opt-in ADV screen); and a **token
+  redenomination has no corporate-actions record on this venue**, so it would reach a backtest
+  as an uncaught cliff.
+- **A sweep annualized every trial at 252, whatever the interval (2026-08-14, ADR-0059,
+  KAN-840):** `sweep.py` called `metrics.compute(result)` with no basis, so every trial took
+  the default however the bars were spaced — `trading sweep --interval 5m` reported a US-equity
+  **daily** year, understating Sharpe/Sortino/Calmar/annualized return/turnover by
+  **8.8318×** = `sqrt(19656/252)` (2.55× at 1h, 3.61× at 30m, 19.75× at 1m), and inverting
+  `annualized_return` so a **+2.52% month printed as 0.351%**. ADR-0054's defect one module
+  along, pre-dating the crypto epic. **The card's stated mechanism was wrong and the truth is
+  worse:** `cli._sweep_significance_block` already passed the *correct* `freq.periods_per_year`
+  — and applied it to `trial_sharpes()`, which were annualized at 252. One calculation, two
+  years: `observed_sharpe` came out **right** while `null_best_sharpe` was **8.83× too low**
+  and the deflated probability read too high — the ADR-0039 correction too weak, in the
+  flattering direction. Not uniformly wrong (which is monotonic and self-consistent) but
+  **incoherent**, and visible on stdout the whole time: a 5m table called the winner `0.593`
+  while the block four lines below called the same run `observed +5.24` (reproduced by the PM
+  on `main` before merging). **`--folds` had it too, silently** — `run_walk_forward` shares
+  `_run_combo` and prints fold Sharpes with nothing to contradict them. Fixed by threading the
+  **basis, never the interval** (ADR-0022's adapter-construction seam intact, no sniffing):
+  `_run_combo` takes a **required** `periods_per_year`, the two public entry points default
+  theirs to the equity daily year, and the CLI passes `freq.periods_per_year`. Both summaries
+  now **record the basis they were scored on**, and `deflated_winner` **raises** on an explicit
+  basis that disagrees — ADR-0056's move, the mixed-basis calculation is unrepresentable rather
+  than merely unlikely. ADR-0057's `_sweep_basis_caveat` is **deleted**: it existed only to
+  announce this defect. **Equity byte-identical by hash**, with a *daily* sweep as the cleanest
+  control since 252 is correct there. 15 new tests; mutations turn 9/3/8/1/5/1 red — and one
+  **survived the first pass**, because nothing exercised `sweep --folds` at a non-daily
+  interval. Still open: nothing checks the basis matches the interval the *adapter* was built
+  at, and **KAN-677** (walk-forward prints no deflation of its own) is untouched.
+- **A 24/7 venue trades, and Alpaca disagrees with itself about how to spell a symbol
+  (2026-08-14, ADR-0058, KAN-708):** EPIC-87's data hole closed — `backtest --market crypto
+  --source alpaca --symbols @crypto10` and `paper --market crypto --broker alpaca --live` both
+  run end to end, and this is the first card that could **observe** rather than reason about a
+  continuous venue. **The seam was right:** crypto rides the `AlpacaClient` calls that already
+  exist, and `AlpacaBroker` gained **no asset-class-aware logic at all** — the poll loop,
+  terminal statuses, ADR-0036's `(symbol, side)` duplicate key and ADR-0020's
+  reconcile-from-the-account all held against a real crypto fill. The venue is a **client
+  construction property selected by the market's `MarketCalendar`**, not a new
+  `--asset-class` flag — ADR-0056's argument reused, so "crypto bars annualized on a 252-day
+  year" stays unrepresentable and `cli.py` needed no new option. Five defects, each a failing
+  test then a fix. **(1)** An order echoes `BTC/USD`; the **position it creates reports
+  `BTCUSD`** — reconciled under that key a holding is invisible to sizing and the guardrails,
+  so gross exposure reads zero and the run buys the same coin every bar, silently.
+  `list_positions` canonicalizes from the venue's own asset listing; a longest-quote-suffix
+  rule reproduces it on all 73 pairs with zero collisions (independently re-verified by the
+  PM) and is pinned as a **nightly contract test rather than shipped as a second mechanism**.
+  **(2)** `TimeInForce.DAY` is refused `422`/`42210000`, so every crypto order would have
+  failed — *tidily*, as a legible ADR-0041 rejection, while the session traded nothing; crypto
+  is GTC, and the cost is that an unfilled crypto order **never expires**. **(3)** A live
+  session **could not sell what it held**: `sizing.SHARE_PRECISION = 6` rounds a full exit *up*
+  past a 9-decimal holding (`requested 13.338989, available 13.33898895`) — ADR-0011's only
+  exit, blocked, about half the time. **(4)** `cancel_order` was **not** idempotent on a
+  *filled* order — ADR-0036's contract was established with the market shut, so no fill had
+  ever been cancelled. **(5)** ADR-0034's live IEX default is now equity-only —
+  `CryptoBarsRequest` has no `feed` field. **ADR-0047 gains a third behaviour and it is the
+  worst one:** crypto answers `datetime.min` with **one** bar, not zero — a non-empty answer
+  trips neither per-symbol absence (ADR-0035) nor the universe-wide ERROR, so a session would
+  prime one bar and look healthy. The bounded window already prevented it; it is now asserted,
+  and ADR-0040's lesson is pinned for the **fifth** time. **The honesty that matters most:**
+  Alpaca paper crypto fills are **simulated, not routed**, and here that is a headline rather
+  than ADR-0052's footnote — the venue charges **~25 bps taken in the received asset** while
+  the bench models 5 bps of slippage and no commission, and the session's three paired fills
+  came back at **8/35/44 bps realized against 5.00 modelled — the opposite direction from
+  equities, i.e. optimistic**. n=3 against `MIN_PAIRED_FILLS = 30`, so that is a direction, not
+  a measurement; **KAN-710 owns it**. The binding order floor is a **$10 notional**, an order
+  of magnitude above the published `min_order_size`, so no minimum-size gate was built — it
+  would be a false negative. `crypto10` ships with an explicit caveat: the worst survivorship
+  bias in the repo, because Alpaca's 73-asset listing is itself a survivor filter `blue20` does
+  not have. Equity byte-identical across all 7 golden artifacts; `RESULT_SCHEMA_VERSION` stays
+  **1**. Nine mutations turn 2/2/2/1/2/3/1/2/1 red — three initially turned **0**, including a
+  string-slicing test that silently matched the whole file after a ruff reformat.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -921,12 +1002,16 @@ As of this writing:
   `--source csv` path is the hook), **per-bar rolling liquidity** (the ADV screen is
   point-in-time, judged once before the run), **parameter-stability / heatmap output**
   from a sweep, and **regime-split metrics**. The **paper-vs-simulated fill
-  divergence report** is built (ADR-0038) but has only ~one live paired fill behind
-  it — the mechanism is done, the *evidence* about 5 bps is not; its `result.json`
+  divergence report** is built (ADR-0038) and now has **60 equity paired fills**
+  (ADR-0052: 0.51 bps realized against 5.00 modelled, conservative) plus **3 crypto
+  ones pointing the other way** (ADR-0058: 8/35/44 bps, optimistic, and blind to the
+  venue's ~25 bps fee because it compares prices while the fee is taken in quantity) —
+  the crypto measurement proper is **KAN-710**; its `result.json`
   block and dashboard panel are still unbuilt (additive; `divergence_rows` already
   emits the flat shape). Three ADR-0039 gaps stay open too: `paper` has no
-  `--bootstrap` (only `backtest` does), `--folds` walk-forward prints no deflation of
-  its own, and there is **no cross-invocation trial ledger** — the tool sees one
+  `--bootstrap` (only `backtest` does), `--folds` walk-forward still prints no deflation
+  of its own (**KAN-677** — though ADR-0059 gave `WalkForwardSummary` the basis that
+  block will need), and there is **no cross-invocation trial ledger** — the tool sees one
   command, so an operator who tried six strategies by hand has made 36 trials and the
   tool will report 1. It says so every time; it cannot do better alone.
 
@@ -1046,13 +1131,22 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
 - **Ask a provider for a window it will answer:** never `datetime.min`. A request is
   bounded from `lookback × interval` with slack; an unbounded net does not catch more,
   it catches nothing (Alpaca answers an absurd start with an *empty response*, not an
-  error — ADR-0047). And an offline stand-in that is more forgiving than the provider
-  cannot test this: `SyntheticAdapter` clips, `FakeAdapter` filters, so a regression
+  error — ADR-0047). Its **crypto** endpoint is worse: `datetime.min` returns **one**
+  bar, a non-empty answer that trips neither per-symbol absence nor the universe-wide
+  ERROR, so the session looks healthy having primed nothing (ADR-0058). And an offline
+  stand-in that is more forgiving than the provider cannot test this:
+  `SyntheticAdapter` clips, `FakeAdapter` filters, so a regression
   test written against either passes whether or not the bug exists (ADR-0040's lesson).
 - **A live session's stop policy is a duration, not a poll count** — the same count
   means ten minutes at 5m and two days at 1d. Tune it toward the cheap error: stopping
   late costs a few polls of a shut venue, stopping early costs the whole day's
   measurement (ADR-0049).
+- **A derived statistic must be computed on the same basis as the population it is
+  compared against.** A correct `periods_per_year` applied to trial Sharpes annualized
+  on another year is not "uniformly wrong" — uniform error is monotonic and
+  self-consistent, which is what let it survive. It is **incoherent**, and it failed in
+  the flattering direction. A summary now records the basis it was scored on and
+  deflating at a basis the trials did not use **raises** (ADR-0059).
 - **The annualization basis belongs to the market, not to the module** — `periods_per_year`
   is the single knob behind every risk-adjusted figure, so a hard-coded 252 x 390 silently
   reports one market's year for another. It comes from a `MarketCalendar`, and a lookup that
@@ -1122,14 +1216,20 @@ src/trading/
                            #   terminal order statuses (ADR-0033) + feed choice (ADR-0034)
                            #   + cancel_order, the seam's 6th call (ADR-0036)
                            #   + OrderRejectedError: a submit-time venue refusal (ADR-0041)
+                           #   + crypto venue: a client construction property chosen by the
+                           #     market's calendar; positions canonicalized BTCUSD -> BTC/USD,
+                           #     GTC not DAY, no feed, cancel idempotent on a filled order (ADR-0058)
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022);
-                           #   verifies an adjusted series really is adjusted; RAW never checked (ADR-0045)
+                           #   verifies an adjusted series really is adjusted; RAW never checked (ADR-0045);
+                           #   crypto has no adjustment and no feed concept at all (ADR-0058)
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022);
                            #   per-symbol fetch guard: retry forever, escalate, never quarantine (ADR-0035);
                            #   bounded fetch window — datetime.min is a request no provider answers (ADR-0047)
   strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry
                            #   buy_and_hold retries its entry until the position exists (ADR-0037 amended)
-  universe.py              # curated baskets (blue20) + @name expansion (ADR-0024) + broker verification (ADR-0028)
+  universe.py              # curated baskets (blue20, crypto10) + @name expansion (ADR-0024)
+                           #   + broker verification (ADR-0028); crypto10 verifies 10/10 with no
+                           #     --market, and carries the repo's worst survivorship caveat (ADR-0058)
   liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029)
   metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure,
                            #   entry count + trades-per-parameter significance (ADR-0029);
@@ -1137,6 +1237,8 @@ src/trading/
                            #   Sharpe significance (ADR-0039): stationary block bootstrap CI,
                            #   paired win rate, deflated Sharpe — seeded, never the global RNG
   sweep.py                 # parameter sweep (ADR-0016) + true IS->OOS walk-forward (ADR-0026);
+                           #   annualizes on the caller's periods_per_year, recorded on the summary —
+                           #   deflating at a basis the trials were not scored on raises (ADR-0059);
                            #   trial_count + deflated_winner() — best-of-N is not a finding (ADR-0039)
 tests/
   unit/           # fast, no infra
