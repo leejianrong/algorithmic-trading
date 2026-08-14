@@ -664,13 +664,31 @@ class TestCryptoShapedSymbolGuard:
         """The rule is narrow on purpose: a false positive would block a real run."""
         assert cli._crypto_shaped(symbol) is None
 
-    def test_no_curated_basket_symbol_is_flagged(self) -> None:
-        """The shipped universes must stay runnable — checked, not assumed."""
+    def test_every_curated_basket_is_flagged_exactly_as_its_market_requires(self) -> None:
+        """The shipped universes must stay runnable — checked, not assumed.
+
+        Strengthened when ``crypto10`` landed (ADR-0058). Until then every basket
+        was an equity one and "nothing is flagged" said all there was to say; a
+        crypto basket makes the guard's *two* claims separable, and both matter:
+
+        * a session-market basket must never be flagged, or the guard blocks a
+          legitimate run (the ``BRK-B`` false-positive worry, ADR-0057);
+        * a **pair** basket must be flagged on every symbol, or ``--market
+          crypto`` is silently forgettable for the one universe that most needs
+          it — the shape guard's whole reason to exist.
+
+        Asserting "no basket is flagged" would now have to be *weakened* to keep
+        passing, which is the shape of a test quietly going quiet.
+        """
         from trading.universe import BASKETS
 
-        for basket in BASKETS.values():
+        pair_baskets = {"crypto10"}
+        assert pair_baskets <= set(BASKETS), "a pair basket must exist for this to mean anything"
+        for name, basket in BASKETS.items():
+            expect_flagged = name in pair_baskets
             for symbol in basket.symbols:
-                assert cli._crypto_shaped(symbol) is None, symbol
+                flagged = cli._crypto_shaped(symbol) is not None
+                assert flagged is expect_flagged, f"{name}: {symbol}"
 
     def test_a_backtest_refuses_pair_symbols_under_the_equity_market(self, tmp_path: Path) -> None:
         out = tmp_path / "e.csv"

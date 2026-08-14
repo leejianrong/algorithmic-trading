@@ -36,7 +36,13 @@ import logging
 import math
 from datetime import date, datetime, timedelta
 
-from trading.data.alpaca_client import AlpacaClient, SplitEvent
+from trading.calendar import US_EQUITY, MarketCalendar
+from trading.data.alpaca_client import (
+    ASSET_CLASS_CRYPTO,
+    ASSET_CLASS_US_EQUITY,
+    AlpacaClient,
+    SplitEvent,
+)
 from trading.types import Bar
 
 logger = logging.getLogger(__name__)
@@ -98,6 +104,22 @@ class AlpacaAdapter:
     constructor parameter rather than a CLI flag, because "give me prices I have
     been told are wrong" should cost a line of Python, not a flag someone copies
     out of a runbook.
+
+    ``calendar`` selects the **venue** (ADR-0058), and it is deliberately the same
+    value that already fixes annualization (ADR-0054) and the paper feed's
+    completeness rule (ADR-0053) rather than a new ``asset_class=`` argument of its
+    own. That is ADR-0056's reasoning applied a second time: a separate flag would
+    keep "crypto bars annualized on a 252-day year" representable one keyword away,
+    which is the exact defect this epic was sequenced to remove. A continuous
+    calendar therefore builds a crypto client, and:
+
+    * **split verification is skipped, not merely inert.** A crypto pair has no
+      corporate actions, so there is nothing to cross-check and
+      :meth:`AlpacaClient.get_splits` is never called — which matters because the
+      guard's failure mode is a warning per window, and a warning about a
+      cross-check that cannot apply is noise that trains an operator to ignore
+      warnings.
+    * **``feed`` is refused**, because ``CryptoBarsRequest`` has no such field.
     """
 
     def __init__(
@@ -108,17 +130,20 @@ class AlpacaAdapter:
         interval: timedelta = timedelta(days=1),
         feed: str | None = None,
         verify_adjustments: bool = True,
+        calendar: MarketCalendar = US_EQUITY,
     ) -> None:
+        self._asset_class = ASSET_CLASS_CRYPTO if calendar.is_continuous else ASSET_CLASS_US_EQUITY
         if client is None:
             from trading.data.alpaca_client import RealAlpacaClient
 
-            client = RealAlpacaClient(feed=feed)
+            client = RealAlpacaClient(feed=feed, asset_class=self._asset_class)
         elif feed is not None:
             raise ValueError("feed applies only when AlpacaAdapter builds its own client")
         self._client = client
         self._adjusted = adjusted
         self._interval = interval
-        self._verify_adjustments = verify_adjustments
+        self._calendar = calendar
+        self._verify_adjustments = verify_adjustments and self._asset_class == ASSET_CLASS_US_EQUITY
         # (symbol, start-date, end-date) -> splits, or None when the lookup failed.
         # A backtest fetches each symbol once, but the ADV screen (ADR-0029), the
         # benchmark leg and a --once paper replay all re-enter, so one corporate-
