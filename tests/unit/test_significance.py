@@ -42,6 +42,7 @@ from trading.metrics import (
     return_moments,
     sharpe,
     sharpe_confidence_interval,
+    trial_count_note,
 )
 
 _EPOCH = datetime(2000, 1, 3, tzinfo=UTC)
@@ -511,6 +512,103 @@ class TestDeflatedSharpe:
         assert daily.probability == pytest.approx(hourly.probability)
 
 
+class TestPriorTrials:
+    """ADR-0062: a cross-invocation trial ledger widens N, never the spread.
+
+    The ledger only ever supplies a count, so every property here is about the
+    *count* side of the correction: the default reproduces today's behaviour
+    exactly, and a larger count never makes the null threshold easier to clear.
+    """
+
+    @staticmethod
+    def _moments() -> ReturnMoments:
+        result = curve_moments(_curve(_noise(1_000, seed=41)))
+        assert result is not None
+        return result
+
+    def test_zero_prior_trials_is_byte_for_byte_the_old_behaviour(self) -> None:
+        moments = self._moments()
+        spread = [0.2 * i for i in range(24)]
+        without_kwarg = deflated_sharpe(moments, spread)
+        with_zero = deflated_sharpe(moments, spread, prior_trials=0)
+        assert without_kwarg == with_zero
+
+    def test_the_augmented_count_lands_on_trials(self) -> None:
+        deflated = deflated_sharpe(self._moments(), [0.2 * i for i in range(1, 25)], prior_trials=6)
+        assert deflated is not None
+        assert deflated.trials == 24 + 6
+
+    def test_more_prior_trials_never_lower_the_null(self) -> None:
+        """The direction the whole card exists to guarantee.
+
+        Widening N by trials this call cannot see must make the bar to clear
+        *harder or equal*, never easier — that is what makes ignoring the ledger
+        the conservative (never the flattering) mistake.
+        """
+        moments = self._moments()
+        spread = [0.15 * i for i in range(1, 25)]  # real spread, so the null isn't pinned at 0
+        thresholds = [
+            deflated_sharpe(moments, spread, prior_trials=prior) for prior in (0, 1, 10, 100, 1_000)
+        ]
+        assert all(d is not None for d in thresholds)
+        nulls = [d.null_best_sharpe for d in thresholds if d is not None]
+        assert nulls == sorted(nulls)
+        assert nulls[-1] > nulls[0]
+
+    def test_more_prior_trials_never_raise_the_probability(self) -> None:
+        """The mirror of the null-threshold direction, stated on the figure a
+        reader actually acts on: probability can only fall or hold as the ledger
+        grows, never climb.
+        """
+        moments = self._moments()
+        spread = [0.15 * i for i in range(1, 25)]
+        few = deflated_sharpe(moments, spread, prior_trials=0)
+        many = deflated_sharpe(moments, spread, prior_trials=500)
+        assert few is not None
+        assert many is not None
+        assert few.probability is not None
+        assert many.probability is not None
+        assert many.probability <= few.probability
+
+    def test_a_lone_trial_gets_no_spread_regardless_of_the_ledger(self) -> None:
+        """The documented, real gap: one trial can never supply a spread.
+
+        A ledger of single backtests can grow ``trials`` arbitrarily, but with no
+        spread to price the correction with, ``expected_max_sharpe`` still returns
+        0.0 — the null threshold does not move just because the count did.
+        """
+        moments = self._moments()
+        unledgered = deflated_sharpe(moments, [1.2], prior_trials=0)
+        ledgered = deflated_sharpe(moments, [1.2], prior_trials=500)
+        assert unledgered is not None
+        assert ledgered is not None
+        assert unledgered.null_best_sharpe == 0.0
+        assert ledgered.null_best_sharpe == 0.0
+        assert ledgered.trials == 501
+
+    def test_a_negative_prior_trials_is_a_caller_bug(self) -> None:
+        with pytest.raises(ValueError, match="prior_trials must be >= 0"):
+            deflated_sharpe(self._moments(), [1.0], prior_trials=-1)
+
+
+class TestTrialCountNote:
+    def test_zero_prior_trials_matches_the_pre_ledger_sentence(self) -> None:
+        assert trial_count_note(5) == trial_count_note(5, prior_trials=0)
+        assert trial_count_note(5) == (
+            "the deflation counts 5 trial(s) — only those visible in this "
+            "invocation. Runs made in earlier invocations, over other date ranges, or on "
+            "other strategies are invisible to this tool, so the correction is a LOWER "
+            "BOUND on the multiple-comparison problem, never a complete accounting"
+        )
+
+    def test_a_positive_prior_trials_discloses_the_split(self) -> None:
+        note = trial_count_note(24, prior_trials=6)
+        assert "24 trial(s)" in note
+        assert "18 from this run" in note
+        assert "6 carried over" in note
+        assert "LOWER BOUND" in note
+
+
 class TestAssessSignificance:
     def test_it_always_returns_an_object(self) -> None:
         report = assess_significance(_curve([]), resamples=10)
@@ -547,3 +645,20 @@ class TestAssessSignificance:
         assert assess_significance(*args, resamples=100) == assess_significance(
             *args, resamples=100
         )
+
+    def test_zero_prior_trials_is_the_pre_ledger_default(self) -> None:
+        curve = _curve(_noise(500, seed=51))
+        without_kwarg = assess_significance(curve, resamples=50)
+        with_zero = assess_significance(curve, resamples=50, prior_trials=0)
+        assert without_kwarg == with_zero
+
+    def test_prior_trials_widens_the_deflated_count_and_the_note(self) -> None:
+        report = assess_significance(
+            _curve(_noise(500, seed=51)),
+            resamples=50,
+            trial_sharpes=[0.4, 0.9, 1.3],
+            prior_trials=20,
+        )
+        assert report.deflated is not None
+        assert report.deflated.trials == 23
+        assert any("23 trial(s): 3 from this run plus 20 carried over" in n for n in report.notes)

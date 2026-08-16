@@ -38,6 +38,15 @@ Three honesty knobs sit on top of that, all opt-in and all off by default:
 the winner's deflation is free and prints under the ranking table. A "best of 24"
 Sharpe quoted without the 24 is the number this bench exists not to print.
 
+- ``backtest --ledger PATH`` / ``sweep --ledger PATH`` append every invocation to a
+  cross-invocation JSONL trial ledger (``trading.ledger.TrialLedger``, ADR-0062) and
+  widen the ADR-0039 deflation by its cumulative trial count, so a search made across
+  many separate invocations is no longer invisible to the correction. Off by default;
+  a path you did not give is a path this tool does not touch, and the file only ever
+  grows (append-only, so a crash mid-write under-reports rather than corrupts).
+  ``--hypothesis TEXT`` records a pre-registered rationale verbatim alongside the
+  count, for KAN-862's still-unbuilt playbook to enforce later.
+
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
 parameters says so (ADR-0029).
@@ -112,6 +121,7 @@ from trading.engine import (
 )
 from trading.frequency import DAILY, Frequency
 from trading.interfaces import Broker, DataAdapter
+from trading.ledger import TrialLedger, TrialRecord
 from trading.liquidity import DEFAULT_FORMATION_DAYS, screen_by_adv
 from trading.logging_config import (
     DEFAULT_LOG_FORMAT,
@@ -417,6 +427,17 @@ HALT_COOLDOWN_HELP = (
     "--halt-recovery-drawdown, whichever triggers first wins. Unset takes the --market "
     "posture's value: us_equity none (the halt latches), crypto_24_7 "
     f"{CRYPTO_HALT_COOLDOWN_BARS} (ADR-0055)."
+)
+# Shared by `backtest` and `sweep` for the same reason MARKET_OPTION_HELP is: one
+# sentence, not two chances for the wording to drift (ADR-0062).
+LEDGER_HELP = (
+    "Append this run to a cross-invocation JSONL trial ledger at PATH, and widen the "
+    "ADR-0039 deflation by its cumulative trial count from earlier logged invocations. "
+    "Off by default — a path you do not give is a path this tool does not touch."
+)
+HYPOTHESIS_HELP = (
+    "Pre-registered rationale for this run, recorded verbatim in the ledger (needs "
+    "--ledger; harmless, but not yet used, without it). For KAN-862's playbook."
 )
 
 # Quote currencies that make a symbol a *pair* rather than a ticker. Deliberately
@@ -892,6 +913,7 @@ def _assess_significance(
     periods_per_year: float,
     resamples: int,
     seed: int,
+    prior_trials: int = 0,
 ) -> SignificanceReport:
     """Run the ADR-0039 bootstrap for a finished backtest, or exit 2 on a bad knob.
 
@@ -900,6 +922,10 @@ def _assess_significance(
     so it is passed through whenever ``--benchmark`` produced a run. When it did not
     (absent, or warned away by :func:`_run_benchmark`), ``assess_significance``
     records a note explaining the absence instead of quietly omitting a row.
+
+    ``prior_trials`` (ADR-0062) is a :class:`~trading.ledger.TrialLedger`'s
+    cumulative count from earlier logged invocations; ``0`` (the default) is
+    exactly today's behaviour.
 
     Any ``ValueError`` from ``metrics`` is a caller mistake rather than a data
     shortfall (a data shortfall comes back as a ``None`` block and a note), so it
@@ -916,6 +942,7 @@ def _assess_significance(
             periods_per_year,
             resamples=resamples,
             seed=seed,
+            prior_trials=prior_trials,
         )
     except ValueError as exc:
         typer.echo(f"error: {exc}", err=True)
@@ -1015,6 +1042,16 @@ def backtest(
         help="Seed for the bootstrap RNG (needs --bootstrap). Printed with the interval, "
         "so the figure is reproducible.",
     ),
+    ledger: Path | None = typer.Option(
+        None,
+        "--ledger",
+        help=LEDGER_HELP,
+    ),
+    hypothesis: str = typer.Option(
+        "",
+        "--hypothesis",
+        help=HYPOTHESIS_HELP,
+    ),
     plot: bool = typer.Option(
         False, "--plot/--no-plot", help="Also write an equity_curve.png next to the CSV."
     ),
@@ -1074,6 +1111,12 @@ def backtest(
             adapter, bench_symbol, cash=cash, start=start, end=end, costs=costs
         )
 
+    # Read BEFORE the significance is assembled, not after: the whole point of the
+    # ledger (ADR-0062) is that this invocation's own trial count is widened by
+    # every earlier one it cannot otherwise see. A ledger that does not exist yet
+    # (the very first logged run) reads as 0, so it widens nothing.
+    prior_trials = TrialLedger(ledger).cumulative_trials() if ledger is not None else 0
+
     # The bootstrap is computed ONCE here and handed to both the text summary and
     # result.json (ADR-0039). Neither derives it: a `result.json` must never
     # silently pay for thousands of Sharpe computations nobody asked for, and a run
@@ -1085,6 +1128,7 @@ def backtest(
             periods_per_year=freq.periods_per_year,
             resamples=bootstrap_resamples,
             seed=bootstrap_seed,
+            prior_trials=prior_trials,
         )
         if bootstrap
         else None
@@ -1113,6 +1157,28 @@ def backtest(
     # the CSV. Metrics are computed once here at the run's frequency (default
     # 252/yr for daily keeps the numbers identical).
     metrics = compute_metrics(result, freq.periods_per_year, free_parameters=free_params)
+
+    # Appended whether or not --bootstrap ran: the ledger's own bookkeeping is a
+    # count of trials, not a significance figure, so a plain backtest still adds
+    # its one trial for a LATER invocation's --ledger to see (ADR-0062). Only the
+    # deflation math above is gated on --bootstrap; recording never is.
+    if ledger is not None:
+        TrialLedger(ledger).append(
+            TrialRecord(
+                timestamp=datetime.now(UTC).isoformat(),
+                command="backtest",
+                strategy=strategy,
+                symbols=tuple(sorted(tickers)),
+                date_from=from_,
+                date_to=to,
+                interval=interval,
+                market=chosen_market.name,
+                trial_count=1,
+                observed_sharpe=metrics.sharpe,
+                hypothesis=hypothesis,
+            )
+        )
+
     result_json = out.parent / "result.json"
     write_result_json(
         result,
@@ -1775,7 +1841,13 @@ def _format_sweep_table(summary: SweepSummary, rank_by: str, param_keys: list[st
     return "\n".join(lines)
 
 
-def _sweep_significance_block(summary: SweepSummary, rank_by: str, periods_per_year: float) -> str:
+def _sweep_significance_block(
+    summary: SweepSummary,
+    rank_by: str,
+    periods_per_year: float,
+    *,
+    prior_trials: int = 0,
+) -> str:
     """The winner's trial-count deflation, rendered exactly as ``backtest`` renders it.
 
     A sweep's headline is the *maximum* of everything it ran, and a maximum of N
@@ -1790,14 +1862,21 @@ def _sweep_significance_block(summary: SweepSummary, rank_by: str, periods_per_y
     arithmetic on those — so this block costs nothing and is therefore *not* behind
     ``--bootstrap``, unlike the interval on a single backtest.
 
+    ``prior_trials`` (ADR-0062) is a :class:`~trading.ledger.TrialLedger`'s
+    cumulative count from earlier logged invocations; ``0`` (the default)
+    reproduces the pre-ledger behaviour exactly.
+
     ``""`` when the summary has no runs, or when the winner's moments were not
     recorded — an honest absence rather than a fabricated figure.
     """
-    deflated = summary.deflated_winner(rank_by, periods_per_year)
+    deflated = summary.deflated_winner(rank_by, periods_per_year, prior_trials=prior_trials)
     if deflated is None:
         return ""
     return summarize_significance(
-        SignificanceReport(deflated=deflated, notes=[trial_count_note(deflated.trials)])
+        SignificanceReport(
+            deflated=deflated,
+            notes=[trial_count_note(deflated.trials, prior_trials=prior_trials)],
+        )
     )
 
 
@@ -1895,6 +1974,16 @@ def sweep(
         "--sector-map",
         help="Symbol->sector map as SYM:sector,SYM:sector (used with --max-sector-exposure).",
     ),
+    ledger: Path | None = typer.Option(
+        None,
+        "--ledger",
+        help=LEDGER_HELP,
+    ),
+    hypothesis: str = typer.Option(
+        "",
+        "--hypothesis",
+        help=HYPOTHESIS_HELP,
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/sweep.csv"), "--out", help="Results CSV path."),
 ) -> None:
@@ -1966,6 +2055,15 @@ def sweep(
     adapter = _make_adapter(source, cache_dir, seed, freq)
 
     if folds > 0:
+        if ledger is not None:
+            # KAN-677: walk-forward prints no deflation of its own yet, so there is
+            # nothing here for --ledger to widen or contribute to. Named rather
+            # than silently ignored (ADR-0062).
+            typer.echo(
+                "note: --ledger is not yet wired into --folds walk-forward (KAN-677); "
+                "nothing was appended",
+                err=True,
+            )
         _run_walk_forward_command(
             strategy=strategy,
             grid=grid,
@@ -1983,6 +2081,9 @@ def sweep(
             periods_per_year=freq.periods_per_year,
         )
         return
+
+    # Read BEFORE the deflation is scored, same as backtest's --ledger (ADR-0062).
+    prior_trials = TrialLedger(ledger).cumulative_trials() if ledger is not None else 0
 
     # The run's own basis, from the --interval x --market Frequency: the sweep's
     # metrics used to take metrics.compute's 252.0 whatever the bars were (KAN-840).
@@ -2009,11 +2110,34 @@ def sweep(
             f"combos={len(summary.runs)} ranked by {rank_by}\n"
         )
         typer.echo(_format_sweep_table(summary, rank_by, param_keys))
-        deflation = _sweep_significance_block(summary, rank_by, freq.periods_per_year)
+        deflation = _sweep_significance_block(
+            summary, rank_by, freq.periods_per_year, prior_trials=prior_trials
+        )
         if deflation:
             typer.echo("\n" + deflation)
         _write_sweep_csv(summary, out, rank_by, param_keys)
         typer.echo(f"\nWrote sweep results to {out}")
+
+        # Appended after the deflation above so a failure building the report never
+        # costs the log entry, and before the caller sees "Wrote sweep results" so
+        # the ledger and the CSV land in the same run (ADR-0062).
+        if ledger is not None:
+            winner = summary.ranked(rank_by)[0]
+            TrialLedger(ledger).append(
+                TrialRecord(
+                    timestamp=datetime.now(UTC).isoformat(),
+                    command="sweep",
+                    strategy=strategy,
+                    symbols=tuple(sorted(tickers)),
+                    date_from=from_,
+                    date_to=to,
+                    interval=interval,
+                    market=chosen_market.name,
+                    trial_count=len(summary.runs),
+                    observed_sharpe=winner.metrics.sharpe,
+                    hypothesis=hypothesis,
+                )
+            )
 
     for combo, reason in summary.skipped:
         pretty = ", ".join(f"{k}={_format_param(v)}" for k, v in combo.items())

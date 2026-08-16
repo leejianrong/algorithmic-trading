@@ -317,6 +317,8 @@ class SweepSummary:
         self,
         by: str = "sharpe",
         periods_per_year: float | None = None,
+        *,
+        prior_trials: int = 0,
     ) -> DeflatedSharpe | None:
         """Deflate the top-ranked run's Sharpe for the whole search (ADR-0039).
 
@@ -344,6 +346,12 @@ class SweepSummary:
         different year" has no correct answer to give — a caller bug, in the same
         class as :func:`~trading.metrics.deflated_sharpe` raising on an empty
         ``trial_sharpes``.
+
+        ``prior_trials`` (ADR-0062) passes straight through to
+        :func:`~trading.metrics.deflated_sharpe`: the cumulative count a
+        :class:`~trading.ledger.TrialLedger` reports for every earlier logged
+        invocation, widening ``N`` beyond what this one sweep ran. ``0`` (the
+        default) reproduces the pre-ledger behaviour exactly.
         """
         basis = self.periods_per_year if periods_per_year is None else periods_per_year
         if basis != self.periods_per_year:
@@ -360,7 +368,7 @@ class SweepSummary:
         moments = winners[0].moments
         if moments is None:
             return None
-        return deflated_sharpe(moments, self.trial_sharpes(), basis)
+        return deflated_sharpe(moments, self.trial_sharpes(), basis, prior_trials=prior_trials)
 
 
 def _build_strategy(name: str, combo: ParamCombo) -> Strategy:

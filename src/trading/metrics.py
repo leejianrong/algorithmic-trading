@@ -1086,6 +1086,8 @@ def deflated_sharpe(
     moments: ReturnMoments,
     trial_sharpes: Sequence[float],
     periods_per_year: float = 252.0,
+    *,
+    prior_trials: int = 0,
 ) -> DeflatedSharpe | None:
     """Deflate a run's Sharpe for the search that produced it (KAN-619, ADR-0039).
 
@@ -1102,13 +1104,34 @@ def deflated_sharpe(
     correction is always a lower bound — :func:`assess_significance` says so in its
     notes.
 
+    ``prior_trials`` (ADR-0062, KAN-858) widens ``N`` by trials this call cannot see
+    directly — the cumulative count a :class:`~trading.ledger.TrialLedger` reports
+    for every earlier logged invocation. It is added to ``len(trial_sharpes)``
+    *only* for the count that reaches :func:`expected_max_sharpe`; the *spread*
+    (``sharpe_stdev``, computed below as ``stdev_per_bar``) is still estimated from
+    ``trial_sharpes`` alone, because the ledger records how many trials ran, never
+    their individual Sharpes — carrying those forever would make the ledger grow
+    without bound and would still be silently wrong the day an old experiment's
+    file was deleted. So a ledger-widened correction inherits *this* invocation's
+    spread as a stand-in for the historical trials' unknown one — a real
+    approximation, not a free upgrade, and :func:`trial_count_note` says so. One
+    consequence worth naming: when this invocation is itself a single trial
+    (``len(trial_sharpes) == 1``), ``stdev_per_bar`` is ``None`` regardless of how
+    large ``prior_trials`` is, so :func:`expected_max_sharpe` still returns 0.0 —
+    a ledger of single backtests can grow the visible count without ever supplying
+    a spread to price it with. ``0`` (the default) reproduces the pre-ledger
+    behaviour exactly: :attr:`DeflatedSharpe.trials` is ``len(trial_sharpes)``, as
+    before.
+
     ``None`` when the moments carry no dispersion. Raises ``ValueError`` on an
-    empty ``trial_sharpes``: a result produced by no trials at all is a caller bug,
-    not a data property.
+    empty ``trial_sharpes`` (a result produced by no trials at all is a caller bug,
+    not a data property) or a negative ``prior_trials``.
     """
     trials = len(trial_sharpes)
     if trials < 1:
         raise ValueError("trial_sharpes must hold at least the run being deflated")
+    if prior_trials < 0:
+        raise ValueError(f"prior_trials must be >= 0, got {prior_trials}")
     if moments.stdev <= 0.0:
         return None
     root = sqrt(periods_per_year)
@@ -1116,9 +1139,12 @@ def deflated_sharpe(
     stdev_per_bar: float | None = None
     if trials > 1:
         stdev_per_bar = sqrt(_sample_variance(per_bar, _mean(per_bar)))
-    threshold = expected_max_sharpe(trials, stdev_per_bar if stdev_per_bar is not None else 0.0)
+    augmented_trials = trials + prior_trials
+    threshold = expected_max_sharpe(
+        augmented_trials, stdev_per_bar if stdev_per_bar is not None else 0.0
+    )
     return DeflatedSharpe(
-        trials=trials,
+        trials=augmented_trials,
         observed_sharpe=moments.mean / moments.stdev * root,
         null_best_sharpe=threshold * root,
         probability=probabilistic_sharpe_ratio(moments, threshold),
@@ -1129,7 +1155,7 @@ def deflated_sharpe(
     )
 
 
-def trial_count_note(trials: int) -> str:
+def trial_count_note(trials: int, *, prior_trials: int = 0) -> str:
     """The caveat that must accompany every deflated Sharpe (ADR-0039 §4).
 
     Public and shared rather than inlined where it is first needed, because
@@ -1138,12 +1164,34 @@ def trial_count_note(trials: int) -> str:
     (it kept the trials' moments, not their curves, so there is nothing to
     bootstrap) and must print the *same* sentence. ADR-0039 calls the caveat "not
     optional and not conditional", and two copies of a sentence like that drift.
+
+    ``trials`` is the **augmented** total — :attr:`DeflatedSharpe.trials`, already
+    including any ``prior_trials`` — so this reads the same count the deflation was
+    actually scored against. When ``prior_trials`` is 0 (the default, and every
+    caller before ADR-0062) the wording is exactly what it always was: byte-for-byte
+    identical, because a lone invocation with no ledger has nothing new to disclose.
+    A positive ``prior_trials`` splits the sentence so a reader can see both halves
+    of the count — how many trials this run itself made, and how many were carried
+    over from a :class:`~trading.ledger.TrialLedger` — and restates that the spread
+    behind the correction is still this invocation's alone (see
+    :func:`deflated_sharpe`), so the widened count is a LOWER BOUND twice over: once
+    on trials the ledger predates, and once on the spread of the trials it does see.
     """
+    if prior_trials <= 0:
+        return (
+            f"the deflation counts {trials} trial(s) — only those visible in this "
+            "invocation. Runs made in earlier invocations, over other date ranges, or on "
+            "other strategies are invisible to this tool, so the correction is a LOWER "
+            "BOUND on the multiple-comparison problem, never a complete accounting"
+        )
+    this_invocation = trials - prior_trials
     return (
-        f"the deflation counts {trials} trial(s) — only those visible in this "
-        "invocation. Runs made in earlier invocations, over other date ranges, or on "
-        "other strategies are invisible to this tool, so the correction is a LOWER "
-        "BOUND on the multiple-comparison problem, never a complete accounting"
+        f"the deflation counts {trials} trial(s): {this_invocation} from this run plus "
+        f"{prior_trials} carried over from earlier logged experiment(s) in the ledger — "
+        "the spread behind the correction is still estimated from this invocation's "
+        "trials only (the ledger records counts, not each trial's own Sharpe), so this "
+        "remains a LOWER BOUND twice over: on the trial count made before the ledger "
+        "existed, and on the spread of the trials it does carry forward"
     )
 
 
@@ -1173,6 +1221,7 @@ def assess_significance(
     confidence: float = DEFAULT_CONFIDENCE,
     seed: int = DEFAULT_BOOTSTRAP_SEED,
     trial_sharpes: Sequence[float] | None = None,
+    prior_trials: int = 0,
 ) -> SignificanceReport:
     """Assemble the whole significance block for one run (ADR-0039).
 
@@ -1182,10 +1231,16 @@ def assess_significance(
     result — omit it and the run counts as its own single trial, which is the
     truthful reading of a lone ``trading backtest`` invocation.
 
+    ``prior_trials`` (ADR-0062) is the cumulative trial count a
+    :class:`~trading.ledger.TrialLedger` reports for every *earlier* logged
+    invocation; it widens :func:`deflated_sharpe`'s ``N`` and is folded into the
+    printed note via :func:`trial_count_note`. ``0`` (the default) is exactly
+    today's behaviour.
+
     The notes are not decoration. They record the things a reader would otherwise
     have to infer: that a short series forced a smaller block length, that no
     benchmark meant no paired figure, and that the trial count covers only this
-    invocation.
+    invocation (plus whatever a ledger contributed).
     """
     notes: list[str] = []
     interval = sharpe_confidence_interval(
@@ -1243,8 +1298,8 @@ def assess_significance(
             if trial_sharpes is None
             else list(trial_sharpes)
         )
-        deflated = deflated_sharpe(moments, sharpes, periods_per_year)
-        notes.append(trial_count_note(len(sharpes)))
+        deflated = deflated_sharpe(moments, sharpes, periods_per_year, prior_trials=prior_trials)
+        notes.append(trial_count_note(len(sharpes) + prior_trials, prior_trials=prior_trials))
     return SignificanceReport(
         sharpe_interval=interval,
         paired=paired,
