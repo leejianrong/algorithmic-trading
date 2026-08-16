@@ -1028,6 +1028,49 @@ As of this writing:
   byte-identical across all 7 artifacts; `RESULT_SCHEMA_VERSION` stays **1** (nothing added).
   Nine mutations turn 8/3/12/1/2/5/1/2/1 red — **three initially turned 0**, because every test
   built its broker directly and none exercised `cli.py` (ADR-0040's lesson, sixth sighting).
+- **The crypto fill cost, measured — both terms, separately (2026-08-16, ADR-0061, KAN-710):**
+  ADR-0060 shipped `taker_fee_bps` sourced from Alpaca's published schedule but unseen in a
+  session, and `slippage_bps = 5.0` was still the equity constant, never checked against crypto.
+  A live `sma_crossover`/`@crypto10` 5m session (`--market crypto --divergence --max-position
+  0.01`, the cap chosen against the fee tier, not convenience, so turnover could not cross a
+  volume boundary mid-measurement) made **two independent measurements** and kept them apart —
+  one is a price, one is a quantity, combined once at the end. **The fee, exact arithmetic on
+  observed quantities:** the coin-side ledger (closing position vs. `bought - sold`) gives
+  **22.0000 bps identically across all eight pairs traded**, spanning four orders of magnitude in
+  unit price (`DOGE/USD` at 14,271 units vs. `ETH/USD` at 0.53) — confirming the fee is not
+  per-pair (ADR-0060 §5 had inferred that from two pairs agreeing to four decimals) and retiring
+  ADR-0058's ambiguity: its 8→44 bps divergence spread was **entirely price slippage**, not a fee
+  difference. The cash-side ledger agrees at 22.0806 bps (the 0.08 bps gap is $0.06 across eight
+  sells, consistent with cent rounding), and cash debited on a buy equals gross notional to
+  **$0.0003 across $7,964** — the venue takes nothing out of the reported fill price, which is
+  what makes the two measurements genuinely independent. Against the published schedule this is
+  **exact**: tier 2's taker row is 22 bps, and the account's own trailing-30-day notional
+  (reconstructed from closed orders, `scripts/crypto_fee_reconcile.py`) confirms tier 2 held
+  throughout. **The slippage, n=11 paired fills, is only an observation** —
+  `MIN_PAIRED_FILLS = 30` is not met, and the report says so: mean **+13.02 bps** against the
+  5.00 bps model (median +14.29, stdev 10.59, range -4.83..+26.83; buy +9.14 bps n=8, sell
+  +23.39 bps n=3), a naive 95% CI of +6.77..+19.28 that excludes 5.00 — **but 8 of the 11 rows
+  share one market instant** (`sma_crossover`'s opening entry burst, an ADR-0042 warmup artifact:
+  every symbol already in signal enters simultaneously on the first live bar), so effective n is
+  nearer 4 than 11 and the interval is understated, not confirmatory. **THE FINDING:** the same
+  instrument, same model constant, two asset classes, **opposite signs** — equities (ADR-0052,
+  n=60) measured 0.51 bps against the 5.00 bps model, conservative by 4.49; crypto measures
+  +13.02, optimistic by 8.02. So the modelling error is a property of **the venue**, not of the
+  measurement method. No constant moved: this is Alpaca's *simulated* crypto fill model, not a
+  routed one, so it is our cost model checked against Alpaca's, and only routed execution could
+  settle the level. **Design lesson carried forward:** the binding constraint on reaching
+  `MIN_PAIRED_FILLS = 30` was fill *rate* (an hour bought 11 pairs, not session length) — a longer
+  session buys more of the same opening-burst artifact, not independence; the fix is a different
+  experiment (more symbols, more sessions, or a strategy that doesn't cluster entries), not a
+  longer one. Also newly measured: the divergence reference price goes stale when Alpaca's own
+  crypto tape skips intervals (`LINK/USD` at 100.3% of possible 5m bars over a day, `ETH/USD` at
+  47.6%, `BONK/USD` 95.5% vs `SOL/USD` 58.3% — untreatable by coin-size intuition), which widens
+  the crypto error bar by an unknown factor beyond the equity case's ~0.4 bps IEX print
+  difference; `fill_divergence.csv` gained `reference_ts`/`reference_lag_seconds` and the report
+  prints a staleness block only when the tape actually skipped (byte-identical on a dense equity
+  tape). In this run staleness was nearly absent (10/11 references exactly one interval old), so
+  the +13.02 bps mean is not a staleness artifact here — but the coverage table says a longer or
+  thinner-pair run will not be so lucky (tracked as **KAN-863**).
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -1038,12 +1081,18 @@ As of this writing:
   point-in-time, judged once before the run), **parameter-stability / heatmap output**
   from a sweep, and **regime-split metrics**. The **paper-vs-simulated fill
   divergence report** is built (ADR-0038) and now has **60 equity paired fills**
-  (ADR-0052: 0.51 bps realized against 5.00 modelled, conservative) plus **3 crypto
-  ones pointing the other way** (ADR-0058: 8/35/44 bps, optimistic, and blind to the
-  venue's ~25 bps fee because it compares prices while the fee is taken in quantity) —
-  the crypto measurement proper is **KAN-710**; its `result.json`
-  block and dashboard panel are still unbuilt (additive; `divergence_rows` already
-  emits the flat shape). Three ADR-0039 gaps stay open too: `paper` has no
+  (ADR-0052: 0.51 bps realized against 5.00 modelled, conservative) and **11 crypto
+  ones pointing the other way** (ADR-0061: +13.02 bps, optimistic — below
+  `MIN_PAIRED_FILLS = 30` and 8 of the 11 share one market instant, so this is a
+  direction, not a level). The crypto **fee** is now measured too, separately from
+  slippage (ADR-0061: 22.0000 bps exact against the published tier-2 schedule,
+  confirmed across eight pairs) — but it is measured by position-delta arithmetic,
+  not by the divergence report itself, which still **cannot see it**: every
+  statistic there is a ratio of prices and the fee is taken out of the received
+  quantity. That report's `result.json` block and dashboard panel are still unbuilt
+  (additive; `divergence_rows` already emits the flat shape), and a divergence run
+  dense enough to clear 30 *independent* crypto fills (KAN-863 tracks the
+  reference-staleness half of that gap) is still open. Three ADR-0039 gaps stay open too: `paper` has no
   `--bootstrap` (only `backtest` does), `--folds` walk-forward still prints no deflation
   of its own (**KAN-677** — though ADR-0059 gave `WalkForwardSummary` the basis that
   block will need), and there is **no cross-invocation trial ledger** — the tool sees one
