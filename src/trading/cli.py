@@ -79,7 +79,7 @@ from trading.broker import SimulatedBroker
 from trading.brokers.alpaca import AlpacaBroker
 from trading.calendar import CALENDARS, CRYPTO_24_7, US_EQUITY, MarketCalendar, get_calendar
 from trading.clock import FakeClock, WallClock
-from trading.config import CRYPTO_HALT_COOLDOWN_BARS, RiskConfig
+from trading.config import CRYPTO_HALT_COOLDOWN_BARS, CRYPTO_TAKER_FEE_BPS, CostConfig, RiskConfig
 from trading.data.alpaca_adapter import AlpacaAdapter
 from trading.data.csv_adapter import CsvAdapter
 from trading.data.fake import FakeAdapter
@@ -331,18 +331,20 @@ def _apply_liquidity_screen(
 
 @dataclass(frozen=True, slots=True)
 class _Market:
-    """One market selection: a calendar, a risk posture, and a completeness rule.
+    """One market selection: a calendar, a risk posture, costs, and completeness.
 
-    The three things EPIC-87's phase-1 lanes built as independent library seams
+    The things EPIC-87's phase-1 lanes built as independent library seams
     (ADR-0053/0054/0055), tied together by the one choice an operator makes
-    (ADR-0057). ``name`` is the :class:`~trading.calendar.MarketCalendar`'s own
-    registry name, so there is exactly one spelling of a market in the codebase and
-    it is the one ``result.json`` records.
+    (ADR-0057), plus the cost model ADR-0060 added as the fourth seam. ``name`` is
+    the :class:`~trading.calendar.MarketCalendar`'s own registry name, so there is
+    exactly one spelling of a market in the codebase and it is the one
+    ``result.json`` records.
     """
 
     name: str
     calendar: MarketCalendar
     posture: RiskConfig
+    costs: CostConfig
 
 
 # The risk posture each market trades under (ADR-0055). Keyed by calendar name, so
@@ -354,6 +356,17 @@ class _Market:
 _MARKET_POSTURES: dict[str, Callable[[], RiskConfig]] = {
     US_EQUITY.name: RiskConfig.equity,
     CRYPTO_24_7.name: RiskConfig.crypto,
+}
+
+# The cost model each market trades under (ADR-0060), keyed by calendar name for
+# exactly the reason `_MARKET_POSTURES` is: a market whose trading costs nobody has
+# researched must be **unselectable**, not silently charged US-equity costs. That is
+# the sharper half of this table, because the equity default is *commission-free* —
+# a market missing here would not merely be mispriced, it would be modelled as free,
+# which is the most flattering wrong answer available.
+_MARKET_COSTS: dict[str, Callable[[], CostConfig]] = {
+    US_EQUITY.name: CostConfig.equity,
+    CRYPTO_24_7.name: CostConfig.crypto,
 }
 
 # Operator-friendly spellings of the canonical calendar names. Pure input
@@ -389,6 +402,15 @@ MAX_GROSS_HELP = (
 MAX_DRAWDOWN_HELP = (
     "Drawdown kill-switch threshold, fraction from peak. Unset takes the --market "
     "posture's value (us_equity: 0.20)."
+)
+SLIPPAGE_HELP = (
+    "Adverse price move applied to every fill, in basis points. Unset takes the "
+    "--market cost model's value (us_equity and crypto_24_7 both: 5.0)."
+)
+TAKER_FEE_HELP = (
+    "Venue fee on the traded notional, in basis points. Unset takes the --market "
+    f"cost model's value (us_equity: 0.0, commission-free; crypto_24_7: "
+    f"{CRYPTO_TAKER_FEE_BPS:g}, Alpaca's published tier-1 taker rate — ADR-0060)."
 )
 HALT_COOLDOWN_HELP = (
     "Re-arm the halted kill switch after this many bars in force. With "
@@ -437,7 +459,17 @@ def _resolve_market(name: str) -> _Market:
             err=True,
         )
         raise typer.Exit(2)
-    return _Market(name=calendar.name, calendar=calendar, posture=posture())
+    costs = _MARKET_COSTS.get(calendar.name)
+    if costs is None:
+        typer.echo(
+            f"error: market {calendar.name!r} has no cost model, so it cannot be "
+            "selected yet; add one to _MARKET_COSTS (ADR-0060). Refusing rather "
+            "than falling back to the commission-free equity costs, which would "
+            "model an unresearched venue as free.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    return _Market(name=calendar.name, calendar=calendar, posture=posture(), costs=costs())
 
 
 def _crypto_shaped(symbol: str) -> str | None:
@@ -693,8 +725,43 @@ def _build_risk(
     )
 
 
+def _build_costs(
+    model: CostConfig,
+    slippage_bps: float | None,
+    taker_fee_bps: float | None,
+) -> CostConfig:
+    """Assemble the run's CostConfig from the market's model plus any overrides.
+
+    **The same one-sentence precedence ``_build_risk`` uses** (ADR-0057, applied to
+    costs by ADR-0060): an explicitly-passed flag always wins, and every term the
+    operator did not pass comes from the selected market's cost model. Both options
+    default to ``None`` — "not chosen here" — for the reason stated there: a number
+    in the option *and* a number in the preset is two defaults that can drift apart.
+
+    On ``us_equity`` the resolved values are exactly the old literals (5.0 bps of
+    slippage, no commission, no fee), so no existing invocation moves a cent.
+
+    Note the asymmetry with :meth:`~trading.config.CostConfig.crypto`, which refuses
+    a zero fee. An explicit ``--taker-fee-bps 0`` is *not* refused here, and that is
+    deliberate rather than an oversight: the preset's job is to stop a crypto run
+    from being modelled as free by **default**, while a flag the operator typed is a
+    typed choice that shows up in the shell history — exactly the line ADR-0057 drew
+    when it let ``--max-drawdown 0.9`` override the posture's 0.20. The cure for a
+    bad explicit number is the operator, not a second veto.
+    """
+    return CostConfig(
+        commission_per_share=model.commission_per_share,
+        slippage_bps=model.slippage_bps if slippage_bps is None else slippage_bps,
+        taker_fee_bps=model.taker_fee_bps if taker_fee_bps is None else taker_fee_bps,
+    )
+
+
 def _make_paper_broker(
-    name: str, live: bool, cash: float, calendar: MarketCalendar = US_EQUITY
+    name: str,
+    live: bool,
+    cash: float,
+    calendar: MarketCalendar = US_EQUITY,
+    costs: CostConfig | None = None,
 ) -> Broker:
     """Select the paper execution venue: the simulator, or the live Alpaca broker.
 
@@ -705,9 +772,16 @@ def _make_paper_broker(
     adapter (ADR-0058): the venue's crypto orders need a different time-in-force
     and its positions come back under a different symbol spelling. The simulator
     ignores it — it has no venue.
+
+    ``costs`` is the mirror image: the **simulator** needs the market's cost model
+    (ADR-0060) and the Alpaca broker does not, because a real venue charges what it
+    charges and :class:`~trading.brokers.alpaca.AlpacaBroker` reconciles its
+    portfolio from the account rather than from a modelled fill (ADR-0020). Our cost
+    model is a *prediction* about that venue; handing it to the broker that talks to
+    the venue would be modelling the thing we are measuring.
     """
     if name == "simulated":
-        return SimulatedBroker(Portfolio(cash=cash))
+        return SimulatedBroker(Portfolio(cash=cash), costs)
     if name == "alpaca":
         if not live:
             typer.echo("error: --broker alpaca requires --live (real paper trading).", err=True)
@@ -728,8 +802,17 @@ def _run_benchmark(
     cash: float,
     start: datetime,
     end: datetime,
+    costs: CostConfig | None = None,
 ) -> BacktestResult | None:
     """Run the unconstrained buy-and-hold benchmark, or warn and return ``None``.
+
+    ``costs`` is the selected market's cost model (ADR-0060) and the benchmark pays
+    it too. It is *unconstrained* in the guardrail sense only — ADR-0037's point is
+    that the comparison must not be clamped — but a benchmark exempt from the
+    venue's fees would be a different thing entirely: on a 25 bps venue it would
+    beat the strategy by the fees the strategy paid and the benchmark did not, and
+    ADR-0039's paired bootstrap reads that curve. Buy-and-hold pays the fee roughly
+    once, which is precisely why it is the right baseline for a turnover cost.
 
     The benchmark is a comparison bolted onto a backtest that has *already*
     finished, so a benchmark that cannot be run must cost one warning line, not
@@ -749,7 +832,7 @@ def _run_benchmark(
     means the bench itself is faulty, which makes the strategy numbers suspect
     too, so it is left to propagate.
     """
-    bench_broker = SimulatedBroker(Portfolio(cash=cash))
+    bench_broker = SimulatedBroker(Portfolio(cash=cash), costs)
     engine = Engine(adapter, bench_broker, Guardrails(RiskConfig.unlimited()))
     try:
         bench = engine.run(get_strategy("buy_and_hold"), [symbol], start, end)
@@ -876,6 +959,8 @@ def backtest(
         "--halt-cooldown-bars",
         help=HALT_COOLDOWN_HELP,
     ),
+    slippage_bps: float | None = typer.Option(None, "--slippage-bps", help=SLIPPAGE_HELP),
+    taker_fee_bps: float | None = typer.Option(None, "--taker-fee-bps", help=TAKER_FEE_HELP),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
     ),
@@ -968,10 +1053,16 @@ def backtest(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
+    try:
+        costs = _build_costs(chosen_market.costs, slippage_bps, taker_fee_bps)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
     adapter = _make_adapter(source, cache_dir, seed, freq)
     if min_adv is not None:
         tickers = _apply_liquidity_screen(adapter, tickers, start, min_adv, adv_window)
-    broker = SimulatedBroker(Portfolio(cash=cash))
+    broker = SimulatedBroker(Portfolio(cash=cash), costs)
     result = Engine(adapter, broker, Guardrails(risk)).run(strat, tickers, start, end)
 
     # Optional buy-and-hold benchmark on the same dates/source, run UNCONSTRAINED
@@ -979,7 +1070,9 @@ def backtest(
     bench_result: BacktestResult | None = None
     bench_symbol = benchmark.strip().upper()
     if bench_symbol:
-        bench_result = _run_benchmark(adapter, bench_symbol, cash=cash, start=start, end=end)
+        bench_result = _run_benchmark(
+            adapter, bench_symbol, cash=cash, start=start, end=end, costs=costs
+        )
 
     # The bootstrap is computed ONCE here and handed to both the text summary and
     # result.json (ADR-0039). Neither derives it: a `result.json` must never
@@ -1201,6 +1294,8 @@ def paper(
         "--halt-cooldown-bars",
         help=HALT_COOLDOWN_HELP,
     ),
+    slippage_bps: float | None = typer.Option(None, "--slippage-bps", help=SLIPPAGE_HELP),
+    taker_fee_bps: float | None = typer.Option(None, "--taker-fee-bps", help=TAKER_FEE_HELP),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
     ),
@@ -1318,8 +1413,14 @@ def paper(
         and not chosen_market.calendar.is_continuous
     ):
         data_feed = "iex"
+    try:
+        costs = _build_costs(chosen_market.costs, slippage_bps, taker_fee_bps)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
     adapter = _make_adapter(source, cache_dir, seed, freq, data_feed)
-    broker = _make_paper_broker(broker_name, live, cash, chosen_market.calendar)
+    broker = _make_paper_broker(broker_name, live, cash, chosen_market.calendar, costs)
 
     # The clock and feed are the *only* difference between backtest and paper
     # (ADR-0002/0014). Live: wall clock over a recent-window feed, runs until
@@ -1383,9 +1484,17 @@ def paper(
     tracked_broker = broker
     shadow: ShadowBroker | None = None
     if divergence:
+        # The counterfactual runs the market's own cost model (ADR-0060), so the
+        # report measures the model this market would actually have used. Note what
+        # it still cannot see: the crypto term is a fee on notional, and ADR-0038's
+        # statistic is a ratio of fill price to reference price, so a 25 bps fee
+        # moves no reported bps figure. The summary therefore *states* the modelled
+        # fee alongside the slippage it can measure, rather than letting a clean
+        # slippage verdict read as a validated cost model (KAN-710 owns the fix).
         shadow = ShadowBroker(
             broker,
             clock,
+            costs=costs,
             price_notion=NOTION_RAW if live else NOTION_ADJUSTED,
             journal=DivergenceJournal(divergence_csv),
         )
@@ -1766,6 +1875,8 @@ def sweep(
         "--halt-cooldown-bars",
         help=HALT_COOLDOWN_HELP,
     ),
+    slippage_bps: float | None = typer.Option(None, "--slippage-bps", help=SLIPPAGE_HELP),
+    taker_fee_bps: float | None = typer.Option(None, "--taker-fee-bps", help=TAKER_FEE_HELP),
     no_guardrails: bool = typer.Option(
         False, "--no-guardrails", help="Disable risk guardrails (fully permissive)."
     ),
@@ -1831,6 +1942,12 @@ def sweep(
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(2) from exc
 
+    try:
+        costs = _build_costs(chosen_market.costs, slippage_bps, taker_fee_bps)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
     if folds > 0 and windows > 1:
         typer.echo(
             "error: --folds (true walk-forward) and --windows (plain per-window sweep) "
@@ -1861,6 +1978,7 @@ def sweep(
             rank_by=rank_by,
             cash=cash,
             risk=risk,
+            costs=costs,
             out=out,
             periods_per_year=freq.periods_per_year,
         )
@@ -1877,6 +1995,7 @@ def sweep(
         end,
         cash=cash,
         risk=risk,
+        costs=costs,
         windows=windows,
         periods_per_year=freq.periods_per_year,
     )
@@ -1998,6 +2117,7 @@ def _run_walk_forward_command(
     rank_by: str,
     cash: float,
     risk: RiskConfig,
+    costs: CostConfig,
     out: Path,
     periods_per_year: float,
 ) -> None:
@@ -2027,6 +2147,7 @@ def _run_walk_forward_command(
         rank_by=rank_by,
         cash=cash,
         risk=risk,
+        costs=costs,
         periods_per_year=periods_per_year,
     )
 

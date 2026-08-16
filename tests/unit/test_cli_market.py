@@ -224,6 +224,16 @@ class TestTheCalendarSeam:
     two ways at once. A committed-shape CSV is identical on both markets by
     construction, so the annualization basis is the only variable and the claim
     "nothing but the annualized figures moved" is actually being tested.
+
+    **Since ADR-0060 the CSV alone is no longer enough**, and both helpers below
+    therefore pin ``--taker-fee-bps 0`` on *both* invocations. ``--market`` now also
+    selects a cost model, so a crypto run pays Alpaca's 25 bps taker fee, fills at
+    different net prices, and produces a different equity curve — at which point
+    "only the annualized figures moved" is false and these three tests were right to
+    go red. Holding the fee equal restores the isolation this class exists for: it
+    is the *calendar* seam under test, not the cost seam, and the cost seam has its
+    own tests. The flag is passed to the equity run too, where it is a no-op (that
+    model's fee is already 0.0), so neither arm reads as the special case.
     """
 
     @staticmethod
@@ -261,6 +271,10 @@ class TestTheCalendarSeam:
                 "2021-01-04",
                 "--to",
                 "2021-03-31",
+                # Hold the ADR-0060 cost seam constant so the calendar is the only
+                # variable; see the class docstring.
+                "--taker-fee-bps",
+                "0",
                 *extra,
             ],
         )
@@ -311,6 +325,10 @@ class TestTheCalendarSeam:
                 "2021-01-04",
                 "--to",
                 "2021-03-31",
+                # Hold the ADR-0060 cost seam constant so the calendar is the only
+                # variable; see the class docstring.
+                "--taker-fee-bps",
+                "0",
                 *extra,
             ],
         )

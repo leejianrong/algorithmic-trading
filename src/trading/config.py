@@ -10,19 +10,120 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass
 
+# Alpaca's published **tier-1 taker** rate for crypto spot, in basis points
+# (ADR-0060). Source: https://docs.alpaca.markets/us/docs/crypto-fees — the
+# maker/taker schedule is tiered by trailing 30-day *crypto* volume, tier 1 is
+# "$0-$100K" and charges maker 0.15% / taker **0.25%**. Read 2026-08-14; the page
+# itself carries "Updated September 24, 2025".
+#
+# **Taker, not maker, because this bench cannot be a maker.** Every order it emits
+# is a market order (ADR-0004, and `sizing.py` produces nothing else), which by
+# definition crosses the spread and takes liquidity. No maker/taker switch is built:
+# it would be a knob with exactly one reachable setting.
+#
+# **Tier 1, because that is where this account sits and where it will stay.** The
+# paper account holds ~$100k, and tier 1 covers $0-$100K of trailing 30-day volume.
+# Whether Alpaca's *paper* venue simulates tiering at all is unknown and untested —
+# it is moot at this size, and tier 1 is the most expensive row, so assuming it is
+# the conservative direction.
+#
+# **The published number and the measured one agree exactly**, which is why this is
+# a sourced constant and not a fitted one. KAN-708 measured the paper venue taking
+# the fee in the *received* asset at ratios `0.99749936` and `0.99750000` against a
+# published `1 - 0.0025 = 0.9975` (ADR-0058 §5). Independent derivation, same
+# number, so nothing here was tuned to make a report look right.
+CRYPTO_TAKER_FEE_BPS = 25.0
+
 
 @dataclass(frozen=True, slots=True)
 class CostConfig:
-    """Trading cost assumptions applied by the simulated broker."""
+    """Trading cost assumptions applied by the simulated broker.
+
+    Three terms, and they are three *different physical quantities* rather than
+    three spellings of one (ADR-0060):
+
+    * ``slippage_bps`` — an adverse move on the fill price. A statement about the
+      *price* you get.
+    * ``commission_per_share`` — dollars per unit traded. Independent of price.
+    * ``taker_fee_bps`` — a fraction of the traded **notional**. Independent of
+      quantity.
+
+    ``commission_per_share`` cannot express the third: a percentage-of-notional fee
+    is not a per-share amount at any fixed conversion, because the conversion is the
+    price. So a term was **added** rather than the existing one restructured — a
+    venue may legitimately charge both, and folding them together would have meant
+    re-deriving one of them from a price at every call site.
+
+    **The defaults are a US-equity posture** and they do not move: 5 bps of slippage
+    and no commission, which is a commission-free equity broker. :meth:`equity`
+    names that posture and returns exactly ``CostConfig()``; :meth:`crypto` is the
+    24/7 posture and differs in **one field**. ADR-0055's shape, applied to costs.
+    """
 
     commission_per_share: float = 0.0
     slippage_bps: float = 5.0  # 5 basis points = 0.05% adverse move on each fill.
+    # A proportional fee on the traded notional, charged by the venue on top of
+    # whatever the price already cost. Zero for commission-free US equities, which
+    # is why every existing run is arithmetically untouched (ADR-0060).
+    taker_fee_bps: float = 0.0
 
     def __post_init__(self) -> None:
         if self.commission_per_share < 0:
             raise ValueError("commission_per_share must be non-negative")
         if self.slippage_bps < 0:
             raise ValueError("slippage_bps must be non-negative")
+        if self.taker_fee_bps < 0:
+            raise ValueError("taker_fee_bps must be non-negative")
+
+    @classmethod
+    def equity(cls) -> CostConfig:
+        """The US-equity cost posture — exactly the field defaults, named.
+
+        Returns ``cls()``. It exists so a caller choosing a market chooses one
+        *explicitly*, instead of the equity assumption being the unnamed thing that
+        happens when nobody chooses (ADR-0055's argument, ADR-0060's application).
+        Pinned equal to ``CostConfig()`` by a test.
+        """
+        return cls()
+
+    @classmethod
+    def crypto(cls, *, taker_fee_bps: float = CRYPTO_TAKER_FEE_BPS) -> CostConfig:
+        """The 24/7 cost posture: the equity slippage, plus the venue's taker fee.
+
+        Differs from :meth:`equity` in **exactly one field** — ``taker_fee_bps`` —
+        and a test diffs the two configs so a second change here turns red.
+
+        **``slippage_bps`` deliberately stays at 5.0**, and that restraint is the
+        point. ADR-0052 refused to re-tune it on **60** paired equity fills that
+        measured 0.51 bps against the model, on the grounds that the measurement was
+        the same order as the reference error, that Alpaca paper fills are
+        *simulated* rather than routed, and that one afternoon on one venue is not a
+        level. The crypto evidence available here is **three** paired fills (8.03,
+        35.29, 44.34 bps — ADR-0058), an eighth of ``MIN_PAIRED_FILLS``. Less
+        evidence cannot justify more tuning. KAN-710 owns that measurement.
+
+        So the one number that *does* move is the one that is **published and
+        independently confirmed**: ``CRYPTO_TAKER_FEE_BPS``, Alpaca's tier-1 taker
+        rate, sourced from the fee schedule and separately observed on the account
+        at the same value. See that constant for the URL, the date, and the tier.
+
+        ``taker_fee_bps`` may be overridden for a different volume tier, but it may
+        **not** be zero: a 24/7 posture that models a venue charging 25 bps as free
+        is precisely the flattering number this preset exists to prevent, and it is
+        not reachable from the published schedule either — the cheapest row on it is
+        tier 8's 0.10% taker, and only a *maker* ever pays 0.00%. It is a
+        ``ValueError``, not a silently free venue. Use ``CostConfig()`` if what you
+        want is the equity posture.
+        """
+        if taker_fee_bps <= 0:
+            raise ValueError(
+                "the 24/7 posture requires a positive taker fee: Alpaca's crypto "
+                f"venue charges {CRYPTO_TAKER_FEE_BPS:g} bps at tier 1 and takes it "
+                "in the received asset (ADR-0058 §5, ADR-0060). Modelling that as "
+                "free is the flattering number this preset exists to prevent. Use "
+                "CostConfig() for the commission-free equity posture instead."
+            )
+        return cls(taker_fee_bps=taker_fee_bps)
 
 
 # The one number the 24/7 (crypto) posture changes (ADR-0055). Everything else in
