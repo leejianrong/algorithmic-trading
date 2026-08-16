@@ -710,6 +710,27 @@ def test_deflated_winner_scores_the_top_ranked_run_against_the_whole_search() ->
     assert deflated.trial_sharpe_stdev is not None
 
 
+def test_deflated_winner_prior_trials_widens_the_count_and_never_lowers_the_null() -> None:
+    """ADR-0062: a ledger's cumulative count reaches the sweep the same way it
+    reaches a plain backtest — through ``prior_trials``, threaded to
+    ``deflated_sharpe`` unchanged."""
+    summary = run_sweep(
+        "sma_crossover",
+        {"fast": [5, 10, 15], "slow": [30, 50]},
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+    )
+    unledgered = summary.deflated_winner()
+    ledgered = summary.deflated_winner(prior_trials=18)
+    assert unledgered is not None
+    assert ledgered is not None
+    assert ledgered.trials == unledgered.trials + 18 == 24
+    assert ledgered.null_best_sharpe >= unledgered.null_best_sharpe
+    assert summary.deflated_winner(prior_trials=0) == unledgered
+
+
 def test_a_bigger_grid_raises_the_bar_the_winner_must_clear() -> None:
     """The point of KAN-619: searching harder makes the winner *less* impressive."""
     small = run_sweep(
