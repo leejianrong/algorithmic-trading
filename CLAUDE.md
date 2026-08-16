@@ -993,6 +993,41 @@ As of this writing:
   not have. Equity byte-identical across all 7 golden artifacts; `RESULT_SCHEMA_VERSION` stays
   **1**. Nine mutations turn 2/2/2/1/2/3/1/2/1 red — three initially turned **0**, including a
   string-slicing test that silently matched the whole file after a ruff reformat.
+- **Costs are per-market, and the crypto fee is sourced rather than fitted (2026-08-16, ADR-0060,
+  KAN-707):** `CostConfig` modelled commission-free US equities, and `commission_per_share`
+  cannot express a fraction of notional at **any** setting — the conversion between them *is*
+  the price — so from ADR-0058 until now `--market crypto` priced a ~25 bps venue as **free**.
+  Measured on a real backtest: adding the fee took a 2023 three-coin run from **+12.56% to
+  +8.55%**, Sharpe 1.79 → 1.23, and `--taker-fee-bps 0` reproduces the old figure **exactly**,
+  so the fee is provably the only change (independently reproduced by the PM). A **third term**
+  `taker_fee_bps` is added rather than the existing one restructured — price, dollars-per-unit
+  and fraction-of-notional are three different physical quantities — and
+  `CostConfig.equity()`/`.crypto()` follow ADR-0055's shape: a value not a branch, differing in
+  **one field**, with `slippage_bps` **held at 5.0** because ADR-0052 refused to re-tune on 60
+  paired fills and crypto has 3. `--market` selects costs as its **fourth seam**, and
+  `_MARKET_COSTS` refuses a market with no researched cost model rather than falling back —
+  the sharper case of ADR-0054's rule, since here the equity default is *free*.
+  **The number is published and measured, and the two agree exactly:** Alpaca's tier-1 taker is
+  0.25% (docs read 2026-08-14, page stamped "Updated September 24, 2025"), giving
+  `1 - 0.0025 = 0.9975` against KAN-708's independently measured `0.99749936` / `0.99750000`.
+  Two directions, same number. **The account is now at tier 2**, verified by the PM by
+  reconstructing trailing 30-day crypto notional from closed orders — **$100,636.53 across 53
+  filled orders**, crossing the $100K boundary *during KAN-708's own session* — so a run today
+  is charged **22 bps, not the 25 the default models**. That settles two ADR-0058 unknowns:
+  **the paper venue does simulate volume tiering**, and **the fee is not per-pair**. The
+  constant stays at tier 1 because a fresh account starts there and it is the most expensive
+  taker row, i.e. the conservative direction; `--taker-fee-bps` is the correction, and this is
+  recorded as the one thing modelled deliberately slightly wrong. **The headline limit:**
+  ADR-0038 compares **prices** while this fee is taken in **quantity**, so the one instrument
+  that validates a cost model **cannot see its largest crypto term** — the summary prints it
+  marked `NOT MEASURED BY THIS REPORT`, and **KAN-710 inherits that**. The fee is deliberately
+  **not** folded into the fill price: that would buy visibility by fabricating a 25 bps
+  divergence against every real fill. Charging it in cash keeps `apply_fill` the single
+  accounting path, at the cost of **funding** — measured, entry rejections roughly double
+  (27 → 52 over 50 seeds) while **0/50 runs end flat**, ADR-0037's retry absorbing it. Equity
+  byte-identical across all 7 artifacts; `RESULT_SCHEMA_VERSION` stays **1** (nothing added).
+  Nine mutations turn 8/3/12/1/2/5/1/2/1 red — **three initially turned 0**, because every test
+  built its broker directly and none exercised `cli.py` (ADR-0040's lesson, sixth sighting).
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -1120,6 +1155,16 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   invoked and no equity point recorded (ADR-0042). `_step` stays the only code that
   trades, in both modes.
 - **No implicit shorting; fractional-share quantities allowed** (ADR-0011).
+- **Trading costs belong to the market, and "free" is the most flattering wrong answer.**
+  A cost term the shared model cannot express is not mispriced, it is **absent** —
+  `commission_per_share` had nowhere to put a fraction of notional, so a crypto backtest
+  charged nothing at all and overstated a real run by 4 percentage points. A market with no
+  researched cost model is **unselectable**, never silently given the commission-free equity
+  one (ADR-0060). And never buy visibility by distortion: the venue's fee sits outside the
+  price it reports, so folding it into the modelled fill price would fabricate a divergence
+  against every real fill. Note the corollary — **cost is a function of liquidity, not of
+  asset class**: ADR-0052's 0.51 bps was measured on twenty mega-caps and must not be
+  extrapolated down the cap scale (KAN-861).
 - **A live session must survive being stopped:** SIGTERM takes the same finalizing
   exit Ctrl-C does, and a signal arriving *during* finalization is ignored so the
   artifacts are written whole (ADR-0033 as extended by ADR-0043). Signal handlers and
@@ -1171,7 +1216,10 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
 src/trading/
   types.py                 # core value types (implemented, tested)
   interfaces.py            # DI seams: DataAdapter, Broker, Strategy, RiskGuardrails
-  config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps)
+  config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps, no fee);
+                           #   CostConfig.equity()/.crypto() — costs are a per-market posture,
+                           #   taker_fee_bps is a fraction of notional the per-share term
+                           #   could never express (ADR-0060)
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5);
                            #   prime_history: a live session's opening window is warmup, not
                            #   orders — data only, no strategy/broker/curve (ADR-0042);
