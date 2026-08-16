@@ -164,6 +164,44 @@ class FillDivergence:
     reference_price: float | None
     live: Settlement
     shadow: Settlement
+    # The bar `reference_price` was taken from. Last and defaulted rather than
+    # beside the price it belongs to, so every existing construction of this row
+    # stays valid; see `reference_lag` for why it is worth carrying at all.
+    reference_ts: datetime | None = None
+
+    @property
+    def reference_lag(self) -> timedelta | None:
+        """How stale the reference open is: submitted bar → reference bar.
+
+        On a tape that serves a bar for every interval this is exactly one interval
+        and carries no information. On one with **holes** it is the measurement's
+        dominant contaminant, and it is invisible in every other column.
+
+        The reference is the open of the first bar the feed serves for the symbol
+        *after* submission (ADR-0038). When the venue skips intervals for a thin
+        pair, that bar can be many intervals later, so ``realized - reference``
+        folds in however far the price drifted in between — priced against a bar
+        that had not happened when the venue filled. Alpaca's crypto venue publishes
+        bars only for intervals it *traded*, and its own volume is not the market's:
+        measured over 2026-08-15, ``ETH/USD`` returned 137 of a possible 288 5m bars
+        (47.6%) against ``LINK/USD``'s 289. So a per-pair slippage spread on this
+        tape may be a statement about bar coverage rather than about execution, and
+        this column is what lets the two be told apart.
+
+        Drift is symmetric, so this inflates variance rather than biasing the mean —
+        *unless* the strategy's own signal is autocorrelated with it, which a
+        trend-following entry is. Recorded, not corrected.
+
+        One imprecision, stated rather than engineered away: ``submitted_ts`` is the
+        **universe's** newest bar stamp, not this symbol's, because ``submit`` is
+        never handed bars. With a universe wide enough that something trades every
+        interval those coincide, which is the case this was built for; on a narrow
+        universe of thin pairs the lag is measured from a clock that may run ahead
+        of the symbol, so it can read zero and in principle negative.
+        """
+        if self.reference_ts is None or self.submitted_ts is None:
+            return None
+        return self.reference_ts - self.submitted_ts
 
     @property
     def symbol(self) -> str:
@@ -285,6 +323,16 @@ class DivergenceSummary:
     # price. Carrying it here is what stops a clean slippage verdict from reading as
     # a validated cost model when the largest term in that model was never in scope.
     modelled_taker_fee_bps: float = 0.0
+    # How far the reference open post-dates the bar the order was decided on, over
+    # the comparable fills (ADR-0061). On a tape that serves a bar every interval
+    # these are all equal and say nothing; on one with holes the excess is drift
+    # that lands in every figure above. `stale` counts the rows lagging by more
+    # than the *tightest* lag seen, which is the report's only interval-free way of
+    # asking "did this tape skip", since it is never told the bar interval.
+    reference_lag_min: timedelta | None = None
+    reference_lag_median: timedelta | None = None
+    reference_lag_max: timedelta | None = None
+    stale_reference_fills: int = 0
 
     @property
     def conclusive(self) -> bool:
@@ -316,6 +364,8 @@ def summarize(
     realized = [bps for r in comparable if (bps := r.realized_slippage_bps) is not None]
     error_bps = [bps for r in comparable if (bps := r.slippage_error_bps) is not None]
     latencies = [lat for r in records if (lat := r.latency) is not None]
+    lags = sorted(lag for r in comparable if (lag := r.reference_lag) is not None)
+    tightest = lags[0] if lags else None
 
     return DivergenceSummary(
         price_notion=price_notion,
@@ -352,6 +402,14 @@ def summarize(
         unmatched_live_rejections=unmatched_live_rejections,
         submit_refusals=submit_refusals,
         errors=tuple(errors),
+        reference_lag_min=tightest,
+        reference_lag_median=(
+            timedelta(seconds=statistics.median(lag.total_seconds() for lag in lags))
+            if lags
+            else None
+        ),
+        reference_lag_max=lags[-1] if lags else None,
+        stale_reference_fills=sum(1 for lag in lags if tightest is not None and lag > tightest),
     )
 
 
@@ -377,6 +435,7 @@ class _Tracked:
     submitted_at: datetime
     submitted_ts: datetime | None
     reference_price: float | None = None
+    reference_ts: datetime | None = None
     live: Settlement | None = None
     shadow: Settlement | None = None
 
@@ -595,6 +654,7 @@ class ShadowBroker:
             bar = bars.get(tracked.order.symbol)
             if tracked.reference_price is None and bar is not None:
                 tracked.reference_price = bar.open
+                tracked.reference_ts = bar.ts
 
         self._run_shadow(bars, snapshot, ts, now)
         self._attribute_live(live_fills, live_rejections, ts, now)
@@ -764,6 +824,7 @@ class ShadowBroker:
             submitted_at=tracked.submitted_at,
             submitted_ts=tracked.submitted_ts,
             reference_price=tracked.reference_price,
+            reference_ts=tracked.reference_ts,
             live=tracked.live if tracked.live is not None else PENDING,
             shadow=tracked.shadow if tracked.shadow is not None else PENDING,
         )
@@ -787,6 +848,8 @@ CSV_COLUMNS = [
     "side",
     "order_qty",
     "reference_price",
+    "reference_ts",
+    "reference_lag_seconds",
     "live_outcome",
     "live_ts",
     "live_qty",
@@ -821,6 +884,7 @@ def divergence_rows(records: Sequence[FillDivergence]) -> list[dict[str, str]]:
     rows: list[dict[str, str]] = []
     for record in records:
         latency = record.latency
+        lag = record.reference_lag
         rows.append(
             {
                 "submitted_ts": _iso(record.submitted_ts),
@@ -829,6 +893,14 @@ def divergence_rows(records: Sequence[FillDivergence]) -> list[dict[str, str]]:
                 "side": record.side.value,
                 "order_qty": _num(record.order.qty),
                 "reference_price": _num(record.reference_price),
+                "reference_ts": _iso(record.reference_ts),
+                # `is not None`, not truthiness: `timedelta(0)` is falsy, and a zero
+                # lag is reachable — the submitted bar's timestamp is the universe's
+                # newest, so a symbol whose own bars trail the universe can have its
+                # next bar land on that same stamp. Rendering that as "" would drop
+                # the tightest lag in the run from the very analysis this column is
+                # for, and silently.
+                "reference_lag_seconds": _num(lag.total_seconds() if lag is not None else None),
                 "live_outcome": record.live.outcome,
                 "live_ts": _iso(record.live.ts),
                 "live_qty": _num(record.live.qty),
@@ -1011,6 +1083,26 @@ def render_report(
         "  an upper bound — a polling broker only notices a fill when it polls):",
         f"    mean {_seconds(summary.mean_latency)}    max {_seconds(summary.max_latency)}",
         "    model: the next bar, by construction",
+        # Printed only when the tape actually skipped, so a run on a tape that
+        # serves every interval is byte-identical to before (ADR-0060's rule for
+        # the fee line, applied again). When it *is* printed it qualifies every
+        # figure above it, which is why it sits here and not in a footnote.
+        *(
+            [
+                "",
+                f"  Reference staleness: {summary.stale_reference_fills} of {summary.comparable} "
+                "comparable fill(s) were priced",
+                f"    against a bar later than the tightest gap seen "
+                f"({_seconds(summary.reference_lag_min)}); median "
+                f"{_seconds(summary.reference_lag_median)}, worst "
+                f"{_seconds(summary.reference_lag_max)}.",
+                "    This tape skips intervals, so those references post-date the fill and the",
+                "    drift in between is inside the slippage above. Read a per-pair spread",
+                "    against the per-pair lag before calling it execution (ADR-0061).",
+            ]
+            if summary.stale_reference_fills
+            else []
+        ),
     ]
 
     diverged = [r for r in records if r.outcome_diverged]

@@ -663,3 +663,137 @@ class TestCsvOutput:
         path = tmp_path / "nested" / "fill_divergence.csv"
         write_divergence_csv([], path)
         assert path.read_text().splitlines()[0].startswith("submitted_ts,")
+
+
+def _bar_at(symbol: str, index: int, price: float) -> Bar:
+    """One bar at a chosen slot of the daily grid ``_bars`` walks."""
+    return Bar(
+        symbol=symbol,
+        ts=START + timedelta(days=index),
+        open=price,
+        high=price * 1.03,
+        low=price * 0.99,
+        close=price * 1.02,
+        volume=1_000,
+    )
+
+
+class TestReferenceStaleness:
+    """How old the reference open is — the contaminant on a tape with holes.
+
+    Alpaca's crypto venue publishes a bar only for an interval it actually traded,
+    on its own volume rather than the market's, so a thin pair skips intervals
+    (measured 2026-08-15: ``ETH/USD`` returned 137 of a possible 288 5m bars against
+    ``LINK/USD``'s 289). The reference is the first bar the feed serves *after*
+    submission, so on such a pair it can be minutes late and the "slippage" quietly
+    absorbs the drift in between. Nothing else in the row shows this.
+    """
+
+    def _run(self, reference_slot: int, reference_open: float = 110.0) -> FillDivergence:
+        """Submit on the bar at slot 0; serve the symbol's next bar at ``slot``."""
+        client = FakeAlpacaClient({"AAA": [_bar_at("AAA", 0, 100.0)]}, cash=10_000.0)
+        client.set_price("AAA", 100.0)  # the venue fills exactly at the submit price
+        live = AlpacaBroker(client, clock=_clock())
+        shadow = ShadowBroker(live, _clock())
+
+        shadow.on_bar({"AAA": _bar_at("AAA", 0, 100.0)})
+        shadow.submit(Order("AAA", Side.BUY, qty=10))
+        for slot in range(1, reference_slot):
+            # The venue traded something else; our symbol has no bar at all.
+            shadow.on_bar({"BBB": _bar_at("BBB", slot, 7.0)})
+        shadow.on_bar({"AAA": _bar_at("AAA", reference_slot, reference_open)})
+        (record,) = shadow.divergences
+        return record
+
+    def test_a_dense_tape_lags_by_exactly_one_interval(self) -> None:
+        record = self._run(reference_slot=1)
+        assert record.reference_ts == START + timedelta(days=1)
+        assert record.reference_lag == timedelta(days=1)
+
+    def test_a_gap_in_the_symbols_bars_shows_up_as_a_longer_lag(self) -> None:
+        record = self._run(reference_slot=4)
+        assert record.reference_ts == START + timedelta(days=4)
+        assert record.reference_lag == timedelta(days=4)
+
+    def test_the_drift_over_that_gap_lands_in_the_realized_slippage(self) -> None:
+        """The number the report would quote, with nothing else to explain it.
+
+        Both runs fill at exactly 100.0 — the venue charged nothing at all. The
+        dense one prices that against the very next bar, which opened where the fill
+        landed, and scores it honestly. The gapped one prices it against a bar three
+        intervals later that has drifted 10% up, and reports a 909 bps *price
+        improvement*. Same execution, opposite verdict, and only ``reference_lag``
+        distinguishes them.
+        """
+        dense = self._run(reference_slot=1, reference_open=100.0)
+        gapped = self._run(reference_slot=4, reference_open=110.0)
+        assert dense.live.price == pytest.approx(100.0)
+        assert gapped.live.price == pytest.approx(100.0)
+        assert dense.realized_slippage_bps == pytest.approx(0.0)
+        assert gapped.realized_slippage_bps == pytest.approx(-909.09, abs=0.01)
+
+    def test_the_lag_reaches_the_csv_alongside_the_reference_it_explains(self) -> None:
+        (row,) = divergence_rows([self._run(reference_slot=4)])
+        assert row["reference_ts"] == (START + timedelta(days=4)).isoformat()
+        assert float(row["reference_lag_seconds"]) == pytest.approx(4 * 86_400)
+
+    def test_a_dense_tape_prints_no_staleness_line_at_all(self) -> None:
+        """Equity is dense, so its block must be exactly what it was before.
+
+        The report is never told the bar interval (ADR-0022), so "did this tape
+        skip" is asked against the *tightest* lag the run itself saw. When every
+        lag is that lag, nothing is stale and nothing is printed.
+        """
+        records = [self._run(reference_slot=1), self._run(reference_slot=1)]
+        summary = summarize(records)
+        assert summary.stale_reference_fills == 0
+        assert summary.reference_lag_min == summary.reference_lag_max == timedelta(days=1)
+        assert "Reference staleness" not in render_report(summary, records)
+
+    def test_a_skipping_tape_says_so_over_the_figures_it_qualifies(self) -> None:
+        records = [self._run(reference_slot=1), self._run(reference_slot=4)]
+        summary = summarize(records)
+        assert summary.stale_reference_fills == 1
+        assert summary.reference_lag_min == timedelta(days=1)
+        assert summary.reference_lag_max == timedelta(days=4)
+        report = render_report(summary, records)
+        assert "Reference staleness: 1 of 2 comparable fill(s)" in report
+        # Above the verdict, because it qualifies the numbers rather than following
+        # from them.
+        assert report.index("Reference staleness") < report.index("VERDICT")
+
+    def test_a_zero_lag_renders_as_zero_and_not_as_absent(self) -> None:
+        """`timedelta(0)` is falsy, and a zero lag is reachable, not hypothetical.
+
+        ``submitted_ts`` is the *universe's* newest bar stamp, so a symbol whose own
+        bars trail the universe can have its next bar land on that same stamp.
+        Rendering it as "" would drop the tightest lag in the run out of the very
+        analysis this column exists for, and silently — the row would still carry
+        its slippage, so nothing would look missing.
+        """
+        record = FillDivergence(
+            order=Order("AAA", Side.BUY, qty=1),
+            submitted_at=START,
+            submitted_ts=START,
+            reference_price=100.0,
+            reference_ts=START,
+            live=Settlement(OUTCOME_FILLED, price=100.0, qty=1.0),
+            shadow=Settlement(OUTCOME_FILLED, price=100.05, qty=1.0),
+        )
+        assert record.reference_lag == timedelta(0)
+        (row,) = divergence_rows([record])
+        assert row["reference_lag_seconds"] == "0.0"
+
+    def test_an_order_that_never_saw_a_bar_has_no_lag_rather_than_zero(self) -> None:
+        record = FillDivergence(
+            order=Order("AAA", Side.BUY, qty=1),
+            submitted_at=START,
+            submitted_ts=START,
+            reference_price=None,
+            live=Settlement(OUTCOME_PENDING),
+            shadow=Settlement(OUTCOME_PENDING),
+        )
+        assert record.reference_lag is None
+        (row,) = divergence_rows([record])
+        assert row["reference_ts"] == ""
+        assert row["reference_lag_seconds"] == ""
