@@ -15,6 +15,13 @@
 > One thing the 2026-08-10 run changed about the procedure: **a session ends holding
 > its book**, and leaves working orders that fill at the next open. Flattening is a
 > manual step afterwards — see "After the run".
+>
+> **Running this on crypto instead?** Most of this page still applies, but a market
+> with no close changes enough to be dangerous — nothing ends the session, a dry run
+> is not free, orders are GTC and never expire, and the venue's fee is a second
+> measurement this report structurally cannot make. The delta is
+> [`crypto-divergence-run.md`](crypto-divergence-run.md); read it *instead of*
+> guessing which parts of this one still hold.
 
 ## What we are measuring
 

@@ -138,6 +138,8 @@ class TestRowsReachDiskAsTheySettle:
                     "side",
                     "order_qty",
                     "reference_price",
+                    "reference_ts",
+                    "reference_lag_seconds",
                     "live_outcome",
                     "live_ts",
                     "live_qty",

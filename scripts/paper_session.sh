@@ -22,6 +22,22 @@ PAPER_STRATEGY="${PAPER_STRATEGY:-sma_crossover}"
 PAPER_SYMBOLS="${PAPER_SYMBOLS:-@blue20}"
 PAPER_INTERVAL="${PAPER_INTERVAL:-5m}"
 PAPER_DATE="${PAPER_DATE:-2026-08-10}"
+# Which market the session trades (ADR-0057): calendar, completeness policy, risk
+# posture and cost model all come from this one flag. `us_equity` reproduces every
+# launch this script made before it existed.
+PAPER_MARKET="${PAPER_MARKET:-us_equity}"
+# ADR-0034's IEX tape is EQUITY-ONLY (ADR-0058 §9): `CryptoBarsRequest` has no
+# `feed` field, so `RealAlpacaClient` *refuses* feed-plus-crypto at construction.
+# A hardcoded `--data-feed iex` therefore made `--market crypto` unlaunchable from
+# here -- the run died before any network call. The CLI already selects `iex` for a
+# live equity session by itself, so this default is the runbook's text rather than
+# a behavioural knob; empty means "let the CLI decide".
+# Crypto CLEARS it unconditionally rather than defaulting it away: a feed on the
+# crypto venue is always an error, so the launcher must never be able to emit one.
+case "$PAPER_MARKET" in
+crypto | crypto_24_7) PAPER_DATA_FEED="" ;;
+*) PAPER_DATA_FEED="${PAPER_DATA_FEED:-iex}" ;;
+esac
 PAPER_OUT_ROOT="${PAPER_OUT_ROOT:-results/paper}"
 PAPER_ENV_FILE="${PAPER_ENV_FILE:-.env}"
 PAPER_LABEL="${PAPER_LABEL:-}"
@@ -53,15 +69,18 @@ build_cmd() {
 		--strategy "$PAPER_STRATEGY"
 		--symbols "$PAPER_SYMBOLS"
 		--interval "$PAPER_INTERVAL"
+		--market "$PAPER_MARKET"
 		--source alpaca
 		--broker alpaca
 		--live
-		--data-feed iex
 		--divergence
 		--from "$PAPER_DATE"
 		--to "$PAPER_DATE"
 		--out "$out"
 	)
+	if [ -n "$PAPER_DATA_FEED" ]; then
+		CMD+=(--data-feed "$PAPER_DATA_FEED")
+	fi
 	if [ -n "$PAPER_EXTRA_ARGS" ]; then
 		# Deliberately word-split: this carries flags like `--max-empty-polls 1`.
 		read -r -a extra <<<"$PAPER_EXTRA_ARGS"

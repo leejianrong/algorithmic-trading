@@ -82,6 +82,14 @@ ci-local:  ## Everything on CI's merge path, locally (the six required checks).
 PAPER_STRATEGY ?= sma_crossover
 PAPER_SYMBOLS ?= @blue20
 PAPER_INTERVAL ?= 5m
+# us_equity | crypto. Picks calendar, completeness, risk posture and costs at once
+# (ADR-0057/0060) -- and on crypto it also drops --data-feed, which the crypto
+# client refuses at construction (ADR-0058 §9). The crypto divergence run is
+#   make paper-live PAPER_MARKET=crypto PAPER_SYMBOLS=@crypto10 \
+#       PAPER_EXTRA_ARGS="--max-position 0.01"
+# -- see docs/crypto-divergence-run.md.
+PAPER_MARKET ?= us_equity
+PAPER_DATA_FEED ?=
 PAPER_DATE ?= 2026-08-10
 PAPER_OUT_ROOT ?= results/paper
 PAPER_ENV_FILE ?= .env
@@ -92,7 +100,8 @@ PAPER_EXTRA_ARGS ?=
 PAPER_OUT ?=
 # auto (tmux if installed, else setsid) | tmux | setsid.
 PAPER_LAUNCHER ?= auto
-export PAPER_STRATEGY PAPER_SYMBOLS PAPER_INTERVAL PAPER_DATE PAPER_OUT_ROOT PAPER_ENV_FILE
+export PAPER_STRATEGY PAPER_SYMBOLS PAPER_INTERVAL PAPER_MARKET PAPER_DATA_FEED
+export PAPER_DATE PAPER_OUT_ROOT PAPER_ENV_FILE
 export PAPER_EXTRA_ARGS PAPER_OUT PAPER_LAUNCHER
 # `uv run --env-file` errors on a missing file, and the keys may already be
 # exported, so the flag is conditional on the file being there.
