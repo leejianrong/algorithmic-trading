@@ -56,7 +56,7 @@ from statistics import fmean, median
 from typing import TYPE_CHECKING, cast
 
 from trading.broker import SimulatedBroker
-from trading.config import RiskConfig
+from trading.config import CostConfig, RiskConfig
 from trading.engine import EmptyUniverseError, Engine
 from trading.frequency import TRADING_DAYS_PER_YEAR
 from trading.metrics import (
@@ -384,6 +384,7 @@ def _run_combo(
     *,
     cash: float,
     risk: RiskConfig,
+    costs: CostConfig,
     periods_per_year: float,
 ) -> tuple[PerformanceMetrics, int, ReturnMoments | None]:
     """Run one combo over one span; return its metrics, bar count, and moments.
@@ -417,7 +418,7 @@ def _run_combo(
     predate a whole universe's listings. Callers catch it and record the span as
     unusable, which is why this does not swallow it here.
     """
-    broker = SimulatedBroker(Portfolio(cash=cash))
+    broker = SimulatedBroker(Portfolio(cash=cash), costs)
     engine = Engine(adapter, broker, Guardrails(risk))
     result = engine.run(_build_strategy(strategy, combo), tickers, start, end)
     return (
@@ -467,6 +468,7 @@ def run_sweep(
     *,
     cash: float = 1_000.0,
     risk: RiskConfig | None = None,
+    costs: CostConfig | None = None,
     windows: int = 1,
     periods_per_year: float = DEFAULT_PERIODS_PER_YEAR,
 ) -> SweepSummary:
@@ -500,6 +502,7 @@ def run_sweep(
 
     tickers = list(symbols)
     risk_config = risk if risk is not None else RiskConfig()
+    cost_config = costs if costs is not None else CostConfig()
     spans = split_windows(start, end, windows)
     runnable, skipped = _partition_grid(strategy, grid)
 
@@ -517,6 +520,7 @@ def run_sweep(
                     win_end,
                     cash=cash,
                     risk=risk_config,
+                    costs=cost_config,
                     periods_per_year=periods_per_year,
                 )
             except EmptyUniverseError as exc:
@@ -712,6 +716,7 @@ def run_walk_forward(
     rank_by: str = "sharpe",
     cash: float = 1_000.0,
     risk: RiskConfig | None = None,
+    costs: CostConfig | None = None,
     periods_per_year: float = DEFAULT_PERIODS_PER_YEAR,
 ) -> WalkForwardSummary:
     """Walk ``[start, end]`` forward, optimizing on IS and testing once on OOS.
@@ -749,6 +754,7 @@ def run_walk_forward(
 
     tickers = list(symbols)
     risk_config = risk if risk is not None else RiskConfig()
+    cost_config = costs if costs is not None else CostConfig()
     spans = split_folds(start, end, folds, mode=mode)
     runnable, skipped = _partition_grid(strategy, grid)
 
@@ -789,6 +795,7 @@ def run_walk_forward(
                     span.is_end,
                     cash=cash,
                     risk=risk_config,
+                    costs=cost_config,
                     periods_per_year=periods_per_year,
                 )
                 scored.append(_Scored(combo=combo, metrics=metrics, points=points))
@@ -810,6 +817,7 @@ def run_walk_forward(
                 span.oos_end,
                 cash=cash,
                 risk=risk_config,
+                costs=cost_config,
                 periods_per_year=periods_per_year,
             )
         except EmptyUniverseError as exc:

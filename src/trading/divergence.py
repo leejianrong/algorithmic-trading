@@ -277,6 +277,14 @@ class DivergenceSummary:
     submit_refusals: int = 0
     errors: tuple[str, ...] = ()
     min_samples: int = MIN_PAIRED_FILLS
+    # Stated, never measured (ADR-0060). Every statistic above is derived from
+    # `FillDivergence._adverse_bps`, a ratio of fill price to reference price — so a
+    # fee charged on notional and taken out of the *received asset* moves none of
+    # them, on either side: the venue reports the same execution price whether it
+    # charges 0 or 25 bps, and the counterfactual's fee is likewise outside the
+    # price. Carrying it here is what stops a clean slippage verdict from reading as
+    # a validated cost model when the largest term in that model was never in scope.
+    modelled_taker_fee_bps: float = 0.0
 
     @property
     def conclusive(self) -> bool:
@@ -313,6 +321,7 @@ def summarize(
         price_notion=price_notion,
         modelled_slippage_bps=config.slippage_bps,
         modelled_commission_per_share=config.commission_per_share,
+        modelled_taker_fee_bps=config.taker_fee_bps,
         orders=len(records),
         comparable=len(comparable),
         outcome_divergences=sum(1 for r in records if r.outcome_diverged),
@@ -962,6 +971,20 @@ def render_report(
         f"  Price notion:      {summary.price_notion} (both sides; never mixed — ADR-0021)",
         f"  Cost model:        {summary.modelled_slippage_bps:.2f} bps slippage, "
         f"${summary.modelled_commission_per_share:.4f}/share commission",
+        # Printed only when there is one, so an equity run's block is byte-identical
+        # (ADR-0060). When there IS one it is the largest term in the model and the
+        # least visible, so it says so in words rather than printing a bare number
+        # under a heading that reads as "what this report just checked".
+        *(
+            [
+                f"  Venue fee:         {summary.modelled_taker_fee_bps:.2f} bps of notional — "
+                "NOT MEASURED BY THIS REPORT. The figures below compare fill prices, "
+                "and this fee is taken out of the received asset, so it moves neither "
+                "the realized nor the modelled number (ADR-0060, KAN-710)."
+            ]
+            if summary.modelled_taker_fee_bps
+            else []
+        ),
         f"  Orders tracked:    {summary.orders} (accepted by the live broker)",
         *(
             [
