@@ -173,7 +173,7 @@ requested-range assertion `test_liquidity.py` already uses for `screen_by_adv`.
 `config.py` names the tier's rate; `liquidity.py` names the tier's floor:
 
 ```python
-LIQUID_TIER_SLIPPAGE_BPS = 2.0       # config.py
+LIQUID_TIER_SLIPPAGE_BPS = 2.0  # config.py
 DEFAULT_TIER_ADV_FLOOR = 1_000_000_000.0  # liquidity.py, $1B/day
 ```
 
