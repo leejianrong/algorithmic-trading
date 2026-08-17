@@ -14,6 +14,11 @@ When the caller supplies a :class:`~trading.metrics.SignificanceReport` it also
 renders the ADR-0039 block — the bootstrap confidence interval on Sharpe, the
 paired beats-the-benchmark win rate, and the trial-count deflation — and again,
 omitting it leaves the summary byte-identical.
+When the caller supplies a :class:`~trading.metrics.RegimeReport` it also renders
+the ADR-0066 regime-split block — the same headline figures restricted to the
+run's own high/low-volatility and trending/mean-reverting bars, alongside (never
+instead of) the whole-run numbers — and again, omitting it leaves the summary
+byte-identical.
 ``write_equity_csv`` writes one
 row per trading day with an ``exposure`` column and, when a benchmark run is
 supplied, a ``benchmark_equity`` column aligned by timestamp. ``write_equity_png``
@@ -34,6 +39,7 @@ from trading.calendar import US_EQUITY, get_calendar
 from trading.frequency import Frequency
 from trading.metrics import (
     DEFLATED_SHARPE_CONFIDENCE,
+    MIN_BOOTSTRAP_OBSERVATIONS,
     MIN_TRADES_PER_PARAMETER,
     compare_to_benchmark,
     compute,
@@ -46,6 +52,8 @@ if TYPE_CHECKING:
         DeflatedSharpe,
         PairedBootstrap,
         PerformanceMetrics,
+        RegimeMetrics,
+        RegimeReport,
         SharpeInterval,
         SignificanceReport,
     )
@@ -75,6 +83,7 @@ def summarize(
     periods_per_year: float = 252.0,
     free_parameters: int | None = None,
     significance: SignificanceReport | None = None,
+    regimes: RegimeReport | None = None,
 ) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
 
@@ -98,6 +107,12 @@ def summarize(
     caller-supplied rather than computed here because a bootstrap is the most
     expensive thing in the report by an order of magnitude, and because a run that
     does not ask for it must print exactly the bytes it always has.
+
+    ``regimes`` (from :func:`trading.metrics.compute_regime_report`, ADR-0066)
+    appends the regime-split block: the same headline figures restricted to the
+    run's own high/low-volatility and trending/mean-reverting bars. Caller-supplied
+    for the same reason ``significance`` is — computing it here would mean a run
+    that never asked for it pays the cost, and its bytes must stay byte-identical.
     """
     metrics = compute(result, periods_per_year, free_parameters=free_parameters)
     lines = [f"Symbols:       {', '.join(result.symbols)}"]
@@ -149,6 +164,8 @@ def summarize(
         )
     if significance is not None:
         lines.extend(significance_lines(significance))
+    if regimes is not None:
+        lines.extend(regime_lines(regimes))
     if result.rejections:
         lines.append(f"Rejected:      {len(result.rejections)} order(s)")
     if result.clamps:
@@ -395,6 +412,59 @@ def summarize_significance(significance: SignificanceReport | None) -> str:
     return "\n".join(significance_lines(significance))
 
 
+def _regime_metrics_lines(label: str, regime: RegimeMetrics) -> list[str]:
+    """One regime slice's headline figures, on the same one-line-per-figure shape
+    the whole-run block above uses.
+
+    Prints the figures whether or not the slice :attr:`~RegimeMetrics.underpowered`
+    — the reader decides what to trust, exactly as ADR-0029 does for a thin
+    trades-per-parameter ratio — but a too-thin slice gets an explicit warning
+    line naming the floor it missed, rather than a caveat buried in ``notes``.
+    """
+    m = regime.metrics
+    lines = [
+        f"  {label:<14} bars={regime.bar_count:<5} "
+        f"return={m.total_return * 100:+7.2f}%  ann={m.annualized_return * 100:+7.2f}%  "
+        f"Sharpe={m.sharpe:+.2f}  Sortino={m.sortino:+.2f}  Calmar={m.calmar:+.2f}  "
+        f"maxDD={m.max_drawdown * 100:6.2f}%"
+    ]
+    if regime.underpowered:
+        lines.append(
+            f"    ⚠ {regime.bar_count} return period(s) is below "
+            f"{MIN_BOOTSTRAP_OBSERVATIONS} — too thin to read this slice's Sharpe/Sortino/"
+            "Calmar as a measurement"
+        )
+    return lines
+
+
+def regime_lines(regimes: RegimeReport) -> list[str]:
+    """Render the whole ADR-0066 regime-split block, notes included.
+
+    Two independent splits — volatility (high/low) and trend (trending/mean-
+    reverting) — each restricted to the run's *own* :class:`PerformanceMetrics`,
+    on top of (never instead of) the whole-run figures ``summarize`` already
+    printed. When the curve was too short to classify even one bar, every slot is
+    ``None`` and the block is just the one explanatory note.
+    """
+    if regimes.vol_threshold is None or regimes.trend_threshold is None:
+        return [f"  note: {note}" for note in regimes.notes]
+    assert regimes.high_vol is not None
+    assert regimes.low_vol is not None
+    assert regimes.trending is not None
+    assert regimes.mean_reverting is not None
+    lines = [
+        f"Regimes (window={regimes.window} bars; vol split @ "
+        f"{regimes.vol_threshold * 100:.2f}% ann., trend split @ "
+        f"{regimes.trend_threshold:.2f} efficiency ratio):"
+    ]
+    lines.extend(_regime_metrics_lines("high_vol", regimes.high_vol))
+    lines.extend(_regime_metrics_lines("low_vol", regimes.low_vol))
+    lines.extend(_regime_metrics_lines("trending", regimes.trending))
+    lines.extend(_regime_metrics_lines("mean_reverting", regimes.mean_reverting))
+    lines.extend(f"  note: {note}" for note in regimes.notes)
+    return lines
+
+
 def _halt_episode_lines(result: BacktestResult) -> list[str]:
     """The halt-episode count line, when opt-in recovery actually did something.
 
@@ -559,6 +629,7 @@ def result_to_dict(
     benchmark_metrics: BenchmarkComparison | None = None,
     periods_per_year: float | None = None,
     significance: SignificanceReport | None = None,
+    regimes: RegimeReport | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
 
@@ -628,19 +699,33 @@ def result_to_dict(
                    "episodes": [
                      {"halt_ts": iso8601 str, "resume_ts": iso8601 str | null,
                       "reason": str}, ...
-                   ]}
+                   ]},
+          "regimes": {   # ADR-0066, additive; KEY OMITTED ENTIRELY when not computed
+            "window": int, "vol_threshold": float | null, "trend_threshold": float | null,
+            "high_vol": {"label": str, "bar_count": int,
+                         "metrics": dataclasses.asdict(PerformanceMetrics)} | null,
+            "low_vol": same shape as "high_vol" | null,
+            "trending": same shape as "high_vol" | null,
+            "mean_reverting": same shape as "high_vol" | null,
+            "notes": list[str]
+          }   # present only when the caller supplied a RegimeReport
         }
 
     The ``episode_count``/``episodes`` keys (ADR-0031), the top-level ``absent``
     list (ADR-0032), the top-level ``benchmark_metrics`` block plus the
     ``metrics.return_per_unit_exposure`` field (ADR-0037), the top-level
-    ``significance`` block (ADR-0039), and the top-level ``market`` name
-    (ADR-0057) are purely additive:
+    ``significance`` block (ADR-0039), the top-level ``market`` name (ADR-0057),
+    and the top-level ``regimes`` block (ADR-0066) are purely additive:
     every pre-existing key keeps its exact meaning and value — ``symbols`` is
     still the *requested* universe, ``metrics`` is still exactly
     ``dataclasses.asdict`` of what the caller passed — so
     ``RESULT_SCHEMA_VERSION`` does **not** move (see the constant's note). A v1
-    reader that ignores them behaves exactly as it did.
+    reader that ignores them behaves exactly as it did. ``regimes`` is the one key
+    among these that is **omitted** rather than emitted as ``null`` when absent
+    (every other one keeps the always-present-null shape) — chosen so a run that
+    never passes ``--regimes`` writes the byte-identical document it always has;
+    a v1 reader already tolerates a missing key exactly as it tolerates a ``null``
+    one, so nothing downstream distinguishes the two conventions.
 
     ``benchmark_metrics`` sits at the top level rather than inside ``metrics``
     because it describes a *relation between two runs*, not a property of this
@@ -690,8 +775,16 @@ def result_to_dict(
         is **never derived here**: a bootstrap costs thousands of Sharpe
         computations, so writing a ``result.json`` must not silently pay for one
         the caller did not ask for.
+    regimes:
+        An already-computed :class:`~trading.metrics.RegimeReport` (ADR-0066), or
+        ``None``. Never derived here, for the same reason ``significance`` is not:
+        a run that did not ask for the regime split must not silently pay for it.
+        Unlike ``significance`` — present as ``null`` even when absent — the
+        ``regimes`` key is **omitted entirely** when ``None``, so a run that never
+        passes ``--regimes`` emits the exact bytes it always has (pinned by a CLI
+        golden); the key appears only once a caller actually supplies a report.
     """
-    return {
+    payload: dict[str, Any] = {
         "schema_version": RESULT_SCHEMA_VERSION,
         "mode": mode,
         "frequency": frequency,
@@ -773,6 +866,12 @@ def result_to_dict(
             ],
         },
     }
+    # The regime-split block (ADR-0066). Omitted entirely — not even a ``null`` —
+    # when the caller did not supply one, so a run without ``--regimes`` writes the
+    # exact bytes it always has, unlike ``significance``'s always-present ``null``.
+    if regimes is not None:
+        payload["regimes"] = asdict(regimes)
+    return payload
 
 
 def write_result_json(
@@ -787,6 +886,7 @@ def write_result_json(
     benchmark_metrics: BenchmarkComparison | None = None,
     periods_per_year: float | None = None,
     significance: SignificanceReport | None = None,
+    regimes: RegimeReport | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
 
@@ -803,6 +903,7 @@ def write_result_json(
         benchmark_metrics=benchmark_metrics,
         periods_per_year=periods_per_year,
         significance=significance,
+        regimes=regimes,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:
