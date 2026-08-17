@@ -1071,33 +1071,147 @@ As of this writing:
   tape). In this run staleness was nearly absent (10/11 references exactly one interval old), so
   the +13.02 bps mean is not a staleness artifact here — but the coverage table says a longer or
   thinner-pair run will not be so lucky (tracked as **KAN-863**).
+- **A cross-invocation trial ledger widens the deflation, and cannot widen its spread
+  (2026-08-17, ADR-0062, KAN-858):** `deflated_sharpe`/`assess_significance`/
+  `SweepSummary.deflated_winner` (ADR-0039) only ever saw one invocation's trial
+  count, so an operator who hand-tried six strategies across twenty sessions had a
+  correction systematically too generous in exact proportion to how much research
+  was actually done. `trading.ledger.TrialLedger` is a plain append-only JSONL file
+  — one `TrialRecord` per invocation (command, strategy, symbols, range, interval,
+  market, trial count, observed Sharpe, an as-yet-unenforced `hypothesis` string),
+  durable the same three-call way `DivergenceJournal` (ADR-0048) is, tolerating a
+  torn final line from a crash but raising on any other corruption. New
+  `backtest --ledger PATH --hypothesis TEXT` / `sweep --ledger PATH --hypothesis
+  TEXT` append to it and widen `deflated_sharpe`'s new keyword-only `prior_trials`
+  — the **count** only, never the spread (`sharpe_stdev` still comes from this
+  invocation's own trials alone, proved never to make significance easier to claim
+  as `prior_trials` grows). Defaults to `0` everywhere, so every pre-ledger call
+  site is byte-for-byte unchanged. `--folds` walk-forward is **not** wired to it
+  (KAN-677 remains open). Unblocks KAN-862's pre-registration playbook, which
+  needs somewhere to put a hypothesis before it can enforce it was written first.
+- **The research playbook: pre-registration and the kill criteria (2026-08-18,
+  KAN-862):** `docs/research-playbook.md` is the repeatable hypothesis-to-live-capital
+  loop this bench's validation tooling exists to enforce, written operationally like
+  `docs/monday-divergence-run.md` rather than as an essay — 11 steps, hypothesis
+  (naming the mechanism **and** the counterparty) through freeze-universe/costs/OOS,
+  cheap in-sample kills, `sweep --ledger --hypothesis` IS optimisation, one true OOS
+  shot via `--folds`, a robustness battery, cumulative-ledger deflation, portfolio
+  fit, paper incubation, micro-live, and scale/retire against criteria written at
+  step 1. Every worked command was actually run and its real output pasted in. Names
+  what's still a gap rather than describing it as built: no `--folds`↔`--ledger`
+  wiring (KAN-677), no portfolio-fit correlation CLI (library call only), `paper`
+  has neither `--bootstrap` nor `--ledger`, and (at the time it was written) the
+  robustness battery's parameter heatmap/regime-split/Monte Carlo items were still
+  open — see the three bullets below, landed the same day.
+- **A sweep's parameter cliff is now visible (2026-08-18, ADR-0065, KAN-620):** a
+  flat, best-first sweep CSV couldn't answer whether a winning combo sits on a
+  plateau or a spike a real search would not reliably land on again.
+  `sweep.neighbor_stability` (+ `SweepSummary.combo_scores`/`stability`) looks up
+  each combo's immediate neighbour in every swept grid dimension — positionally in
+  the grid's own list order, holding other parameters fixed — and reports the
+  combo's own score next to the mean of whichever neighbours also ran;
+  `gap = score − neighbor_mean` names the cliff, and a missing/rejected neighbour is
+  excluded rather than zeroed. Read-only reporting on top of what `run_sweep`
+  already computes: `SweepSummary` gains one additive `grid` field, nothing about
+  ranking or the existing CSV changes. CLI: `sweep --stability` (off by default)
+  writes a sibling `*_stability.csv` and prints a plain ASCII heatmap for a
+  two-`--param` grid; combined with `--folds` it prints a note and writes nothing —
+  walk-forward has no stability view of its own yet (same shape as KAN-677's gap).
+- **Point-in-time S&P 500 universe on free data (2026-08-18, ADR-0064, KAN-631):**
+  rescoped from "buy PIT data" to "fix what free data allows, measure what remains"
+  after the owner ruled out a paid vendor. `trading.data.sp500_membership`
+  reconstructs real S&P 500 membership for any date from a committed, MIT-licensed,
+  Wikipedia-derived fixture (`tests/fixtures/sp500_membership/sp500_changes.csv`,
+  694 change-rows). The card cited a thinner secondhand dataset recommending a
+  ~2010 usable floor; measured directly against the fixture actually used, coverage
+  is denser than that (10-42 change-dates/year in every decade from 1996 on, three
+  corporate-history spot checks — TSLA, FB→META, GM — all exact), so this documents
+  **1996-01-02** as the usable floor instead. Fixes only the *selection* half of
+  ADR-0027's survivorship bias — the *price* half stays broken (yfinance has no
+  delisted-name history) and is now **measured**: a real 2007 S&P 500 sample came
+  back 34-48% untradeable on free data vs. 8-18% for today's membership sampled the
+  same way, and the return/Sharpe comparison itself flipped sign between two random
+  50-name draws — reported as noise, not averaged into a false-precision number.
+  ADR-0027 is amended, not closed. Russell 2000/S&P 1500 have no free PIT source
+  and are not approximated (an IP constraint, not a budget one).
+- **Regime-split metrics (2026-08-18, ADR-0066, KAN-621):** a 21-year Sharpe
+  averages the dot-com bust, the GFC, and the 2009-2020 bull run into one number —
+  `metrics.compute_regime_report` splits the same `PerformanceMetrics` `compute`
+  already produces by two independent trailing regime axes over a run's own equity
+  curve, each split at the run's own median: **volatility** (trailing 20-bar
+  realized vol, annualized) and **trend** (trailing 20-bar Kaufman efficiency
+  ratio). The two axes are reported separately, never crossed, so an already-thin
+  sample isn't quartered a second time. A thin regime slice is computed and printed,
+  never hidden, flagged via `RegimeMetrics.underpowered` (reusing
+  `MIN_BOOTSTRAP_OBSERVATIONS`). Purely additive and opt-in:
+  `backtest --regimes/--no-regimes`, off by default, computed once and shared
+  between the terminal summary and `result.json`. One deliberate schema asymmetry:
+  `result.json`'s `regimes` key is **omitted entirely** (not `null`) when absent —
+  unlike `significance`/`benchmark_metrics` — because the always-present-null shape
+  was measured to move the hash of a plain run that never touches the flag.
+  `RESULT_SCHEMA_VERSION` stays **1**. Not wired into `paper`/`sweep`.
+- **Monte Carlo path shuffling (2026-08-18, ADR-0067, KAN-859):**
+  `metrics.monte_carlo_shuffle` reshuffles a run's own per-bar returns into
+  thousands of random *permutations* — every return used exactly once, never a
+  resample-with-replacement like ADR-0039's stationary block bootstrap — and places
+  the run's real, path-ordered max drawdown against that empirical distribution:
+  did this run's own sequence of losses cluster unusually badly, or was it unusually
+  fortunate? Complements ADR-0039 rather than duplicating it: the bootstrap answers
+  "how uncertain is this Sharpe"; shuffling answers "did the ORDER matter". The
+  annualized Sharpe is mathematically invariant to any permutation (mean/variance of
+  a multiset don't depend on order) — measured directly at `0.0` maximum deviation
+  across 2,000 reshuffles of two fixtures — so it is reported **once**, beside the
+  bootstrap CI, never as a fabricated "distribution"; max drawdown is not invariant,
+  proven with a hand-built pair (same five `-5%` losses clustered vs. spread among
+  twenty `+1%` gains: 22.62% vs. 9.27% drawdown, identical Sharpe). Wired as
+  `backtest --monte-carlo/--monte-carlo-resamples/--monte-carlo-seed`, off by
+  default, mirroring `--bootstrap`'s exact shape; the `result.json` `"monte_carlo"`
+  key is **omitted** (not `null`) when absent, matching `regimes` rather than
+  `significance`'s always-null convention. `RESULT_SCHEMA_VERSION` stays **1**.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
   the dashboard server needs the `dashboard` extra (`uv sync --extra dashboard`).
-  Also open: a
-  **survivorship-bias-free point-in-time universe** (ADR-0027 records the gap; the
-  `--source csv` path is the hook), **per-bar rolling liquidity** (the ADV screen is
-  point-in-time, judged once before the run), **parameter-stability / heatmap output**
-  from a sweep, and **regime-split metrics**. The **paper-vs-simulated fill
-  divergence report** is built (ADR-0038) and now has **60 equity paired fills**
-  (ADR-0052: 0.51 bps realized against 5.00 modelled, conservative) and **11 crypto
-  ones pointing the other way** (ADR-0061: +13.02 bps, optimistic — below
-  `MIN_PAIRED_FILLS = 30` and 8 of the 11 share one market instant, so this is a
-  direction, not a level). The crypto **fee** is now measured too, separately from
-  slippage (ADR-0061: 22.0000 bps exact against the published tier-2 schedule,
-  confirmed across eight pairs) — but it is measured by position-delta arithmetic,
-  not by the divergence report itself, which still **cannot see it**: every
-  statistic there is a ratio of prices and the fee is taken out of the received
-  quantity. That report's `result.json` block and dashboard panel are still unbuilt
-  (additive; `divergence_rows` already emits the flat shape), and a divergence run
-  dense enough to clear 30 *independent* crypto fills (KAN-863 tracks the
-  reference-staleness half of that gap) is still open. Three ADR-0039 gaps stay open too: `paper` has no
-  `--bootstrap` (only `backtest` does), `--folds` walk-forward still prints no deflation
-  of its own (**KAN-677** — though ADR-0059 gave `WalkForwardSummary` the basis that
-  block will need), and there is **no cross-invocation trial ledger** — the tool sees one
-  command, so an operator who tried six strategies by hand has made 36 trials and the
-  tool will report 1. It says so every time; it cannot do better alone.
+  Also open: **per-bar rolling liquidity** (the ADV screen, and now the KAN-861
+  liquidity-cost tiering, are both point-in-time, judged once before the run — a
+  symbol whose liquidity dries up mid-run keeps its screen/tier decision), an
+  automated **cost-sensitivity sweep** (KAN-618 — today this is a manual
+  `--slippage-bps`/`--taker-fee-bps` rerun), and a **turnover/cost budget check**
+  (KAN-860, now unblocked by KAN-861's per-tier rate) that would fail a run loudly
+  when its turnover times its tier's rate exceeds a stated budget, the way
+  ADR-0029's trades-per-parameter warning already does.
+
+  The **paper-vs-simulated fill divergence report** is built (ADR-0038) and now has
+  **60 equity paired fills** (ADR-0052: 0.51 bps realized against 5.00 modelled,
+  conservative on mega-caps), **11 equity paired fills on the S&P 500's thinnest
+  decile** (ADR-0063, KAN-861: mean +4.23 bps / median +5.06 bps — close to the
+  model, confirming cost is a function of liquidity rather than asset class), and
+  **11 crypto ones pointing the other way** (ADR-0061: +13.02 bps, optimistic —
+  below `MIN_PAIRED_FILLS = 30` and 8 of the 11 share one market instant, so this
+  is a direction, not a level). `CostConfig.symbol_slippage_bps` (ADR-0063) now
+  lets a backtest charge a lower, ADV-tiered rate to genuinely liquid names
+  (`backtest --liquidity-tier-adv`, off by default) rather than pricing the whole
+  S&P 500 like a mega-cap; the mega-cap tier rate (2.0 bps) is deliberately **not**
+  set to the measured 0.51 bps, for the same re-tuning caution ADR-0052 already
+  applies. The crypto **fee** is measured too, separately from slippage (ADR-0061:
+  22.0000 bps exact against the published tier-2 schedule) — but only by
+  position-delta arithmetic; the divergence report itself still **cannot see it**
+  (every statistic there is a ratio of prices, and the fee is taken out of the
+  received quantity). That report's `result.json` block and dashboard panel are
+  still unbuilt (additive; `divergence_rows` already emits the flat shape), and a
+  divergence run dense enough to clear 30 *independent* crypto fills (KAN-863
+  tracks the reference-staleness half of that gap) is still open.
+
+  Two ADR-0039 gaps stay open: `paper` has no `--bootstrap`/`--ledger`/
+  `--hypothesis` (only `backtest`/`sweep` do), and `--folds` walk-forward still
+  prints no deflation or ledger entry of its own (**KAN-677** — though ADR-0059
+  gave `WalkForwardSummary` the basis that block will need). Robustness tooling is
+  further along than `docs/research-playbook.md` (KAN-862) assumed at the time it
+  was written: **parameter-stability/heatmap output** from a sweep
+  (`sweep --stability`, ADR-0065), **regime-split metrics** (`backtest --regimes`,
+  ADR-0066), and **Monte Carlo path shuffling** (`backtest --monte-carlo`,
+  ADR-0067) are all built the same day as the playbook — the playbook's own
+  "not yet built" table is the thing to re-check, not this paragraph alone.
 
 If code and prose disagree, the code wins — update the prose.
 
@@ -1213,7 +1327,11 @@ Run one test: `uv run pytest tests/unit/test_types.py::TestPortfolioAccounting`.
   price it reports, so folding it into the modelled fill price would fabricate a divergence
   against every real fill. Note the corollary — **cost is a function of liquidity, not of
   asset class**: ADR-0052's 0.51 bps was measured on twenty mega-caps and must not be
-  extrapolated down the cap scale (KAN-861).
+  extrapolated down the cap scale. Now built on, not just noted: ADR-0063 (KAN-861)
+  measured the S&P 500's thinnest decile (11 paired fills, mean +4.23 bps — close to
+  the 5.00 bps model) and added `CostConfig.symbol_slippage_bps`, an opt-in per-symbol
+  override classified once from pre-run ADV, so a mixed-liquidity universe does not
+  price its 500th name like a mega-cap.
 - **A live session must survive being stopped:** SIGTERM takes the same finalizing
   exit Ctrl-C does, and a signal arriving *during* finalization is ignored so the
   artifacts are written whole (ADR-0033 as extended by ADR-0043). Signal handlers and
@@ -1268,13 +1386,20 @@ src/trading/
   config.py                # BacktestConfig, CostConfig (defaults: $1,000, 5 bps, no fee);
                            #   CostConfig.equity()/.crypto() — costs are a per-market posture,
                            #   taker_fee_bps is a fraction of notional the per-share term
-                           #   could never express (ADR-0060)
+                           #   could never express (ADR-0060); symbol_slippage_bps — an
+                           #   optional per-symbol override classified from pre-run ADV,
+                           #   None by default so every existing caller is unaffected (ADR-0063)
+  ledger.py                # TrialLedger: append-only cross-invocation JSONL trial ledger,
+                           #   widens deflated_sharpe's prior_trials count (never the spread,
+                           #   ADR-0062); backtest/sweep --ledger PATH --hypothesis TEXT
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5);
                            #   prime_history: a live session's opening window is warmup, not
                            #   orders — data only, no strategy/broker/curve (ADR-0042);
                            #   _step diffs broker.rejections around submit too (ADR-0044);
                            #   silence_tolerance_polls: paper-only, below `class Engine` (ADR-0049)
-  broker.py                # SimulatedBroker + CostModel
+  broker.py                # SimulatedBroker + CostModel; fill_price(side, reference, symbol=None)
+                           #   — an optional symbol looks up CostConfig.symbol_slippage_bps,
+                           #   falling back to the flat rate for anything untiered (ADR-0063)
   brokers/alpaca.py        # AlpacaBroker — submit-then-poll paper broker (ADR-0020);
                            #   refuses a duplicate while a same-side order is working (ADR-0036);
                            #   records a venue refusal at submit instead of dying (ADR-0041)
@@ -1286,7 +1411,8 @@ src/trading/
   cli.py                   # `trading backtest / paper / gen-data / sweep / dashboard / verify-universe`
                            #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed,
                            #    --divergence, --bootstrap, --lookback, --log-level, --log-format,
-                           #    --max-empty-polls, --market);
+                           #    --max-empty-polls, --market, --ledger, --hypothesis, --regimes,
+                           #    --monte-carlo, --liquidity-tier-adv; sweep also has --stability);
                            #   --market selects calendar + completeness + risk posture at once, and
                            #   refuses crypto-shaped symbols on a session market (ADR-0057);
                            #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032);
@@ -1327,16 +1453,26 @@ src/trading/
   universe.py              # curated baskets (blue20, crypto10) + @name expansion (ADR-0024)
                            #   + broker verification (ADR-0028); crypto10 verifies 10/10 with no
                            #     --market, and carries the repo's worst survivorship caveat (ADR-0058)
-  liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029)
+  data/sp500_membership.py # point-in-time S&P 500 membership from a committed free-data fixture,
+                           #   usable from 1996-01-02 (ADR-0064); PointInTimeSP500.members_as_of
+  liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029);
+                           #   classify_liquidity_tier + liquidity_tier_rates reuse the same
+                           #   formation-window ADV to assign CostConfig.symbol_slippage_bps (ADR-0063)
   metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure,
                            #   entry count + trades-per-parameter significance (ADR-0029);
                            #   benchmark-relative beta/alpha/correlation/IR (ADR-0037);
                            #   Sharpe significance (ADR-0039): stationary block bootstrap CI,
-                           #   paired win rate, deflated Sharpe — seeded, never the global RNG
+                           #   paired win rate, deflated Sharpe — seeded, never the global RNG;
+                           #   compute_regime_report — two independent regime axes, vol + trend,
+                           #   split at the run's own median (ADR-0066); monte_carlo_shuffle —
+                           #   random permutations of a run's own returns vs. its real path-ordered
+                           #   max drawdown (ADR-0067)
   sweep.py                 # parameter sweep (ADR-0016) + true IS->OOS walk-forward (ADR-0026);
                            #   annualizes on the caller's periods_per_year, recorded on the summary —
                            #   deflating at a basis the trials were not scored on raises (ADR-0059);
-                           #   trial_count + deflated_winner() — best-of-N is not a finding (ADR-0039)
+                           #   trial_count + deflated_winner() — best-of-N is not a finding (ADR-0039);
+                           #   neighbor_stability — each combo's score vs. its grid-neighbour mean,
+                           #   surfacing a "cliff" a real search wouldn't reliably land on (ADR-0065)
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)
