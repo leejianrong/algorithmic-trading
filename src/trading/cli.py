@@ -146,7 +146,14 @@ from trading.report import (
 )
 from trading.risk import Guardrails
 from trading.strategies import free_parameter_count, get_strategy
-from trading.sweep import SweepSummary, WalkForwardSummary, run_sweep, run_walk_forward
+from trading.sweep import (
+    NeighborStability,
+    SweepSummary,
+    WalkForwardSummary,
+    combo_key,
+    run_sweep,
+    run_walk_forward,
+)
 from trading.types import Portfolio
 from trading.universe import get_sector_map, get_universe, validate_universe
 
@@ -1817,6 +1824,81 @@ def _write_sweep_csv(summary: SweepSummary, out: Path, rank_by: str, param_keys:
             writer.writerow(row)
 
 
+def _stability_csv_path(out: Path) -> Path:
+    """The neighbour-stability report's path, a sibling of the main sweep CSV.
+
+    ``results/sweep.csv`` -> ``results/sweep_stability.csv``: no new ``--out``-style
+    flag, matching how ``paper --divergence`` writes ``fill_divergence.csv`` beside
+    the rest of a session's artifacts rather than taking its own path option.
+    """
+    suffix = out.suffix or ".csv"
+    return out.with_name(f"{out.stem}_stability{suffix}")
+
+
+def _write_stability_csv(
+    rows: list[NeighborStability], path: Path, rank_by: str, param_keys: list[str]
+) -> None:
+    """Write each combo's score next to its grid-neighbour mean (ADR-0065, KAN-620).
+
+    One row per unique combo — window repeats are already collapsed to their mean by
+    :meth:`~trading.sweep.SweepSummary.stability` — ranked the same way as the main
+    sweep CSV (best ``by``-score first) so the two files line up rank for rank.
+    ``neighbor_mean``/``gap`` are blank, never ``0``, when a combo has no in-grid
+    neighbour with a recorded score.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ranked = sorted(rows, key=lambda row: row.score, reverse=True)
+    header = ["rank", *param_keys, rank_by, "neighbor_mean", "neighbor_count", "gap"]
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        for rank, row in enumerate(ranked, start=1):
+            writer.writerow(
+                [
+                    rank,
+                    *(row.params.get(key, "") for key in param_keys),
+                    round(row.score, 6),
+                    "" if row.neighbor_mean is None else round(row.neighbor_mean, 6),
+                    row.neighbor_count,
+                    "" if row.gap is None else round(row.gap, 6),
+                ]
+            )
+
+
+def _format_stability_heatmap(
+    rows: list[NeighborStability], param_keys: list[str], grid: dict[str, list[object]]
+) -> str:
+    """A 2-axis score matrix: rows are ``param_keys[0]``, columns ``param_keys[1]``.
+
+    A literal ASCII heatmap, only meaningful for a two-parameter grid (with more
+    axes there is no single 2D picture to draw, so callers gate this on
+    ``len(param_keys) == 2``). A blank cell (``.``) is a combo the strategy
+    constructor rejected or that never ran — never a fabricated score.
+    """
+    row_key, col_key = param_keys
+    row_values = grid[row_key]
+    col_values = grid[col_key]
+    scores = {combo_key(row.params): row.score for row in rows}
+
+    header = [f"{row_key}\\{col_key}"] + [_format_param(v) for v in col_values]
+    body: list[list[str]] = []
+    for rv in row_values:
+        cells = [_format_param(rv)]
+        for cv in col_values:
+            score = scores.get(combo_key({row_key: rv, col_key: cv}))
+            cells.append("." if score is None else f"{score:+.2f}")
+        body.append(cells)
+
+    widths = [len(h) for h in header]
+    for row in body:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+    lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(header))]
+    lines.append("  ".join("-" * widths[i] for i in range(len(header))))
+    lines.extend("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)) for row in body)
+    return "\n".join(lines)
+
+
 def _format_sweep_table(summary: SweepSummary, rank_by: str, param_keys: list[str]) -> str:
     """Render the ranked runs as a plain-text table, ordered by ``rank_by``."""
     ranked = summary.ranked(by=rank_by)
@@ -1986,6 +2068,17 @@ def sweep(
     ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/sweep.csv"), "--out", help="Results CSV path."),
+    stability: bool = typer.Option(
+        False,
+        "--stability",
+        help=(
+            "Report each combo's score next to the mean of its immediate grid "
+            "neighbours, to surface a 'cliff' — a combo that scored far above "
+            "neighbours a real search would not reliably land on (ADR-0065). Writes "
+            "a sibling *_stability.csv next to --out; off by default. Not yet wired "
+            "into --folds walk-forward."
+        ),
+    ),
 ) -> None:
     """Grid-sweep a strategy's parameters over a date range, ranked by a metric.
 
@@ -2064,6 +2157,15 @@ def sweep(
                 "nothing was appended",
                 err=True,
             )
+        if stability:
+            # ADR-0065: neighbour stability reads a plain grid sweep's SweepSummary;
+            # a walk-forward fold does not carry one yet (a later slice, not this
+            # one), so say so rather than silently ignoring the flag.
+            typer.echo(
+                "note: --stability is not yet wired into --folds walk-forward "
+                "(ADR-0065); nothing was written",
+                err=True,
+            )
         _run_walk_forward_command(
             strategy=strategy,
             grid=grid,
@@ -2117,6 +2219,17 @@ def sweep(
             typer.echo("\n" + deflation)
         _write_sweep_csv(summary, out, rank_by, param_keys)
         typer.echo(f"\nWrote sweep results to {out}")
+
+        if stability:
+            # Read-only reporting on top of the summary already computed above — no
+            # ranking, no metric, and no existing CSV column changes (ADR-0065).
+            stability_rows = summary.stability(by=rank_by)
+            if stability_rows:
+                stability_path = _stability_csv_path(out)
+                _write_stability_csv(stability_rows, stability_path, rank_by, param_keys)
+                typer.echo(f"Wrote parameter-stability report to {stability_path}")
+                if len(param_keys) == 2:
+                    typer.echo("\n" + _format_stability_heatmap(stability_rows, param_keys, grid))
 
         # Appended after the deflation above so a failure building the report never
         # costs the log entry, and before the caller sees "Wrote sweep results" so
