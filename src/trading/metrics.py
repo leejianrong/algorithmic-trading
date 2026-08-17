@@ -42,11 +42,26 @@ Purely additive reporting: it does not change what :func:`compute` returns, and 
 regime with too few classified bars for :data:`MIN_BOOTSTRAP_OBSERVATIONS` to mean
 anything is still computed (never hidden) but flagged, exactly as ADR-0029 flags a
 thin trades-per-parameter ratio rather than suppressing it.
+
+Monte Carlo path shuffling (ADR-0067) sits at the very end: :func:`monte_carlo_shuffle`
+draws thousands of random *permutations* of a run's own per-bar returns — every
+observed return used exactly once, just reordered, never resampled with replacement
+like the ADR-0039 bootstrap above — and asks whether the run's real, path-ordered max
+drawdown is typical of that reshuffled population or an outlier of it. It complements
+ADR-0039 rather than duplicating it: the bootstrap answers "how uncertain is this
+Sharpe estimate", while shuffling answers "did the ORDER these returns happened in
+matter". Mean and sample variance do not depend on order, so the annualized Sharpe
+computed from a permutation is mathematically identical to the observed one — it is
+reported once, for a direct side-by-side against :class:`SharpeInterval`, never as a
+resampled "distribution" that would just be the same number with floating-point noise
+in the last bit. Max drawdown has no such invariance: it is a genuine property of the
+path, which is the entire reason this feature exists.
 """
 
 from __future__ import annotations
 
 import random
+from bisect import bisect_right
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
@@ -1685,4 +1700,201 @@ def compute_regime_report(
         trending=trending,
         mean_reverting=mean_reverting,
         notes=notes,
+    )
+
+
+# --- Monte Carlo path shuffling (ADR-0067) ------------------------------------
+#
+# ADR-0039's bootstrap resamples *with replacement* (each drawn index can repeat,
+# some observations never appear) to ask how uncertain a point estimate is. This
+# is a different experiment: every one of the SAME observed returns is used
+# exactly once per resample, just reordered — a random permutation, never a
+# resample — so it asks a question the bootstrap cannot: did the actual SEQUENCE
+# these returns arrived in matter, or would any other ordering of the identical
+# multiset of returns have told the same story. Max drawdown is the headline
+# answer, because it is a path-dependent statistic the Sharpe (mean/stdev of an
+# unordered multiset) structurally cannot see reordered at all.
+
+
+def _shuffled_copy(returns: Sequence[float], rng: random.Random) -> list[float]:
+    """One uniformly random permutation of ``returns``.
+
+    Every element of ``returns`` appears in the result exactly once — a reorder,
+    never a resample-with-replacement (contrast :func:`_stationary_indices`,
+    which draws indices *with* replacement for the block bootstrap and can skip
+    or repeat an observation). ``rng.shuffle`` is Fisher-Yates, uniform over all
+    ``n!`` orderings, driven entirely by the caller's local ``rng`` — never the
+    module-global one.
+    """
+    shuffled = list(returns)
+    rng.shuffle(shuffled)
+    return shuffled
+
+
+def _empirical_percentile(sorted_values: Sequence[float], value: float) -> float:
+    """The fraction of an already-sorted empirical distribution at or below ``value``.
+
+    ``value``'s own percentile rank within ``sorted_values`` — 0.0 if it is below
+    every entry, 1.0 if it is at or above every entry. Used to place the run's real
+    path-ordered max drawdown against the population of shuffled ones: a rank near
+    1.0 says the real path was worse than almost every reordering, a rank near 0.0
+    says it was better than almost every reordering. ``0.5`` (undefined-but-neutral)
+    for an empty distribution, which cannot arise from :func:`monte_carlo_shuffle`
+    (it never resamples zero times) but keeps this helper total.
+    """
+    if not sorted_values:
+        return 0.5
+    return bisect_right(sorted_values, value) / len(sorted_values)
+
+
+@dataclass(frozen=True, slots=True)
+class MonteCarloShuffleReport:
+    """Whether a run's max drawdown depended on the ORDER its returns arrived in
+    (ADR-0067, KAN-859).
+
+    Complements :class:`SharpeInterval` rather than duplicating it: that interval
+    answers "how uncertain is this Sharpe estimate" by resampling *with*
+    replacement; this answers "did this run get an unusually bad — or unusually
+    fortunate — CLUSTERING of its own losses" by reshuffling the exact same
+    returns into a new order every time, never adding or dropping one.
+
+    ``sharpe`` is the run's own observed annualized Sharpe (:func:`_sharpe_of` on
+    the unshuffled returns), printed here for a direct side-by-side against
+    :class:`SharpeInterval` — **not** a resampled distribution. Mean and sample
+    variance are invariant to the order their inputs are summed in (``sum``/``len``
+    do not know or care about order), so scoring the Sharpe on a shuffled sequence
+    would reproduce this same value up to floating-point summation-order noise at
+    the level of the last one or two bits — a "distribution" that is really one
+    number with rounding jitter dressed up as evidence. Reporting only the single
+    observed value, once, is the honest rendering of an invariant quantity; see
+    ``tests/unit/test_monte_carlo.py`` for the measured floating-point tolerance.
+
+    Every ``shuffled_*``/``actual_*`` field is ``None`` — with ``notes`` saying
+    why — only when the curve is shorter than :data:`MIN_BOOTSTRAP_OBSERVATIONS`
+    return periods: shuffling a handful of returns has too few distinct orderings
+    to say anything about path dependence, the same "too short, computed as an
+    honest absence rather than a fabricated number" rule ADR-0039 already applies
+    to the Sharpe interval.
+
+    ``shuffled_low``/``shuffled_median``/``shuffled_high`` are percentiles (at
+    ``confidence``, the same two-sided convention :class:`SharpeInterval` uses) of
+    the max drawdown across ``resamples`` random reorderings of the SAME return
+    series. ``actual_max_drawdown`` is the run's own real, path-ordered max
+    drawdown (never reordered) and ``actual_percentile`` is where it ranks inside
+    that shuffled population, in ``[0.0, 1.0]`` — the single figure that answers
+    the card's question directly: 0.97 means the real path was worse than 97% of
+    random reorderings of its own returns (an unusually bad clustering of losses,
+    or a structural vulnerability); 0.03 means it was better than 97% of them (an
+    unusually fortunate sequence a live deployment should not expect to repeat).
+
+    Unlike :class:`SharpeInterval`, there is no ``block_length`` here at all — a
+    permutation has no block-size knob; it is not parameterized by anything
+    between "keep every return exactly once" and "reorder them", so there is
+    nothing to reduce on a short series the way the bootstrap's block length is.
+    """
+
+    resamples: int
+    seed: int
+    confidence: float
+    observations: int
+    sharpe: float | None
+    actual_max_drawdown: float | None
+    shuffled_low: float | None
+    shuffled_median: float | None
+    shuffled_high: float | None
+    actual_percentile: float | None
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def worse_than_shuffled(self) -> bool | None:
+        """Whether the real path's drawdown exceeds nearly every random reordering.
+
+        ``None`` — not ``False`` — when there was nothing to compare (too short).
+        """
+        if self.actual_max_drawdown is None or self.shuffled_high is None:
+            return None
+        return self.actual_max_drawdown > self.shuffled_high
+
+    @property
+    def better_than_shuffled(self) -> bool | None:
+        """Whether the real path's drawdown beats nearly every random reordering.
+
+        ``None`` — not ``False`` — when there was nothing to compare (too short).
+        """
+        if self.actual_max_drawdown is None or self.shuffled_low is None:
+            return None
+        return self.actual_max_drawdown < self.shuffled_low
+
+
+def monte_carlo_shuffle(
+    curve: Sequence[EquityPoint],
+    periods_per_year: float = 252.0,
+    *,
+    resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    confidence: float = DEFAULT_CONFIDENCE,
+    seed: int = DEFAULT_BOOTSTRAP_SEED,
+) -> MonteCarloShuffleReport:
+    """Reshuffle a run's own per-bar returns ``resamples`` times (ADR-0067).
+
+    Each resample is an exact random permutation of :func:`daily_returns` —
+    :func:`_shuffled_copy`, backed by ``rng.shuffle`` — never a bootstrap
+    resample-with-replacement. Every one of the observed returns appears in every
+    resample exactly once; only their order changes. :func:`_max_drawdown_of` is
+    then scored on each shuffled sequence, and the run's own real (unshuffled)
+    max drawdown is placed against that empirical distribution via
+    :func:`_empirical_percentile`.
+
+    Deterministic on ``seed``, exactly like :func:`sharpe_confidence_interval`: a
+    local :class:`random.Random` is constructed and driven, the module-global RNG
+    is never touched, and the same curve/seed/resamples always reproduce the same
+    report.
+
+    Always returns a :class:`MonteCarloShuffleReport` — never ``None`` — mirroring
+    :class:`RegimeReport`'s convention rather than :class:`SharpeInterval`'s bare
+    ``None``: below :data:`MIN_BOOTSTRAP_OBSERVATIONS` return periods every
+    ``shuffled_*``/``actual_*`` field is ``None`` and ``notes`` explains why, so a
+    caller never has to special-case "no report" versus "an empty one".
+
+    Raises ``ValueError`` for a nonsensical ``resamples``/``confidence`` — a
+    caller mistake, not a property of the data (:func:`_validate_bootstrap_args`,
+    shared with the bootstrap).
+    """
+    _validate_bootstrap_args(resamples, confidence)
+    returns = daily_returns(curve)
+    observations = len(returns)
+    if observations < MIN_BOOTSTRAP_OBSERVATIONS:
+        return MonteCarloShuffleReport(
+            resamples=resamples,
+            seed=seed,
+            confidence=confidence,
+            observations=observations,
+            sharpe=None,
+            actual_max_drawdown=None,
+            shuffled_low=None,
+            shuffled_median=None,
+            shuffled_high=None,
+            actual_percentile=None,
+            notes=[
+                f"no Monte Carlo shuffle: {observations} return period(s) is below the "
+                f"{MIN_BOOTSTRAP_OBSERVATIONS} a meaningful reshuffle needs — a handful of "
+                "returns has too few distinct orderings to say anything about path "
+                "dependence"
+            ],
+        )
+    rng = random.Random(seed)
+    drawdowns = sorted(_max_drawdown_of(_shuffled_copy(returns, rng)) for _ in range(resamples))
+    tail = (1.0 - confidence) / 2.0
+    actual_dd = _max_drawdown_of(returns)
+    return MonteCarloShuffleReport(
+        resamples=resamples,
+        seed=seed,
+        confidence=confidence,
+        observations=observations,
+        sharpe=_sharpe_of(returns, periods_per_year),
+        actual_max_drawdown=actual_dd,
+        shuffled_low=_percentile(drawdowns, tail),
+        shuffled_median=_percentile(drawdowns, 0.5),
+        shuffled_high=_percentile(drawdowns, 1.0 - tail),
+        actual_percentile=_empirical_percentile(drawdowns, actual_dd),
+        notes=[],
     )

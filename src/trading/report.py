@@ -19,6 +19,12 @@ the ADR-0066 regime-split block — the same headline figures restricted to the
 run's own high/low-volatility and trending/mean-reverting bars, alongside (never
 instead of) the whole-run numbers — and again, omitting it leaves the summary
 byte-identical.
+When the caller supplies a :class:`~trading.metrics.MonteCarloShuffleReport` it
+also renders the ADR-0067 path-shuffle block — the run's own max drawdown placed
+against the distribution of max drawdowns from thousands of random reorderings of
+the same per-bar returns, alongside the run's Sharpe (unchanged by any reordering,
+so printed once rather than as a resampled distribution) — and again, omitting it
+leaves the summary byte-identical.
 ``write_equity_csv`` writes one
 row per trading day with an ``exposure`` column and, when a benchmark run is
 supplied, a ``benchmark_equity`` column aligned by timestamp. ``write_equity_png``
@@ -50,6 +56,7 @@ if TYPE_CHECKING:
     from trading.metrics import (
         BenchmarkComparison,
         DeflatedSharpe,
+        MonteCarloShuffleReport,
         PairedBootstrap,
         PerformanceMetrics,
         RegimeMetrics,
@@ -84,6 +91,7 @@ def summarize(
     free_parameters: int | None = None,
     significance: SignificanceReport | None = None,
     regimes: RegimeReport | None = None,
+    monte_carlo: MonteCarloShuffleReport | None = None,
 ) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
 
@@ -113,6 +121,12 @@ def summarize(
     run's own high/low-volatility and trending/mean-reverting bars. Caller-supplied
     for the same reason ``significance`` is — computing it here would mean a run
     that never asked for it pays the cost, and its bytes must stay byte-identical.
+
+    ``monte_carlo`` (from :func:`trading.metrics.monte_carlo_shuffle`, ADR-0067)
+    appends the path-shuffle block: the run's own max drawdown placed against
+    thousands of random reorderings of its own returns, and the run's Sharpe
+    printed once (it does not change under reordering). Caller-supplied and never
+    derived here, for the same reason ``significance``/``regimes`` are not.
     """
     metrics = compute(result, periods_per_year, free_parameters=free_parameters)
     lines = [f"Symbols:       {', '.join(result.symbols)}"]
@@ -166,6 +180,8 @@ def summarize(
         lines.extend(significance_lines(significance))
     if regimes is not None:
         lines.extend(regime_lines(regimes))
+    if monte_carlo is not None:
+        lines.extend(monte_carlo_lines(monte_carlo))
     if result.rejections:
         lines.append(f"Rejected:      {len(result.rejections)} order(s)")
     if result.clamps:
@@ -465,6 +481,62 @@ def regime_lines(regimes: RegimeReport) -> list[str]:
     return lines
 
 
+def monte_carlo_lines(report: MonteCarloShuffleReport) -> list[str]:
+    """Render the whole ADR-0067 Monte Carlo path-shuffle block, notes included.
+
+    When the curve was too short to shuffle meaningfully, every field is ``None``
+    and this is just the explanatory ``note:`` line — the same "say why, don't go
+    silent" rule ADR-0039/ADR-0066 already follow.
+    """
+    if report.actual_max_drawdown is None:
+        return [f"  note: {note}" for note in report.notes]
+    assert report.shuffled_low is not None
+    assert report.shuffled_median is not None
+    assert report.shuffled_high is not None
+    assert report.actual_percentile is not None
+    assert report.sharpe is not None
+    lines = [
+        f"Monte Carlo shuffle ({report.resamples} random reorderings of "
+        f"{report.observations} return period(s), seed {report.seed}):",
+        f"  Sharpe (order-invariant): {report.sharpe:+.2f}  — mean/stdev do not depend "
+        "on the order returns are summed in, so reordering cannot change this; it is a "
+        "single value, not a resampled distribution (cf. the bootstrap CI above, which "
+        "is about estimation uncertainty, not path order)",
+        f"  Max drawdown — actual path:            {report.actual_max_drawdown * 100:6.2f}%",
+        f"  Max drawdown — shuffled {report.confidence * 100:.0f}% range: "
+        f"[{report.shuffled_low * 100:.2f}%, {report.shuffled_high * 100:.2f}%]  "
+        f"(median {report.shuffled_median * 100:.2f}%)",
+        f"  Actual path's drawdown sits at the {report.actual_percentile * 100:.1f} "
+        "percentile of the shuffled distribution",
+    ]
+    if report.worse_than_shuffled:
+        lines.append(
+            "  ⚠ the actual path's drawdown is worse than nearly every random reordering "
+            "of the SAME returns — this run's sequence saw an unusually bad CLUSTERING of "
+            "losses (bad luck in ordering, or a structural vulnerability), not merely an "
+            "unlucky total amount of loss"
+        )
+    elif report.better_than_shuffled:
+        lines.append(
+            "  ⚠ the actual path's drawdown is better than nearly every random reordering "
+            "of the SAME returns — this run's own sequence was unusually FORTUNATE; a live "
+            "deployment should not expect to be this lucky again"
+        )
+    lines.extend(f"  note: {note}" for note in report.notes)
+    return lines
+
+
+def summarize_monte_carlo(report: MonteCarloShuffleReport | None) -> str:
+    """:func:`monte_carlo_lines` as one block of text, or ``""`` when absent.
+
+    Mirrors :func:`summarize_significance`'s shape, for the same reason: a caller
+    other than ``summarize`` that wants the identical wording without duplicating it.
+    """
+    if report is None:
+        return ""
+    return "\n".join(monte_carlo_lines(report))
+
+
 def _halt_episode_lines(result: BacktestResult) -> list[str]:
     """The halt-episode count line, when opt-in recovery actually did something.
 
@@ -630,6 +702,7 @@ def result_to_dict(
     periods_per_year: float | None = None,
     significance: SignificanceReport | None = None,
     regimes: RegimeReport | None = None,
+    monte_carlo: MonteCarloShuffleReport | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
 
@@ -708,24 +781,39 @@ def result_to_dict(
             "trending": same shape as "high_vol" | null,
             "mean_reverting": same shape as "high_vol" | null,
             "notes": list[str]
-          }   # present only when the caller supplied a RegimeReport
+          },   # present only when the caller supplied a RegimeReport
+          "monte_carlo": {   # ADR-0067, additive; KEY OMITTED ENTIRELY when not computed
+            "resamples": int, "seed": int, "confidence": float, "observations": int,
+            "sharpe": float | null,               # order-invariant; not a distribution
+            "actual_max_drawdown": float | null,  # the run's own real path-ordered value
+            "shuffled_low": float | null, "shuffled_median": float | null,
+            "shuffled_high": float | null,
+            "actual_percentile": float | null,    # actual's rank in the shuffled population
+            "notes": list[str]
+          }   # present only when the caller supplied a MonteCarloShuffleReport
         }
 
     The ``episode_count``/``episodes`` keys (ADR-0031), the top-level ``absent``
     list (ADR-0032), the top-level ``benchmark_metrics`` block plus the
     ``metrics.return_per_unit_exposure`` field (ADR-0037), the top-level
     ``significance`` block (ADR-0039), the top-level ``market`` name (ADR-0057),
-    and the top-level ``regimes`` block (ADR-0066) are purely additive:
-    every pre-existing key keeps its exact meaning and value — ``symbols`` is
-    still the *requested* universe, ``metrics`` is still exactly
-    ``dataclasses.asdict`` of what the caller passed — so
+    the top-level ``regimes`` block (ADR-0066), and the top-level ``monte_carlo``
+    block (ADR-0067) are purely additive: every pre-existing key keeps its exact
+    meaning and value — ``symbols`` is still the *requested* universe, ``metrics``
+    is still exactly ``dataclasses.asdict`` of what the caller passed — so
     ``RESULT_SCHEMA_VERSION`` does **not** move (see the constant's note). A v1
-    reader that ignores them behaves exactly as it did. ``regimes`` is the one key
-    among these that is **omitted** rather than emitted as ``null`` when absent
-    (every other one keeps the always-present-null shape) — chosen so a run that
-    never passes ``--regimes`` writes the byte-identical document it always has;
-    a v1 reader already tolerates a missing key exactly as it tolerates a ``null``
-    one, so nothing downstream distinguishes the two conventions.
+    reader that ignores them behaves exactly as it did. ``regimes`` and
+    ``monte_carlo`` are the two keys among these that are **omitted** rather than
+    emitted as ``null`` when absent (every earlier one keeps the
+    always-present-null shape established by ``significance``) — chosen so a run
+    that never passes the corresponding flag writes the byte-identical document it
+    always has. That always-null shape was only ever safe for the ADR that first
+    introduced a given top-level key: once a baseline `result.json` hash is pinned
+    (as it was the moment ADR-0066 shipped), any *later* additive key must be
+    omitted rather than nulled, or it moves that already-pinned hash for every run
+    that never asked for the new feature. A v1 reader already tolerates a missing
+    key exactly as it tolerates a ``null`` one, so nothing downstream distinguishes
+    the two conventions.
 
     ``benchmark_metrics`` sits at the top level rather than inside ``metrics``
     because it describes a *relation between two runs*, not a property of this
@@ -783,6 +871,15 @@ def result_to_dict(
         ``regimes`` key is **omitted entirely** when ``None``, so a run that never
         passes ``--regimes`` emits the exact bytes it always has (pinned by a CLI
         golden); the key appears only once a caller actually supplies a report.
+    monte_carlo:
+        An already-computed :class:`~trading.metrics.MonteCarloShuffleReport`
+        (ADR-0067), or ``None``. Never derived here, for the same reason
+        ``significance``/``regimes`` are not: a run that did not ask for the
+        path-shuffle must not silently pay for thousands of reshuffles. Like
+        ``regimes`` (and unlike ``significance``, whose always-null convention
+        predates a pinned baseline hash), the ``monte_carlo`` key is **omitted
+        entirely** when ``None`` rather than emitted as ``null``, so a run that
+        never passes ``--monte-carlo`` emits the exact bytes it always has.
     """
     payload: dict[str, Any] = {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -871,6 +968,11 @@ def result_to_dict(
     # exact bytes it always has, unlike ``significance``'s always-present ``null``.
     if regimes is not None:
         payload["regimes"] = asdict(regimes)
+    # The Monte Carlo path-shuffle block (ADR-0067). Same omitted-entirely
+    # convention as ``regimes``, for the same reason: a run without
+    # ``--monte-carlo`` must write the exact bytes it always has.
+    if monte_carlo is not None:
+        payload["monte_carlo"] = asdict(monte_carlo)
     return payload
 
 
@@ -887,6 +989,7 @@ def write_result_json(
     periods_per_year: float | None = None,
     significance: SignificanceReport | None = None,
     regimes: RegimeReport | None = None,
+    monte_carlo: MonteCarloShuffleReport | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
 
@@ -904,6 +1007,7 @@ def write_result_json(
         periods_per_year=periods_per_year,
         significance=significance,
         regimes=regimes,
+        monte_carlo=monte_carlo,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:
