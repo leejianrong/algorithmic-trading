@@ -21,6 +21,7 @@ from __future__ import annotations
 import math
 from datetime import UTC, datetime, timedelta
 from itertools import pairwise
+from typing import ClassVar
 
 import pytest
 
@@ -33,7 +34,9 @@ from trading.sweep import (
     SweepSummary,
     WalkForwardFold,
     WalkForwardSummary,
+    combo_key,
     expand_grid,
+    neighbor_stability,
     run_sweep,
     run_walk_forward,
     split_folds,
@@ -982,3 +985,218 @@ def test_the_basis_never_changes_which_combination_wins() -> None:
     assert [run.params for run in daily.ranked("total_return")] == [
         run.params for run in five_minute.ranked("total_return")
     ]
+
+
+# --- parameter-stability: a combo's score next to its grid-neighbour mean -----
+#
+# ADR-0065 / KAN-620: a flat ranked CSV hides whether a winner sits on a plateau or
+# a spike a real search would not reliably land on. For a grid of `fast` x `slow`,
+# combo (fast=10, slow=100)'s neighbours are the adjacent `fast` values at
+# slow=100 and the adjacent `slow` values at fast=10 — never a diagonal move.
+
+
+def test_combo_key_is_order_independent() -> None:
+    """Two combos with the same pairs must compare equal regardless of dict order."""
+    assert combo_key({"fast": 5, "slow": 30}) == combo_key({"slow": 30, "fast": 5})
+    assert combo_key({"fast": 5, "slow": 30}) != combo_key({"fast": 5, "slow": 50})
+
+
+class TestNeighborStabilityPure:
+    """The pure function on a hand-built grid + score map — no engine, no adapter."""
+
+    _GRID: ClassVar[dict[str, list[object]]] = {"fast": [5, 10, 15], "slow": [30, 50, 80]}
+
+    def _scores(self, **overrides: float) -> dict[tuple[tuple[str, object], ...], float]:
+        """All nine combos of ``_GRID`` scored ``0.0``, with ``overrides`` applied.
+
+        ``overrides`` keys are ``"fast,slow"`` strings for brevity, e.g. ``"10,50"``.
+        """
+        base = {
+            combo_key({"fast": f, "slow": s}): 0.0
+            for f in self._GRID["fast"]
+            for s in self._GRID["slow"]
+        }
+        for spec, score in overrides.items():
+            f, s = (int(x) for x in spec.split(","))
+            base[combo_key({"fast": f, "slow": s})] = score
+        return base
+
+    def test_a_center_combo_averages_all_four_neighbours(self) -> None:
+        """(10, 50) sits in the middle of a 3x3 grid: 2 fast neighbours + 2 slow ones."""
+        scores = self._scores(
+            **{"10,50": 1.0, "5,50": 0.2, "15,50": 0.4, "10,30": 0.6, "10,80": 0.8}
+        )
+        rows = neighbor_stability(self._GRID, scores)
+        row = next(r for r in rows if r.params == {"fast": 10, "slow": 50})
+        assert row.score == 1.0
+        assert row.neighbor_count == 4
+        assert row.neighbor_mean == pytest.approx((0.2 + 0.4 + 0.6 + 0.8) / 4.0)
+        assert row.gap == pytest.approx(1.0 - row.neighbor_mean)
+
+    def test_a_corner_combo_has_only_two_neighbours(self) -> None:
+        """(5, 30) is a corner: no fast value below 5, no slow value below 30."""
+        scores = self._scores(**{"5,30": 1.0, "10,30": 0.5, "5,50": 0.3})
+        rows = neighbor_stability(self._GRID, scores)
+        row = next(r for r in rows if r.params == {"fast": 5, "slow": 30})
+        assert row.neighbor_count == 2
+        assert row.neighbor_mean == pytest.approx((0.5 + 0.3) / 2.0)
+
+    def test_a_missing_neighbour_is_excluded_not_treated_as_zero(self) -> None:
+        """A combo the strategy constructor rejected never enters the mean."""
+        scores = self._scores(**{"10,50": 1.0, "5,50": 0.2, "10,30": 0.6, "10,80": 0.8})
+        # (15, 50) never ran (as if the strategy constructor rejected it) — remove
+        # it from the score map entirely, not merely leave it at the 0.0 baseline.
+        del scores[combo_key({"fast": 15, "slow": 50})]
+        rows = neighbor_stability(self._GRID, scores)
+        row = next(r for r in rows if r.params == {"fast": 10, "slow": 50})
+        assert row.neighbor_count == 3
+        assert row.neighbor_mean == pytest.approx((0.2 + 0.6 + 0.8) / 3.0)
+
+    def test_no_neighbours_at_all_is_none_not_zero(self) -> None:
+        """An honest absence: a combo whose every neighbour is missing scores no mean."""
+        scores = {combo_key({"fast": 10, "slow": 50}): 1.0}
+        rows = neighbor_stability(self._GRID, scores)
+        assert len(rows) == 1
+        assert rows[0].neighbor_count == 0
+        assert rows[0].neighbor_mean is None
+        assert rows[0].gap is None
+
+    def test_a_single_value_axis_contributes_no_neighbours(self) -> None:
+        """A parameter that was not actually swept has nothing adjacent to compare."""
+        grid: dict[str, list[object]] = {"fast": [10], "slow": [30, 50, 80]}
+        scores = {
+            combo_key({"fast": 10, "slow": s}): score
+            for s, score in zip([30, 50, 80], [0.1, 1.0, 0.3], strict=True)
+        }
+        rows = neighbor_stability(grid, scores)
+        row = next(r for r in rows if r.params == {"fast": 10, "slow": 50})
+        # Only the slow axis is swept: one neighbour each side, none from fast.
+        assert row.neighbor_count == 2
+        assert row.neighbor_mean == pytest.approx((0.1 + 0.3) / 2.0)
+
+    def test_neighbours_are_positional_in_the_grids_own_list_order(self) -> None:
+        """Adjacency follows the grid's list order, not numeric distance.
+
+        `fast=[5, 20, 10]` (deliberately out of numeric order) must treat 20 as
+        adjacent to both 5 and 10 — the same order `expand_grid` reads.
+        """
+        grid: dict[str, list[object]] = {"fast": [5, 20, 10], "slow": [30]}
+        scores = {
+            combo_key({"fast": 5, "slow": 30}): 1.0,
+            combo_key({"fast": 20, "slow": 30}): 2.0,
+            combo_key({"fast": 10, "slow": 30}): 3.0,
+        }
+        rows = neighbor_stability(grid, scores)
+        middle = next(r for r in rows if r.params == {"fast": 20, "slow": 30})
+        assert middle.neighbor_count == 2
+        assert middle.neighbor_mean == pytest.approx((1.0 + 3.0) / 2.0)
+        edge = next(r for r in rows if r.params == {"fast": 5, "slow": 30})
+        # 5 is adjacent only to 20 (index 1), not to 10 (index 2) — list order.
+        assert edge.neighbor_count == 1
+        assert edge.neighbor_mean == pytest.approx(2.0)
+
+    def test_a_cliff_is_a_large_positive_gap(self) -> None:
+        """The motivating case: a spike surrounded by much lower scores."""
+        scores = self._scores(
+            **{"10,50": 5.0, "5,50": 0.1, "15,50": 0.1, "10,30": 0.1, "10,80": 0.1}
+        )
+        rows = neighbor_stability(self._GRID, scores)
+        row = next(r for r in rows if r.params == {"fast": 10, "slow": 50})
+        assert row.gap is not None
+        assert row.gap > 4.0  # far above its neighbours' mean of 0.1
+
+    def test_returns_one_row_per_scored_combo_in_the_scores_order(self) -> None:
+        scores = {
+            combo_key({"fast": 5, "slow": 30}): 1.0,
+            combo_key({"fast": 10, "slow": 30}): 2.0,
+        }
+        rows = neighbor_stability(self._GRID, scores)
+        assert [r.params for r in rows] == [{"fast": 5, "slow": 30}, {"fast": 10, "slow": 30}]
+
+
+class TestSweepSummaryStability:
+    """The end-to-end path: `run_sweep`'s own summary feeds `stability()`."""
+
+    def test_stability_is_empty_for_a_hand_built_summary_without_a_grid(self) -> None:
+        """An honest absence, the same idiom as `deflated_winner`'s missing moments."""
+        summary = SweepSummary(
+            strategy="sma_crossover",
+            symbols=["AAA"],
+            runs=[
+                SweepRun(
+                    params={"fast": 5}, metrics=_metrics(1.0, 0.1), window=0, start=_START, end=_END
+                )
+            ],
+        )
+        assert summary.grid == {}
+        assert summary.stability() == []
+
+    def test_run_sweep_records_its_grid_on_the_summary(self) -> None:
+        grid = {"fast": [5, 10], "slow": [30, 50]}
+        summary = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END)
+        assert summary.grid == grid
+
+    def test_stability_covers_every_combo_that_ran(self) -> None:
+        grid = {"fast": [5, 10, 15], "slow": [30, 50, 80]}
+        summary = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END)
+        rows = summary.stability()
+        assert {tuple(sorted(r.params.items())) for r in rows} == {
+            tuple(sorted(run.params.items())) for run in summary.runs
+        }
+
+    def test_stability_matches_the_pure_function_on_the_summarys_own_scores(self) -> None:
+        grid = {"fast": [5, 10, 15], "slow": [30, 50, 80]}
+        summary = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END)
+        rows = summary.stability()
+        expected = {
+            combo_key(r.params): (r.score, r.neighbor_mean, r.neighbor_count, r.gap) for r in rows
+        }
+        direct = neighbor_stability(grid, summary.combo_scores())
+        for row in direct:
+            key = combo_key(row.params)
+            assert expected[key] == (row.score, row.neighbor_mean, row.neighbor_count, row.gap)
+
+    def test_stability_is_deterministic(self) -> None:
+        grid = {"fast": [5, 10, 15], "slow": [30, 50, 80]}
+        first = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END).stability()
+        second = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END).stability()
+        assert first == second
+
+    def test_stability_does_not_change_the_ranking_or_any_existing_field(self) -> None:
+        """Purely additive reporting: computing it must not perturb the summary."""
+        grid = {"fast": [5, 10], "slow": [30, 50]}
+        summary = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END)
+        before = (summary.ranked(), summary.trial_count, summary.skipped, summary.deflated_winner())
+        summary.stability()
+        after = (summary.ranked(), summary.trial_count, summary.skipped, summary.deflated_winner())
+        assert before == after
+
+    def test_a_skipped_combo_never_enters_a_neighbours_mean(self) -> None:
+        """`sma_crossover` rejects fast >= slow; a rejected combo cannot pull a mean."""
+        grid = {"fast": [10, 40], "slow": [30]}  # fast=40 >= slow=30 is invalid
+        summary = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END)
+        assert len(summary.skipped) == 1
+        rows = summary.stability()
+        # Only the one runnable combo produced a score, so it has zero neighbours —
+        # never a mean silently computed from a combo that was never run.
+        assert len(rows) == 1
+        assert rows[0].neighbor_count == 0
+        assert rows[0].neighbor_mean is None
+
+    def test_combo_scores_averages_across_windows(self) -> None:
+        """`--windows` runs a combo multiple times; stability reads the combo's mean."""
+        grid = {"fast": [5], "slow": [30]}
+        summary = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END, windows=3)
+        scores = summary.combo_scores()
+        only_key = combo_key({"fast": 5, "slow": 30})
+        window_sharpes = [run.metrics.sharpe for run in summary.runs]
+        assert len(window_sharpes) == 3
+        assert scores[only_key] == pytest.approx(sum(window_sharpes) / 3.0)
+
+    def test_stability_ranks_by_total_return_when_asked(self) -> None:
+        grid = {"fast": [5, 10], "slow": [30, 50]}
+        summary = run_sweep("sma_crossover", grid, _adapter(), _SYMBOLS, _START, _END)
+        rows = summary.stability(by="total_return")
+        expected_scores = {combo_key(r.params): r.score for r in rows}
+        for run in summary.runs:
+            assert expected_scores[combo_key(run.params)] == pytest.approx(run.metrics.total_return)
