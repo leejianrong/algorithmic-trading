@@ -1030,6 +1030,7 @@ class TestNeighborStabilityPure:
         row = next(r for r in rows if r.params == {"fast": 10, "slow": 50})
         assert row.score == 1.0
         assert row.neighbor_count == 4
+        assert row.neighbor_mean is not None
         assert row.neighbor_mean == pytest.approx((0.2 + 0.4 + 0.6 + 0.8) / 4.0)
         assert row.gap == pytest.approx(1.0 - row.neighbor_mean)
 
