@@ -40,6 +40,19 @@ self-consistent, which is why the table stayed wrong through several releases. T
 interval itself never arrives here — ADR-0022 keeps the bar length an
 adapter-construction property — only the basis does.
 
+A flat, best-first CSV also hides the one thing a real parameter search cares about
+most: whether a winner sits on a plateau or a spike. :func:`neighbor_stability`
+(ADR-0065, KAN-620) answers that for :func:`run_sweep`'s grid: for every combo it
+looks up the *adjacent* grid value in each swept parameter, holding the others fixed
+(``fast=10, slow=100``'s neighbours are the adjacent ``fast`` values at ``slow=100``
+and the adjacent ``slow`` values at ``fast=10``), and reports the combo's own score
+next to the mean of whichever neighbours actually ran. A combo whose score sits far
+above that mean won by a coincidence a real search would not reproduce reliably — a
+"cliff", not an edge. This is read-only reporting on top of what :func:`run_sweep`
+already computed: it changes no ranking, no metric, and no existing field, and it is
+off by default in the CLI (the same additive, opt-in shape as ``--bootstrap``,
+ADR-0039). :func:`run_walk_forward` does not carry it yet — see ADR-0065's known gaps.
+
 Everything here is pure with respect to the inputs: no wall clock, no RNG, no
 network. Determinism comes entirely from the injected adapter (seed a
 ``SyntheticAdapter`` for offline, repeatable sweeps) and the deterministic grid
@@ -78,6 +91,12 @@ if TYPE_CHECKING:
 
 # A single parameter combination, e.g. ``{"fast": 5, "slow": 30}``.
 ParamCombo = dict[str, object]
+
+# A combo's canonical, hashable, order-independent identity (ADR-0065): sorted
+# ``(name, value)`` pairs, so two combos built independently — a sweep run's own
+# ``params`` vs. a neighbour :func:`neighbor_stability` assembles — compare equal
+# whenever their key/value pairs match, regardless of each dict's own insertion order.
+ComboKey = tuple[tuple[str, object], ...]
 
 # The annualization basis a sweep assumes when its caller names none: the US-equity
 # *daily* year, which is what :func:`trading.metrics.compute` defaults to and what a
@@ -272,6 +291,11 @@ class SweepSummary:
     # hand-built summary stays valid and every existing caller is unaffected; the
     # CLI always sets it from the run's own Frequency.
     periods_per_year: float = DEFAULT_PERIODS_PER_YEAR
+    # The grid `run_sweep` expanded, kept verbatim so `stability` can find each
+    # combo's in-grid neighbours (ADR-0065). Empty for a hand-built summary — the
+    # pre-existing default every other field here already uses — in which case
+    # `stability` returns `[]` rather than guessing a grid that was never recorded.
+    grid: dict[str, list[object]] = field(default_factory=dict)
 
     def ranked(self, by: str = "sharpe") -> list[SweepRun]:
         """Runs sorted best-first by ``by`` ('sharpe' or 'total_return').
@@ -369,6 +393,137 @@ class SweepSummary:
         if moments is None:
             return None
         return deflated_sharpe(moments, self.trial_sharpes(), basis, prior_trials=prior_trials)
+
+    def combo_scores(self, by: str = "sharpe") -> dict[ComboKey, float]:
+        """Mean ``by``-metric per unique combo, collapsing window repeats (ADR-0065).
+
+        Under ``--windows`` a combo appears once per window in :attr:`runs`; the
+        parameter surface a grid neighbour lives on is the *combo*, not the
+        ``(combo, window)`` pair, so this averages across a combo's windows before
+        anything compares it to a neighbour. With ``windows=1`` (the common case)
+        this is just that one run's score.
+        """
+        key = _rank_key(by)
+        grouped: dict[ComboKey, list[float]] = {}
+        for run in self.runs:
+            grouped.setdefault(combo_key(run.params), []).append(key(run.metrics))
+        return {k: fmean(scores) for k, scores in grouped.items()}
+
+    def stability(self, by: str = "sharpe") -> list[NeighborStability]:
+        """Each combo's own score next to its immediate grid-neighbour mean.
+
+        ADR-0065 / KAN-620: a flat ranked CSV cannot show whether a winner sits on a
+        plateau or a spike a real search would not land on reliably. This calls
+        :func:`neighbor_stability` over :meth:`combo_scores`, in the grid's own
+        deterministic expansion order (:func:`expand_grid`) filtered to combos that
+        actually produced a score — a combo the strategy constructor rejected
+        (:attr:`skipped`) never enters the neighbour mean.
+
+        ``[]`` when :attr:`grid` was never recorded (a hand-built summary, or a
+        sweep whose grid was empty) — an honest absence, not a guess at what the
+        grid might have been.
+        """
+        if not self.grid:
+            return []
+        scores = self.combo_scores(by)
+        ordered = {
+            key: scores[key]
+            for key in (combo_key(combo) for combo in expand_grid(self.grid))
+            if key in scores
+        }
+        return neighbor_stability(self.grid, ordered)
+
+
+def combo_key(params: Mapping[str, object]) -> ComboKey:
+    """A combo's hashable key, sorted by parameter name so key order never matters.
+
+    Two combos built independently (a sweep run's own ``params`` vs. a neighbour
+    assembled by :func:`neighbor_stability`) must compare equal whenever their
+    key/value pairs match regardless of how each dict was built; dict order is not
+    guaranteed to agree, so this sorts rather than trusting ``tuple(d.items())``.
+    """
+    return tuple(sorted(params.items(), key=lambda kv: kv[0]))
+
+
+@dataclass(frozen=True, slots=True)
+class NeighborStability:
+    """One combo's score next to the mean of its immediate grid neighbours.
+
+    ``neighbor_mean``/``gap`` are ``None`` — never a fabricated 0.0 — when the combo
+    has no neighbour with a recorded score: every swept axis put it at a grid edge,
+    or every adjacent combo was rejected by the strategy constructor (:attr:`SweepSummary.skipped`)
+    or fell in a window that produced no data. A parameter with only one grid value
+    is not "swept" and contributes no neighbours in that dimension, so a one-value
+    axis never scores a combo as unstable for that reason alone.
+
+    ``gap = score - neighbor_mean``: positive means this combo scored *above* its
+    neighbours — the "cliff" ADR-0065 exists to surface, a peak a real search would
+    not reliably land on again. Negative means it scored below them, i.e. sits in a
+    local dip rather than on a ridge.
+    """
+
+    params: ParamCombo
+    score: float
+    neighbor_mean: float | None
+    neighbor_count: int
+    gap: float | None
+
+
+def neighbor_stability(
+    grid: Mapping[str, Sequence[object]],
+    scores: Mapping[ComboKey, float],
+) -> list[NeighborStability]:
+    """Each scored combo next to the mean of its immediate grid neighbours.
+
+    For every ``key -> score`` pair, and for every swept parameter (a grid axis with
+    more than one value — a single-value axis has no adjacent value to compare
+    against and contributes nothing), this looks up the value immediately before and
+    after the combo's own value *in the grid's own list order* — the same order
+    :func:`expand_grid` reads, so ``fast=[5, 10, 20]`` treats 10 as adjacent to both 5
+    and 20 regardless of numeric spacing. Only neighbours present in ``scores`` count
+    toward the mean; a combo the strategy constructor rejected, or that never ran,
+    is silently excluded rather than treated as a zero.
+
+    Pure and order-preserving: returns one :class:`NeighborStability` per entry of
+    ``scores``, in ``scores``'s own iteration order, so a caller that wants a
+    deterministic order should pass an already-ordered mapping (as
+    :meth:`SweepSummary.stability` does).
+    """
+    axis_values: dict[str, list[object]] = {k: list(v) for k, v in grid.items()}
+    swept_axes = [axis for axis, values in axis_values.items() if len(values) > 1]
+
+    rows: list[NeighborStability] = []
+    for key, score in scores.items():
+        params = dict(key)
+        neighbor_scores: list[float] = []
+        for axis in swept_axes:
+            values = axis_values[axis]
+            try:
+                index = values.index(params[axis])
+            except (KeyError, ValueError):
+                # The combo doesn't carry this axis, or its value isn't one of the
+                # grid's own — can't happen for a combo `expand_grid` produced, but
+                # a hand-built `scores` mapping should not raise for it.
+                continue
+            for neighbor_index in (index - 1, index + 1):
+                if 0 <= neighbor_index < len(values):
+                    neighbor_params = dict(params)
+                    neighbor_params[axis] = values[neighbor_index]
+                    neighbor_score = scores.get(combo_key(neighbor_params))
+                    if neighbor_score is not None:
+                        neighbor_scores.append(neighbor_score)
+        neighbor_mean = fmean(neighbor_scores) if neighbor_scores else None
+        gap = None if neighbor_mean is None else score - neighbor_mean
+        rows.append(
+            NeighborStability(
+                params=params,
+                score=score,
+                neighbor_mean=neighbor_mean,
+                neighbor_count=len(neighbor_scores),
+                gap=gap,
+            )
+        )
+    return rows
 
 
 def _build_strategy(name: str, combo: ParamCombo) -> Strategy:
@@ -556,6 +711,7 @@ def run_sweep(
         skipped=skipped,
         empty_windows=empty_windows,
         periods_per_year=periods_per_year,
+        grid={key: list(values) for key, values in grid.items()},
     )
 
 
