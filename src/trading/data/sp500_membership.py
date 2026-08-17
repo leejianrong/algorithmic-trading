@@ -25,7 +25,7 @@ small caps**: S&P 500 removals are overwhelmingly acquisitions and index
 reshuffles rather than bankruptcies, and an acquired firm's ticker typically keeps
 its price history on yfinance right up to the acquisition date (it stops
 *listing*, it does not retroactively vanish) — but it is not zero, and this module
-does not measure it. `docs/adr/0064-point-in-time-sp500-membership.md` records a
+does not measure it. `docs/adr/0064-point-in-time-sp500-universe.md` records a
 real measurement of how much of a PIT universe actually comes back with usable
 price data on `--source yfinance`, for one date range; treat that as one data
 point; do not assume some other window behaves the same.
