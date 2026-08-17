@@ -37,6 +37,11 @@ Three honesty knobs sit on top of that, all opt-in and all off by default:
 ``sweep`` needs no flag for its half of ADR-0039: it already ran every trial, so
 the winner's deflation is free and prints under the ranking table. A "best of 24"
 Sharpe quoted without the 24 is the number this bench exists not to print.
+- ``backtest --regimes`` splits the metrics by the run's own high/low-volatility
+  and trending/mean-reverting bars, restating the same ``PerformanceMetrics``
+  restricted to each label (ADR-0066) — a 21-year Sharpe otherwise averages the
+  dot-com bust, the GFC, and the 2009-2020 bull run into one number. Off by
+  default; a run without the flag is byte-identical to before it existed.
 
 - ``backtest --ledger PATH`` / ``sweep --ledger PATH`` append every invocation to a
   cross-invocation JSONL trial ledger (``trading.ledger.TrialLedger``, ADR-0062) and
@@ -134,6 +139,7 @@ from trading.metrics import (
     DEFAULT_BOOTSTRAP_SEED,
     SignificanceReport,
     assess_significance,
+    compute_regime_report,
     trial_count_note,
 )
 from trading.metrics import compute as compute_metrics
@@ -1049,6 +1055,15 @@ def backtest(
         help="Seed for the bootstrap RNG (needs --bootstrap). Printed with the interval, "
         "so the figure is reproducible.",
     ),
+    regimes: bool = typer.Option(
+        False,
+        "--regimes/--no-regimes",
+        help=(
+            "Split the metrics by the run's own high/low-volatility and "
+            "trending/mean-reverting bars (ADR-0066). Off by default; a run without "
+            "the flag is byte-identical to before it existed."
+        ),
+    ),
     ledger: Path | None = typer.Option(
         None,
         "--ledger",
@@ -1148,6 +1163,17 @@ def backtest(
     market_line = _market_line(chosen_market, freq)
     if market_line:
         typer.echo(market_line)
+
+    # Computed ONCE here and handed to both the text summary and result.json
+    # (ADR-0066, the same shape ADR-0039's bootstrap already uses): neither
+    # `summarize` nor `write_result_json` ever derives it, so a run without
+    # --regimes pays nothing and prints exactly the bytes it always did.
+    regime_report = (
+        compute_regime_report(result, freq.periods_per_year, free_parameters=free_params)
+        if regimes
+        else None
+    )
+
     typer.echo(
         summarize(
             result,
@@ -1155,6 +1181,7 @@ def backtest(
             periods_per_year=freq.periods_per_year,
             free_parameters=free_params,
             significance=significance,
+            regimes=regime_report,
         )
     )
     write_equity_csv(result, out, bench_result)
@@ -1199,6 +1226,7 @@ def backtest(
         metrics=metrics,
         benchmark_curve=bench_result.equity_curve if bench_result is not None else None,
         significance=significance,
+        regimes=regime_report,
     )
     typer.echo(f"Wrote result JSON to {result_json}")
     if plot:

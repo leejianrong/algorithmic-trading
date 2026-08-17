@@ -29,6 +29,19 @@ sweep winner for the number of combinations that competed for the title. All of
 it is deterministic — every function takes an explicit integer ``seed`` and drives
 its own :class:`random.Random`; nothing here ever touches the global RNG, so the
 same run always yields the same interval.
+
+Regime-split metrics (ADR-0066) sit just above the significance block:
+:func:`compute_regime_report` classifies every bar of a run's *own* equity curve
+into a volatility regime (high/low, split at the run's own trailing-vol median)
+and, independently, a trend regime (trending/mean-reverting, split at the run's
+own trailing efficiency-ratio median), then recomputes the *same*
+:class:`PerformanceMetrics` restricted to each label — so "Sharpe 1.4 overall"
+can be read alongside "Sharpe 2.1 in low-vol bars, -0.3 in high-vol ones" rather
+than averaging a 21-year run's dot-com bust, GFC, and bull market into one number.
+Purely additive reporting: it does not change what :func:`compute` returns, and a
+regime with too few classified bars for :data:`MIN_BOOTSTRAP_OBSERVATIONS` to mean
+anything is still computed (never hidden) but flagged, exactly as ADR-0029 flags a
+thin trades-per-parameter ratio rather than suppressing it.
 """
 
 from __future__ import annotations
@@ -38,7 +51,7 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from itertools import pairwise
 from math import e, sqrt
-from statistics import NormalDist
+from statistics import NormalDist, median
 from typing import TYPE_CHECKING
 
 from trading.types import SHARE_EPS, Side
@@ -1304,5 +1317,372 @@ def assess_significance(
         sharpe_interval=interval,
         paired=paired,
         deflated=deflated,
+        notes=notes,
+    )
+
+
+# --- Regime-split metrics (ADR-0066) ------------------------------------------
+
+# Trailing bars the classifier looks back over to score a bar's volatility and
+# trend strength: 20 is about one trading month of daily bars — long enough that
+# a single outlier return does not flip the label, short enough that the labels
+# still track a multi-year run's actual regime changes rather than smoothing them
+# all away. Fixed rather than derived from ``periods_per_year`` (a bar count, not
+# a calendar duration) so intraday runs get the same 20-*bar* lookback a daily
+# run does; ADR-0066 records that as a deliberate, revisitable choice.
+REGIME_WINDOW = 20
+
+
+def _equity_path(returns: Sequence[float], start: float) -> list[float]:
+    """Equity levels implied by compounding ``returns`` back-to-back from ``start``.
+
+    Used only to get a dollar-scaled equity series for a regime slice's max
+    drawdown and turnover denominator (traded notional is in real dollars, so the
+    denominator must be too) — never exposed as a public curve, because a regime
+    slice is a *discontiguous* set of bars and this path does not correspond to
+    any actual sequence of calendar dates.
+    """
+    path = [start]
+    equity = start
+    for r in returns:
+        equity *= 1.0 + r
+        path.append(equity)
+    return path
+
+
+def _total_return_of(returns: Sequence[float]) -> float:
+    """:func:`total_return`'s arithmetic over a bare return sequence.
+
+    A regime slice is a *discontiguous* subsequence of a run's bars — "every bar
+    the run spent in a high-vol regime", not a contiguous span — so there is no
+    real :class:`~trading.engine.EquityPoint` curve to hand :func:`total_return`.
+    This compounds the regime's own per-bar returns back-to-back instead, which is
+    the only sense in which "the regime's total return" is defined: what the
+    strategy would have earned had it experienced only those bars, in order.
+    """
+    if not returns:
+        return 0.0
+    product = 1.0
+    for r in returns:
+        product *= 1.0 + r
+    return product - 1.0
+
+
+def _annualized_return_of(returns: Sequence[float], periods_per_year: float) -> float:
+    """:func:`annualized_return`'s arithmetic over a bare return sequence."""
+    n = len(returns)
+    if n <= 0:
+        return 0.0
+    return float((1.0 + _total_return_of(returns)) ** (periods_per_year / n)) - 1.0
+
+
+def _max_drawdown_of(returns: Sequence[float], start: float = 1.0) -> float:
+    """:func:`max_drawdown`'s arithmetic over a bare return sequence.
+
+    Rebuilds the equity path implied by compounding ``returns`` from ``start``
+    (the run's actual starting equity, so the fraction reported matches what
+    :func:`max_drawdown` would have shown on a curve that only ever saw these
+    bars) and walks it exactly as :func:`max_drawdown` does.
+    """
+    peak = float("-inf")
+    worst = 0.0
+    for value in _equity_path(returns, start):
+        if value > peak:
+            peak = value
+        if peak > 0:
+            drawdown = (peak - value) / peak
+            if drawdown > worst:
+                worst = drawdown
+    return worst
+
+
+def _sortino_of(returns: Sequence[float], periods_per_year: float, rf: float = 0.0) -> float:
+    """:func:`sortino`'s arithmetic over a bare return sequence."""
+    if len(returns) < 2:
+        return 0.0
+    excess = [r - rf for r in returns]
+    mean = sum(excess) / len(excess)
+    downside_sq = sum(min(r, 0.0) ** 2 for r in excess)
+    downside_dev = sqrt(downside_sq / (len(excess) - 1))
+    if downside_dev == 0.0:
+        return 0.0
+    return mean / downside_dev * sqrt(periods_per_year)
+
+
+def _calmar_of(returns: Sequence[float], periods_per_year: float, start: float = 1.0) -> float:
+    """:func:`calmar`'s arithmetic over a bare return sequence."""
+    dd = _max_drawdown_of(returns, start)
+    if dd == 0.0:
+        return 0.0
+    return _annualized_return_of(returns, periods_per_year) / dd
+
+
+def _regime_trade_stats(
+    fills: Sequence[tuple[object, Fill]],
+    regime_ts: frozenset[datetime],
+) -> tuple[int, int, int, float]:
+    """``(wins, closes, entries, traded_notional)`` restricted to bars in ``regime_ts``.
+
+    Walks *every* fill in submission order — never just the ones whose bar falls
+    in this regime — to keep the running per-symbol quantity and average cost
+    correct, mirroring :func:`win_rate` and :func:`entry_count`. A regime slice
+    must not pretend the position history outside it never happened: a SELL that
+    closes a position opened in a different regime still needs that position's
+    true average cost, and a BUY on a warmup or other-regime bar still changes
+    what "flat" means for the next entry. Only fills whose own timestamp is in
+    ``regime_ts`` are *tallied* into the returned counters; every fill still
+    updates the running state.
+
+    ``fills`` is the blotter's ``list[tuple[datetime, Fill]]``, exactly as
+    :func:`win_rate`/:func:`entry_count` take it.
+    """
+    qty: dict[str, float] = {}
+    avg_cost: dict[str, float] = {}
+    wins = closes = entries = 0
+    traded = 0.0
+    for ts, fill in fills:
+        held = qty.get(fill.symbol, 0.0)
+        cost = avg_cost.get(fill.symbol, 0.0)
+        in_regime = ts in regime_ts
+        if fill.side is Side.BUY:
+            if in_regime:
+                if held <= SHARE_EPS:
+                    entries += 1
+                traded += abs(fill.qty * fill.price)
+            new_qty = held + fill.qty
+            if new_qty > 0:
+                avg_cost[fill.symbol] = (held * cost + fill.qty * fill.price) / new_qty
+            qty[fill.symbol] = new_qty
+        else:
+            if in_regime:
+                closes += 1
+                if fill.price > cost:
+                    wins += 1
+                traded += abs(fill.qty * fill.price)
+            qty[fill.symbol] = held - fill.qty
+    return wins, closes, entries, traded
+
+
+@dataclass(frozen=True, slots=True)
+class RegimeMetrics:
+    """:class:`PerformanceMetrics` restricted to the bars sharing one regime label.
+
+    ``bar_count`` is the number of *return periods* (not raw bars — one fewer than
+    the classified span, same convention :func:`daily_returns` uses) classified
+    into this regime; it is the denominator ADR-0066's small-sample warning reads.
+    """
+
+    label: str
+    bar_count: int
+    metrics: PerformanceMetrics
+
+    @property
+    def underpowered(self) -> bool:
+        """Whether this regime has too few return periods for its Sharpe to mean
+        anything.
+
+        Reuses :data:`MIN_BOOTSTRAP_OBSERVATIONS` rather than a fresh threshold —
+        a regime Sharpe computed from 8 bars is exactly as unreliable as a
+        whole-run Sharpe would be from 8 bars, and ADR-0039 already set that floor
+        for "a block bootstrap needs enough observations to mean something". A
+        regime this thin gets its :class:`PerformanceMetrics` computed and printed
+        (never hidden — the reader decides), but flagged.
+        """
+        return self.bar_count < MIN_BOOTSTRAP_OBSERVATIONS
+
+
+@dataclass(frozen=True, slots=True)
+class RegimeReport:
+    """Two independent regime splits of one run's performance (ADR-0066).
+
+    The volatility axis (``high_vol``/``low_vol``) and the trend axis
+    (``trending``/``mean_reverting``) are reported *separately*, not crossed into
+    a four-way combination. Crossing them would quarter an already-scarce bar
+    count a second time — the whole point of this report is surfacing "only works
+    in one regime" on samples that are often already thin, and a chi-squared
+    slicing of few thousand bars into four buckets defeats that faster than it
+    illuminates anything.
+
+    ``window`` is :data:`REGIME_WINDOW` (or whatever was requested).
+    ``vol_threshold``/``trend_threshold`` are the run's own median trailing
+    volatility / trailing efficiency ratio — the split points — so a reader can
+    see exactly what "high" and "low" meant for *this* run rather than trusting an
+    unstated absolute cutoff. Both are ``None``, and every regime slot is
+    ``None``, only when the curve has fewer return periods than ``window`` (too
+    short to classify a single bar); ``notes`` explains why.
+    """
+
+    window: int
+    vol_threshold: float | None
+    trend_threshold: float | None
+    high_vol: RegimeMetrics | None
+    low_vol: RegimeMetrics | None
+    trending: RegimeMetrics | None
+    mean_reverting: RegimeMetrics | None
+    notes: list[str] = field(default_factory=list)
+
+
+def compute_regime_report(
+    result: BacktestResult,
+    periods_per_year: float = 252.0,
+    *,
+    window: int = REGIME_WINDOW,
+    free_parameters: int | None = None,
+) -> RegimeReport:
+    """Split ``result``'s :class:`PerformanceMetrics` by two regime axes (ADR-0066).
+
+    The classifier runs over the run's *own* equity-curve returns
+    (:func:`daily_returns`) — never a benchmark's, and never anything the
+    strategy could not itself have observed causally: each bar's label is a
+    function of the trailing ``window`` bars up to and including it, so it never
+    reads a bar that had not yet closed.
+
+    Two independent trailing statistics, each over the same ``window``-bar
+    lookback:
+
+    - **Volatility.** The sample standard deviation of the trailing ``window``
+      returns, annualized by ``sqrt(periods_per_year)`` — exactly :func:`sharpe`'s
+      annualization, applied to a rolling window instead of the whole series.
+      Bars are labeled ``"high_vol"`` when that trailing figure is at or above the
+      run's own median trailing volatility, ``"low_vol"`` otherwise.
+    - **Trend.** The Kaufman-style efficiency ratio over the same window:
+      ``abs(sum(window returns)) / sum(abs(window returns))``, in ``[0, 1]``. Near
+      1 means the window's moves mostly ran the same direction (net displacement
+      close to the sum of the moves); near 0 means they largely cancelled (a
+      choppy, mean-reverting stretch). Bars are labeled ``"trending"`` when at or
+      above the run's own median trailing efficiency ratio, ``"mean_reverting"``
+      otherwise.
+
+    Splitting at the run's *own* median (rather than a fixed absolute cutoff, e.g.
+    "20% annualized vol") is deliberate: there is no universal threshold that
+    means the same thing across a 5-minute crypto run and a 21-year daily equity
+    one, so each run supplies its own scale and every classification is relative
+    to what that particular run actually experienced. ``vol_threshold``/
+    ``trend_threshold`` on the returned :class:`RegimeReport` record exactly what
+    that scale was.
+
+    The first ``window - 1`` return periods have no full trailing window and are
+    warmup: unclassified on *both* axes, contributing to neither regime's metrics
+    (not even a `None`-labeled bucket — they are simply excluded, the same
+    "not enough data to say anything" silence :func:`sharpe_confidence_interval`
+    keeps rather than fabricating an estimate).
+
+    Each of the four :class:`RegimeMetrics` restricts :func:`PerformanceMetrics`'s
+    return-based figures (total/annualized return, Sharpe, Sortino, Calmar, max
+    drawdown, exposure) to that regime's return periods, and its trade-based
+    figures (win rate, turnover, entry count) to fills whose own bar falls in that
+    regime — reconstructing running position/cost state from the *entire* fill
+    history for correctness (see :func:`_regime_trade_stats`), so a SELL that
+    closes a position opened in a different regime is still priced against its
+    true average cost. ``free_parameters`` behaves exactly as it does for
+    :func:`compute`: omitted, ``trades_per_parameter`` is ``None`` on every slice.
+
+    A regime with fewer than :data:`MIN_BOOTSTRAP_OBSERVATIONS` return periods
+    still gets a fully computed :class:`PerformanceMetrics` (never a suppressed or
+    ``None`` one) but :attr:`RegimeMetrics.underpowered` is ``True`` and a note
+    names it — the same "compute it, then say the sample is too thin to trust"
+    rule ADR-0029 applies to trades-per-parameter and ADR-0039 applies to the
+    Sharpe bootstrap.
+
+    Returns a :class:`RegimeReport` with every field ``None`` (but a note
+    explaining why) when the curve has fewer than ``window`` return periods —
+    too short to classify even one bar.
+    """
+    curve = result.equity_curve
+    returns = daily_returns(curve)
+    n = len(returns)
+    if n < window:
+        return RegimeReport(
+            window=window,
+            vol_threshold=None,
+            trend_threshold=None,
+            high_vol=None,
+            low_vol=None,
+            trending=None,
+            mean_reverting=None,
+            notes=[
+                f"no regime classification: {n} return period(s) is fewer than the "
+                f"{window}-bar trailing window every classification needs"
+            ],
+        )
+
+    vol_series: list[float | None] = [None] * n
+    trend_series: list[float | None] = [None] * n
+    for i in range(window - 1, n):
+        block = returns[i - window + 1 : i + 1]
+        mean_block = sum(block) / window
+        variance_block = sum((r - mean_block) ** 2 for r in block) / (window - 1)
+        vol_series[i] = sqrt(variance_block) * sqrt(periods_per_year)
+        gross = sum(abs(r) for r in block)
+        trend_series[i] = abs(sum(block)) / gross if gross > 0 else 0.0
+
+    vol_threshold = median(v for v in vol_series if v is not None)
+    trend_threshold = median(t for t in trend_series if t is not None)
+
+    vol_labels: list[str | None] = [
+        None if v is None else ("high_vol" if v >= vol_threshold else "low_vol") for v in vol_series
+    ]
+    trend_labels: list[str | None] = [
+        None if t is None else ("trending" if t >= trend_threshold else "mean_reverting")
+        for t in trend_series
+    ]
+
+    def build(labels: list[str | None], target: str) -> RegimeMetrics:
+        idx = [i for i, label in enumerate(labels) if label == target]
+        regime_returns = [returns[i] for i in idx]
+        regime_ts = frozenset(curve[i + 1].ts for i in idx)
+        regime_exposures = [curve[i + 1].exposure for i in idx]
+        start_equity = curve[0].equity
+        wins, closes, entries, traded = _regime_trade_stats(result.fills, regime_ts)
+        bar_count = len(idx)
+        avg_equity = _mean(_equity_path(regime_returns, start_equity))
+        avg_exp = avg_exposure(regime_exposures)
+        ann_return = _annualized_return_of(regime_returns, periods_per_year)
+        metrics = PerformanceMetrics(
+            total_return=_total_return_of(regime_returns),
+            annualized_return=ann_return,
+            sharpe=_sharpe_of(regime_returns, periods_per_year),
+            sortino=_sortino_of(regime_returns, periods_per_year),
+            calmar=_calmar_of(regime_returns, periods_per_year, start_equity),
+            max_drawdown=_max_drawdown_of(regime_returns, start_equity),
+            win_rate=(wins / closes) if closes else 0.0,
+            turnover=(
+                traded / avg_equity * (periods_per_year / bar_count)
+                if bar_count > 0 and avg_equity > 0
+                else 0.0
+            ),
+            avg_exposure=avg_exp,
+            peak_exposure=peak_exposure(regime_exposures),
+            trade_count=entries,
+            trades_per_parameter=(
+                entries / free_parameters
+                if free_parameters is not None and free_parameters > 0
+                else None
+            ),
+            return_per_unit_exposure=(ann_return / avg_exp) if avg_exp > 0.0 else None,
+        )
+        return RegimeMetrics(label=target, bar_count=bar_count, metrics=metrics)
+
+    high_vol = build(vol_labels, "high_vol")
+    low_vol = build(vol_labels, "low_vol")
+    trending = build(trend_labels, "trending")
+    mean_reverting = build(trend_labels, "mean_reverting")
+
+    notes = [
+        f"{regime.label}: {regime.bar_count} return period(s) is below "
+        f"{MIN_BOOTSTRAP_OBSERVATIONS} — its Sharpe/Sortino/Calmar are computed and printed "
+        "but should not be read as a measurement (ADR-0066, echoing ADR-0029/ADR-0039)"
+        for regime in (high_vol, low_vol, trending, mean_reverting)
+        if regime.underpowered
+    ]
+
+    return RegimeReport(
+        window=window,
+        vol_threshold=vol_threshold,
+        trend_threshold=trend_threshold,
+        high_vol=high_vol,
+        low_vol=low_vol,
+        trending=trending,
+        mean_reverting=mean_reverting,
         notes=notes,
     )
