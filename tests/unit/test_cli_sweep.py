@@ -12,7 +12,7 @@ from typer.testing import CliRunner, Result
 from trading.cli import app
 from trading.data.synthetic import SyntheticAdapter
 from trading.frequency import Frequency
-from trading.sweep import run_walk_forward
+from trading.sweep import combo_key, run_sweep, run_walk_forward
 
 runner = CliRunner()
 
@@ -465,3 +465,146 @@ class TestTheIntervalReachesTheTable:
         # And the basis really is the intraday one, not the daily year it defaulted
         # to: at 5m these Sharpes are 8.83x what 252 would have produced.
         assert abs(expected.folds[0].in_sample_metrics.sharpe) > 5.0
+
+
+class TestStabilityCli:
+    """``--stability`` (ADR-0065, KAN-620): a combo's score vs. its grid-neighbour mean.
+
+    Off by default, additive: the main sweep CSV and stdout table are unaffected
+    either way, and the new report is a sibling file next to ``--out``.
+    """
+
+    def _sweep(self, tmp_path: Path, out_name: str = "sweep.csv", *extra: str) -> Result:
+        return runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "sma_crossover",
+                "--param",
+                "fast=5,10,15",
+                "--param",
+                "slow=30,50,80",
+                "--source",
+                "synthetic",
+                "--seed",
+                "5",
+                "--out",
+                str(tmp_path / out_name),
+                *extra,
+                *_COMMON,
+            ],
+        )
+
+    def test_off_by_default_writes_no_stability_file(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path)
+        assert result.exit_code == 0, result.output
+        assert "stability" not in result.output.lower()
+        assert not (tmp_path / "sweep_stability.csv").exists()
+
+    def test_stability_writes_a_sibling_csv_next_to_out(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path, "sweep.csv", "--stability")
+        assert result.exit_code == 0, result.output
+        stability_path = tmp_path / "sweep_stability.csv"
+        assert stability_path.exists()
+        assert f"Wrote parameter-stability report to {stability_path}" in result.output
+
+    def test_stability_csv_has_one_row_per_combo_and_the_expected_columns(
+        self, tmp_path: Path
+    ) -> None:
+        assert self._sweep(tmp_path, "sweep.csv", "--stability").exit_code == 0
+        with (tmp_path / "sweep_stability.csv").open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        # 3 fast x 3 slow = 9 combos, one row each (no window repeats here).
+        assert len(rows) == 9
+        assert set(rows[0]) == {
+            "rank",
+            "fast",
+            "slow",
+            "sharpe",
+            "neighbor_mean",
+            "neighbor_count",
+            "gap",
+        }
+        # Ranked best-first by score, same convention as the main sweep CSV.
+        sharpes = [float(r["sharpe"]) for r in rows]
+        assert sharpes == sorted(sharpes, reverse=True)
+
+    def test_stability_csv_matches_run_sweeps_own_stability(self, tmp_path: Path) -> None:
+        """The CLI's report is exactly `SweepSummary.stability`, not a re-derivation."""
+        assert self._sweep(tmp_path, "sweep.csv", "--stability").exit_code == 0
+        freq_periods_per_year = 252.0  # daily equity default, matching _COMMON's --interval 1d
+        expected = run_sweep(
+            "sma_crossover",
+            {"fast": [5, 10, 15], "slow": [30, 50, 80]},
+            SyntheticAdapter(seed=5),
+            ["AAA", "BBB"],
+            datetime(2021, 1, 1, tzinfo=UTC),
+            datetime(2022, 12, 31, tzinfo=UTC),
+            periods_per_year=freq_periods_per_year,
+        ).stability()
+        expected_by_key = {combo_key(r.params): r for r in expected}
+
+        with (tmp_path / "sweep_stability.csv").open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        assert len(rows) == len(expected)
+        for row in rows:
+            key = combo_key({"fast": int(row["fast"]), "slow": int(row["slow"])})
+            want = expected_by_key[key]
+            assert float(row["sharpe"]) == pytest.approx(want.score, abs=5e-5)
+            if want.neighbor_mean is None:
+                assert row["neighbor_mean"] == ""
+            else:
+                assert float(row["neighbor_mean"]) == pytest.approx(want.neighbor_mean, abs=5e-5)
+
+    def test_stability_prints_an_ascii_heatmap_for_a_two_axis_grid(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path, "sweep.csv", "--stability")
+        assert result.exit_code == 0, result.output
+        # The heatmap header names both axes and every slow value as a column.
+        assert "fast\\slow" in result.output
+        assert "30" in result.output.split("fast\\slow", 1)[1].splitlines()[0]
+
+    def test_stability_does_not_touch_the_main_sweep_csv_or_table(self, tmp_path: Path) -> None:
+        """Purely additive: the pre-existing artifacts are byte-identical either way."""
+        without = self._sweep(tmp_path, "a.csv")
+        with_flag = self._sweep(tmp_path, "b.csv", "--stability")
+        assert without.exit_code == 0
+        assert with_flag.exit_code == 0
+        assert (tmp_path / "a.csv").read_text() == (tmp_path / "b.csv").read_text()
+        # Same ranked table and deflation block on stdout, modulo the new lines
+        # --stability appends after "Wrote sweep results to ...".
+        without_head = without.output.split("Wrote sweep results to", 1)[0]
+        with_head = with_flag.output.split("Wrote sweep results to", 1)[0]
+        assert without_head == with_head
+
+    def test_stability_not_wired_into_folds_prints_a_note_and_writes_nothing(
+        self, tmp_path: Path
+    ) -> None:
+        result = self._sweep(tmp_path, "wf.csv", "--stability", "--folds", "2")
+        assert result.exit_code == 0, result.output
+        assert "not yet wired into --folds walk-forward" in result.output
+        assert not (tmp_path / "wf_stability.csv").exists()
+
+    def test_a_single_param_axis_grid_prints_no_heatmap(self, tmp_path: Path) -> None:
+        """The literal heatmap only makes sense with exactly two `--param` axes."""
+        result = runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "equal_weight",
+                "--param",
+                "invested=0.5,0.9",
+                "--source",
+                "synthetic",
+                "--seed",
+                "5",
+                "--stability",
+                "--out",
+                str(tmp_path / "sweep.csv"),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "\\" not in result.output
+        assert (tmp_path / "sweep_stability.csv").exists()
