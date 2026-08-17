@@ -59,6 +59,13 @@ Sharpe quoted without the 24 is the number this bench exists not to print.
   grows (append-only, so a crash mid-write under-reports rather than corrupts).
   ``--hypothesis TEXT`` records a pre-registered rationale verbatim alongside the
   count, for KAN-862's still-unbuilt playbook to enforce later.
+- ``backtest --liquidity-tier-adv`` charges a lower, more-liquid slippage rate to
+  symbols whose pre-run ADV (the same formation-window measurement ``--min-adv``
+  uses) clears the floor, and leaves everything else on the market's flat default
+  (KAN-861, ADR-0063) — cost is a function of liquidity, not of asset class, so a
+  cross-sectional run spanning the whole S&P 500 should not price its 500th name
+  like a mega-cap. Off by default; a run without the flag prices every symbol flat,
+  exactly as before.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -101,7 +108,13 @@ from trading.broker import SimulatedBroker
 from trading.brokers.alpaca import AlpacaBroker
 from trading.calendar import CALENDARS, CRYPTO_24_7, US_EQUITY, MarketCalendar, get_calendar
 from trading.clock import FakeClock, WallClock
-from trading.config import CRYPTO_HALT_COOLDOWN_BARS, CRYPTO_TAKER_FEE_BPS, CostConfig, RiskConfig
+from trading.config import (
+    CRYPTO_HALT_COOLDOWN_BARS,
+    CRYPTO_TAKER_FEE_BPS,
+    LIQUID_TIER_SLIPPAGE_BPS,
+    CostConfig,
+    RiskConfig,
+)
 from trading.data.alpaca_adapter import AlpacaAdapter
 from trading.data.csv_adapter import CsvAdapter
 from trading.data.fake import FakeAdapter
@@ -135,7 +148,13 @@ from trading.engine import (
 from trading.frequency import DAILY, Frequency
 from trading.interfaces import Broker, DataAdapter
 from trading.ledger import TrialLedger, TrialRecord
-from trading.liquidity import DEFAULT_FORMATION_DAYS, screen_by_adv
+from trading.liquidity import (
+    DEFAULT_FORMATION_DAYS,
+    DEFAULT_TIER_ADV_FLOOR,
+    classify_liquidity_tier,
+    liquidity_tier_rates,
+    screen_by_adv,
+)
 from trading.logging_config import (
     DEFAULT_LOG_FORMAT,
     DEFAULT_LOG_LEVEL,
@@ -361,6 +380,42 @@ def _apply_liquidity_screen(
     return screen.kept
 
 
+def _apply_liquidity_tiering(
+    adapter: DataAdapter,
+    tickers: list[str],
+    start: datetime,
+    *,
+    tier_adv_floor: float,
+    tier_slippage_bps: float,
+    formation_days: int,
+) -> dict[str, float]:
+    """Classify ``tickers`` into the liquid cost tier by pre-run ADV (KAN-861).
+
+    Reuses the exact formation-window ADV measurement ``--min-adv`` already uses
+    (:func:`~trading.liquidity.classify_liquidity_tier`) — this doesn't drop a
+    symbol, it only assigns a rate — and prints one line per symbol so a tiered
+    run's cost basis is visible on stdout rather than a number baked silently into
+    ``result.json``. Symbols below the floor, or with no formation-window data,
+    keep the market's flat default rate untouched.
+    """
+    advs = classify_liquidity_tier(adapter, tickers, start, formation_days=formation_days)
+    tiered = liquidity_tier_rates(
+        advs, tier_adv_floor=tier_adv_floor, tier_slippage_bps=tier_slippage_bps
+    )
+    lines = [
+        f"Liquidity cost tier: ADV >= ${tier_adv_floor:,.0f} -> {tier_slippage_bps:g} bps "
+        "slippage (else the market's default rate), over the same pre-run formation "
+        "window --min-adv uses (KAN-861, ADR-0063)"
+    ]
+    for symbol in tickers:
+        adv = advs.get(symbol)
+        adv_str = "no data" if adv is None else f"${adv:,.0f}"
+        tier = "tiered" if symbol in tiered else "default"
+        lines.append(f"  {symbol}: ADV {adv_str} -> {tier}")
+    typer.echo("\n".join(lines) + "\n")
+    return tiered
+
+
 @dataclass(frozen=True, slots=True)
 class _Market:
     """One market selection: a calendar, a risk posture, costs, and completeness.
@@ -443,6 +498,18 @@ TAKER_FEE_HELP = (
     "Venue fee on the traded notional, in basis points. Unset takes the --market "
     f"cost model's value (us_equity: 0.0, commission-free; crypto_24_7: "
     f"{CRYPTO_TAKER_FEE_BPS:g}, Alpaca's published tier-1 taker rate — ADR-0060)."
+)
+LIQUIDITY_TIER_ADV_HELP = (
+    "Charge a lower, more-liquid slippage rate (--liquidity-tier-slippage-bps) to "
+    "symbols whose pre-run ADV clears this floor, measured over the same pre-"
+    "backtest formation window --min-adv uses (KAN-861, ADR-0063). Symbols below "
+    "the floor, or unmeasured, keep the market's flat default rate. Off by "
+    "default (None) — a run without this flag prices every symbol flat, exactly "
+    f"as before. A reasonable floor is {DEFAULT_TIER_ADV_FLOOR:,.0f} (dollars/day)."
+)
+LIQUIDITY_TIER_SLIPPAGE_HELP = (
+    "Slippage bps charged to symbols at/above --liquidity-tier-adv (needs that "
+    f"flag). Default {LIQUID_TIER_SLIPPAGE_BPS:g}."
 )
 HALT_COOLDOWN_HELP = (
     "Re-arm the halted kill switch after this many bars in force. With "
@@ -1059,6 +1126,16 @@ def backtest(
         "--adv-window",
         help="Calendar days of pre-backtest history the --min-adv screen measures over.",
     ),
+    liquidity_tier_adv: float | None = typer.Option(
+        None,
+        "--liquidity-tier-adv",
+        help=LIQUIDITY_TIER_ADV_HELP,
+    ),
+    liquidity_tier_slippage_bps: float = typer.Option(
+        LIQUID_TIER_SLIPPAGE_BPS,
+        "--liquidity-tier-slippage-bps",
+        help=LIQUIDITY_TIER_SLIPPAGE_HELP,
+    ),
     bootstrap: bool = typer.Option(
         False,
         "--bootstrap/--no-bootstrap",
@@ -1167,6 +1244,21 @@ def backtest(
     adapter = _make_adapter(source, cache_dir, seed, freq)
     if min_adv is not None:
         tickers = _apply_liquidity_screen(adapter, tickers, start, min_adv, adv_window)
+    if liquidity_tier_adv is not None:
+        tiered_rates = _apply_liquidity_tiering(
+            adapter,
+            tickers,
+            start,
+            tier_adv_floor=liquidity_tier_adv,
+            tier_slippage_bps=liquidity_tier_slippage_bps,
+            formation_days=adv_window,
+        )
+        costs = CostConfig(
+            commission_per_share=costs.commission_per_share,
+            slippage_bps=costs.slippage_bps,
+            taker_fee_bps=costs.taker_fee_bps,
+            symbol_slippage_bps=tiered_rates,
+        )
     broker = SimulatedBroker(Portfolio(cash=cash), costs)
     result = Engine(adapter, broker, Guardrails(risk)).run(strat, tickers, start, end)
 

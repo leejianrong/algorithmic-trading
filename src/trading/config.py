@@ -34,6 +34,36 @@ from dataclasses import dataclass
 # number, so nothing here was tuned to make a report look right.
 CRYPTO_TAKER_FEE_BPS = 25.0
 
+# The more-liquid cost tier's slippage rate, in basis points (KAN-861, ADR-0063).
+#
+# **Measured, not fitted, and deliberately not the point estimate.** ADR-0052
+# measured mega-cap (blue20) fills at a mean of 0.51 bps against the flat 5.0 bps
+# model, on 60 paired equity fills — and refused to re-tune the flat model to that
+# number, for reasons this constant respects rather than overrides: the measurement
+# is the same order as the ~0.4 bps IEX-vs-consolidated reference error, these are
+# *paper* fills (our cost model checked against Alpaca's fill model, not routed
+# execution), and it is one afternoon, one venue, twenty names. KAN-861 then
+# measured the *other* end of the liquidity scale — ten real, verifiably thin S&P
+# 500 constituents (ADV $35.6M-$109.3M/day, formation window 2026-05-18..2026-08-16,
+# all ten comfortably above `trading.liquidity.DEFAULT_MIN_ADV = $20M/day` but near
+# the bottom of the index and three orders of magnitude below blue20's billions) —
+# and got a mean of +4.23 bps / median +5.06 bps on 11 paired fills, i.e. close to
+# the flat 5.0 bps default. Read together the two measurements
+# say the *existing* flat model is approximately right for names this thin and
+# probably too pessimistic for names two orders of magnitude more liquid — which is
+# the whole premise of a liquidity-tiered cost model (a corollary of ADR-0060: cost
+# is a function of liquidity, not of asset class).
+#
+# So this constant moves the *mega-cap* tier down from the 5.0 bps default, but not
+# to 0.51: it keeps roughly the same margin of conservatism the flat 5.0 bps number
+# always carried over its own best point estimate (5.0 / 0.51 =~ 9.8x; 2.0 / 0.51
+# =~ 3.9x — still several times the measured mean, comfortably outside the ~0.4 bps
+# reference-price noise floor, on a sample this bench's own significance floor
+# (`MIN_PAIRED_FILLS = 30`) says is not yet a level). The default (below-floor) tier
+# is left at 5.0 exactly, unmoved, because KAN-861's own measurement is the evidence
+# *for* leaving it alone.
+LIQUID_TIER_SLIPPAGE_BPS = 2.0
+
 
 @dataclass(frozen=True, slots=True)
 class CostConfig:
@@ -58,6 +88,18 @@ class CostConfig:
     and no commission, which is a commission-free equity broker. :meth:`equity`
     names that posture and returns exactly ``CostConfig()``; :meth:`crypto` is the
     24/7 posture and differs in **one field**. ADR-0055's shape, applied to costs.
+
+    ``symbol_slippage_bps`` is a fourth, **optional** term (KAN-861, ADR-0063): a
+    per-symbol override of ``slippage_bps``, keyed by symbol. It is ``None`` by
+    default, which is the whole point — a ``CostConfig`` built the old way, or via
+    :meth:`equity`/:meth:`crypto`, carries no per-symbol overrides and prices every
+    symbol at the flat rate exactly as before. The map is populated exactly once,
+    before a run, by classifying each traded symbol's *pre-run* average dollar
+    volume into a liquidity tier (``trading.liquidity.classify_liquidity_tier`` +
+    ``liquidity_tier_rates``) — never per-bar and never from in-run data, the same
+    look-ahead discipline :func:`trading.liquidity.screen_by_adv` already enforces.
+    A symbol absent from the map (or the map itself being ``None``) falls back to
+    ``slippage_bps``, so an un-tiered symbol is priced exactly as it always was.
     """
 
     commission_per_share: float = 0.0
@@ -66,6 +108,10 @@ class CostConfig:
     # whatever the price already cost. Zero for commission-free US equities, which
     # is why every existing run is arithmetically untouched (ADR-0060).
     taker_fee_bps: float = 0.0
+    # Per-symbol slippage override, classified once from pre-run ADV (KAN-861). Kept
+    # out of `equity()`/`crypto()` entirely, so choosing a market never silently
+    # enables tiering — that is a separate, explicit opt-in at the CLI.
+    symbol_slippage_bps: Mapping[str, float] | None = None
 
     def __post_init__(self) -> None:
         if self.commission_per_share < 0:
@@ -74,6 +120,10 @@ class CostConfig:
             raise ValueError("slippage_bps must be non-negative")
         if self.taker_fee_bps < 0:
             raise ValueError("taker_fee_bps must be non-negative")
+        if self.symbol_slippage_bps is not None:
+            for symbol, rate in self.symbol_slippage_bps.items():
+                if rate < 0:
+                    raise ValueError(f"symbol_slippage_bps[{symbol!r}] must be non-negative")
 
     @classmethod
     def equity(cls) -> CostConfig:
