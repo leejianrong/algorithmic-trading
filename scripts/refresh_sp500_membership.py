@@ -75,7 +75,7 @@ OUTPUT_HEADER = ("date", "added", "removed")
 
 def _fetch_raw_snapshots(url: str) -> list[tuple[str, frozenset[str]]]:
     """Download the upstream daily-snapshot CSV and parse it to (date, tickers)."""
-    with urllib.request.urlopen(url) as resp:  # noqa: S310 -- explicit, manual refresh only
+    with urllib.request.urlopen(url) as resp:  # explicit manual refresh, not test/import-time
         text = resp.read().decode("utf-8")
 
     rows: list[tuple[str, frozenset[str]]] = []
