@@ -25,6 +25,14 @@ this module's docstrings and ADR-0029 record that limit rather than hiding it.
 
 Nothing here is stateful, random, or clock-dependent: given the same adapter and
 the same window, a screen is reproducible.
+
+**Same measurement, a second use (KAN-861, ADR-0063).** ``screen_by_adv`` answers
+"is this symbol tradable at all". :func:`classify_liquidity_tier` reuses the exact
+same point-in-time ADV computation to answer a different question — "how much
+worse than the reference price should a fill on this symbol be modelled" — and
+:func:`liquidity_tier_rates` turns that into the per-symbol override
+:class:`~trading.config.CostConfig.symbol_slippage_bps` carries. The two are
+independent: a run may screen, tier, both, or neither.
 """
 
 from __future__ import annotations
@@ -33,8 +41,10 @@ from dataclasses import dataclass
 from datetime import timedelta
 from typing import TYPE_CHECKING
 
+from trading.config import LIQUID_TIER_SLIPPAGE_BPS
+
 if TYPE_CHECKING:
-    from collections.abc import Sequence
+    from collections.abc import Mapping, Sequence
     from datetime import datetime
 
     from trading.interfaces import DataAdapter
@@ -50,6 +60,17 @@ DEFAULT_MIN_ADV = 20_000_000.0
 # long enough to average out a single earnings-day volume spike, short enough to
 # still describe the symbol's *current* liquidity.
 DEFAULT_FORMATION_DAYS = 90
+
+# The ADV floor for the more-liquid cost tier (KAN-861, ADR-0063): at or above this,
+# a symbol is classified into the tier that pays `LIQUID_TIER_SLIPPAGE_BPS` instead
+# of the market's flat default. $1B/day sits a full order of magnitude above the
+# most liquid name KAN-861 actually measured in the thin tier (ZION, $109.3M/day)
+# and comfortably inside "the billions" `blue20`'s mega-caps are described as
+# trading — i.e. it sits in the gap between the two measured samples rather than at
+# either sample's edge, which is a deliberately conservative placement: nothing
+# between ~$110M and this floor was measured, and a symbol that thin still pays the
+# unchanged 5.0 bps default rather than being assumed comparable to a mega-cap.
+DEFAULT_TIER_ADV_FLOOR = 1_000_000_000.0
 
 
 def average_dollar_volume(bars: Sequence[Bar]) -> float:
@@ -228,3 +249,72 @@ def screen_by_adv(
         formation_end=end,
         verdicts=tuple(verdicts),
     )
+
+
+def classify_liquidity_tier(
+    adapter: DataAdapter,
+    symbols: Sequence[str],
+    backtest_start: datetime,
+    *,
+    formation_days: int = DEFAULT_FORMATION_DAYS,
+    adjusted: bool = True,
+) -> dict[str, float | None]:
+    """Each symbol's pre-run ADV, for assigning a liquidity-based cost tier.
+
+    KAN-861 / ADR-0063: cost is a function of liquidity, not of asset class, and
+    ADR-0052 measured that a flat slippage assumption is closer to right for a thin
+    name than a mega-cap one. This function does the ADV *measurement* half —
+    :func:`liquidity_tier_rates` turns it into a rate, and the caller (``cli.py``)
+    hands the result to :class:`~trading.config.CostConfig.symbol_slippage_bps`.
+
+    Reuses exactly the same point-in-time :func:`formation_window` and
+    :func:`average_dollar_volume` that :func:`screen_by_adv` uses, so the identical
+    no-look-ahead guarantee applies: nothing here reads a bar the backtest will
+    trade on (ADR-0001, ADR-0029). It is a genuinely different function rather than
+    a wrapper around :func:`screen_by_adv`, because this one never drops a symbol —
+    the ADV screen and the cost tier are separate decisions (a run may use one,
+    both, or neither) — and it reports ``None`` rather than ``0.0`` for a symbol
+    with no formation-window data, so "unmeasurable" and "measured thin" stay
+    distinguishable exactly as :class:`LiquidityVerdict` keeps them distinguishable.
+
+    A bad ticker (an adapter that raises) or an empty formation window both read as
+    ``None``; one bad symbol never aborts the classification, mirroring
+    :func:`screen_by_adv`'s own resilience.
+    """
+    start, end = formation_window(backtest_start, formation_days)
+    advs: dict[str, float | None] = {}
+    for symbol in symbols:
+        try:
+            bars = adapter.get_bars(symbol, start, end, adjusted=adjusted)
+        except Exception:  # one bad ticker must never abort the classification
+            advs[symbol] = None
+            continue
+        advs[symbol] = average_dollar_volume(bars) if bars else None
+    return advs
+
+
+def liquidity_tier_rates(
+    advs: Mapping[str, float | None],
+    *,
+    tier_adv_floor: float = DEFAULT_TIER_ADV_FLOOR,
+    tier_slippage_bps: float = LIQUID_TIER_SLIPPAGE_BPS,
+) -> dict[str, float]:
+    """Turn :func:`classify_liquidity_tier`'s ADVs into a per-symbol rate override.
+
+    Only symbols clearing ``tier_adv_floor`` appear in the returned map — everything
+    else (below the floor, or unmeasured/``None``) is **omitted**, not zeroed or set
+    to the default explicitly. That is deliberate: :meth:`CostModel.fill_price`
+    falls back to :class:`~trading.config.CostConfig`'s flat ``slippage_bps`` for
+    any symbol absent from the map, so "not in the map" and "priced at the market's
+    default rate" are the same fact, and an unmeasured symbol is conservatively left
+    on the (higher, unless overridden) default rather than assumed liquid.
+    """
+    if tier_adv_floor < 0:
+        raise ValueError(f"tier_adv_floor must be non-negative, got {tier_adv_floor}")
+    if tier_slippage_bps < 0:
+        raise ValueError(f"tier_slippage_bps must be non-negative, got {tier_slippage_bps}")
+    return {
+        symbol: tier_slippage_bps
+        for symbol, adv in advs.items()
+        if adv is not None and adv >= tier_adv_floor
+    }

@@ -20,7 +20,7 @@ class CostModel:
 
     config: CostConfig
 
-    def fill_price(self, side: Side, reference: float) -> float:
+    def fill_price(self, side: Side, reference: float, symbol: str | None = None) -> float:
         """Apply slippage adversely: buys pay up, sells receive less.
 
         **The venue fee is deliberately not folded in here** (ADR-0060). Rolling a
@@ -31,8 +31,19 @@ class CostModel:
         the price it reports, so a model that priced it in would show a 25 bps gap
         against every real fill and invite someone to "correct" a cost model that
         was right. The fee is a separate term because it is a separate thing.
+
+        ``symbol`` is optional and additive (KAN-861, ADR-0063): a caller that
+        does not pass one, or a config with no ``symbol_slippage_bps`` at all, gets
+        exactly the flat ``slippage_bps`` behavior this method has always had. When
+        both are given and ``symbol`` is a key in the map, that rate is used
+        instead — the per-symbol override :meth:`CostConfig.symbol_slippage_bps`
+        documents, classified once before the run from pre-run ADV, never per-bar.
         """
-        slip = self.config.slippage_bps / 10_000.0
+        tiers = self.config.symbol_slippage_bps
+        rate = self.config.slippage_bps
+        if symbol is not None and tiers is not None and symbol in tiers:
+            rate = tiers[symbol]
+        slip = rate / 10_000.0
         factor = 1.0 + slip if side is Side.BUY else 1.0 - slip
         return reference * factor
 
@@ -114,7 +125,7 @@ class SimulatedBroker:
         return fills
 
     def _execute(self, order: Order, bar: Bar) -> Fill | None:
-        price = self._costs.fill_price(order.side, bar.open)
+        price = self._costs.fill_price(order.side, bar.open, order.symbol)
         commission = self._costs.commission(order.qty, price)
 
         if order.side is Side.BUY:
