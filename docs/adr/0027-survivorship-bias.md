@@ -107,3 +107,34 @@ its single largest known source of flattery undocumented.
   survivorship-free dataset, so this decision forecloses nothing: a future slice
   can add a point-in-time universe provider and, for the first time, *compare* a
   biased and an unbiased run on the same strategy.
+
+## Amendment (2026-08-18): the S&P 500's selection half is fixed on free data (ADR-0064)
+
+KAN-631 asked for the real fix this ADR named — a point-in-time constituent
+database — and the owner ruled out paying for one. What free data can still do
+turned out to be more than "nothing": `trading.data.sp500_membership`
+(ADR-0064) reconstructs actual S&P 500 membership for any date back to
+**1996-01-02**, from a committed, MIT-licensed, Wikipedia-derived fixture,
+verified against three known corporate-history events (TSLA's 2020-12-21
+addition, the FB→META 2022-06-09 ticker change, GM's 2013-06-07 re-addition).
+
+This closes **half** of what this ADR calls "mechanism 1": a backtest universe
+can now be chosen as it actually stood on a historical date, not assembled
+today with hindsight. It does **not** touch "mechanism 2" — yfinance still
+serves no delisted-name price history, so a PIT-selected universe still loses
+names the free price provider cannot serve. ADR-0064 measured that residual
+directly on one real comparison: a true 2007 S&P 500 sample came back roughly
+34-48% untradeable on `--source yfinance` (versus 8-18% for a same-sized
+sample of today's membership, mostly "not yet IPO'd" rather than "delisted").
+The two runs' return/Sharpe difference disagreed in *sign* between seeds, so
+this ADR's refusal to cite a precision haircut stands exactly as written above
+— nothing here licenses treating survivorship bias as quantified or corrected.
+
+**Unchanged by this amendment:** `blue20`, `core10`, and `crypto10` are exactly
+as biased as this ADR always said; nothing about them moved. This amendment is
+scoped to the S&P 500 specifically — Russell 2000 and S&P 1500 have no free
+point-in-time source and remain unaddressed, by decision (ADR-0064). Every
+number this bench has ever reported on a curated basket is still an **upper
+bound**, and forward paper results still outweigh backtest numbers for the
+reasons stated above. This ADR stays **Accepted**, not superseded — ADR-0064
+is an amendment, not a closure.

@@ -59,6 +59,17 @@ survivorship-free by construction — far more heavily. A real fix needs a
 point-in-time, survivorship-bias-free constituent database fed in through
 ``--source csv``; that is a future slice, not done.
 
+**Partially addressed for the S&P 500 specifically (ADR-0064, KAN-631):**
+:mod:`trading.data.sp500_membership` reconstructs point-in-time S&P 500
+membership (who was actually in the index on a historical date, back to
+1996-01-02) from a committed, free-data fixture. It fixes the *selection* half
+of this caveat — no more hindsight-picked constituents — but not the *price*
+half: yfinance still has no delisted-name history, so a PIT universe still
+silently loses names the free price provider cannot serve. Read that module's
+docstring and ADR-0064 for the measured residual before treating a PIT
+backtest as unbiased. `blue20` itself is unchanged by this — it remains today's
+mega-caps, and this caveat still fully applies to it.
+
 Honesty caveat 3 — ``core10`` reduces that bias substantially, and does not remove it
 ------------------------------------------------------------------------------------
 ``core10`` exists because of caveat 2. It holds **broad ETFs**, not single names,
