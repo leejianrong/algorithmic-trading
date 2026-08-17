@@ -42,6 +42,14 @@ Sharpe quoted without the 24 is the number this bench exists not to print.
   restricted to each label (ADR-0066) — a 21-year Sharpe otherwise averages the
   dot-com bust, the GFC, and the 2009-2020 bull run into one number. Off by
   default; a run without the flag is byte-identical to before it existed.
+- ``backtest --monte-carlo`` reshuffles the run's own per-bar returns into
+  thousands of random reorderings (an exact permutation each time, never a
+  resample-with-replacement) and places the run's *actual*, path-ordered max
+  drawdown against that distribution — did this run's sequence of losses cluster
+  unusually badly, or was it unusually fortunate (ADR-0067)? The Sharpe is printed
+  once, unchanged by reordering, beside the ADR-0039 bootstrap CI above it rather
+  than as a fabricated "distribution". Off by default; a run without the flag is
+  byte-identical to before it existed.
 
 - ``backtest --ledger PATH`` / ``sweep --ledger PATH`` append every invocation to a
   cross-invocation JSONL trial ledger (``trading.ledger.TrialLedger``, ADR-0062) and
@@ -140,6 +148,7 @@ from trading.metrics import (
     SignificanceReport,
     assess_significance,
     compute_regime_report,
+    monte_carlo_shuffle,
     trial_count_note,
 )
 from trading.metrics import compute as compute_metrics
@@ -919,6 +928,21 @@ def _check_bootstrap_options(*, bootstrap: bool, resamples: int) -> None:
         raise typer.Exit(2)
 
 
+def _check_monte_carlo_options(*, monte_carlo: bool, resamples: int) -> None:
+    """Reject a bad ``--monte-carlo-resamples`` **before** the backtest runs.
+
+    Mirrors :func:`_check_bootstrap_options` exactly, and for the same reason: the
+    shuffle happens after the engine has finished, so validating it there would let
+    a typo throw away a completed multi-year run and write nothing.
+    """
+    if monte_carlo and resamples < 1:
+        typer.echo(
+            f"error: --monte-carlo-resamples must be >= 1, got {resamples}",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+
 def _assess_significance(
     result: BacktestResult,
     benchmark: BacktestResult | None,
@@ -1064,6 +1088,27 @@ def backtest(
             "the flag is byte-identical to before it existed."
         ),
     ),
+    monte_carlo: bool = typer.Option(
+        False,
+        "--monte-carlo/--no-monte-carlo",
+        help=(
+            "Reshuffle the run's own per-bar returns into thousands of random "
+            "reorderings and place the actual max drawdown against that distribution "
+            "(ADR-0067). Off by default; a run without the flag is byte-identical to "
+            "before it existed."
+        ),
+    ),
+    monte_carlo_resamples: int = typer.Option(
+        DEFAULT_BOOTSTRAP_RESAMPLES,
+        "--monte-carlo-resamples",
+        help="Random reorderings to draw (needs --monte-carlo). Cost is linear in this.",
+    ),
+    monte_carlo_seed: int = typer.Option(
+        DEFAULT_BOOTSTRAP_SEED,
+        "--monte-carlo-seed",
+        help="Seed for the shuffle RNG (needs --monte-carlo). Printed with the report, "
+        "so the figure is reproducible.",
+    ),
     ledger: Path | None = typer.Option(
         None,
         "--ledger",
@@ -1088,6 +1133,7 @@ def backtest(
     _check_symbol_shapes(chosen_market, tickers)
     freq = _parse_frequency(interval, chosen_market.calendar)
     _check_bootstrap_options(bootstrap=bootstrap, resamples=bootstrap_resamples)
+    _check_monte_carlo_options(monte_carlo=monte_carlo, resamples=monte_carlo_resamples)
 
     try:
         strat = get_strategy(strategy)
@@ -1174,6 +1220,21 @@ def backtest(
         else None
     )
 
+    # Computed ONCE here and handed to both the text summary and result.json
+    # (ADR-0067, the same shape --bootstrap/--regimes already use): neither
+    # `summarize` nor `write_result_json` ever derives it, so a run without
+    # --monte-carlo pays nothing and prints exactly the bytes it always did.
+    monte_carlo_report = (
+        monte_carlo_shuffle(
+            result.equity_curve,
+            freq.periods_per_year,
+            resamples=monte_carlo_resamples,
+            seed=monte_carlo_seed,
+        )
+        if monte_carlo
+        else None
+    )
+
     typer.echo(
         summarize(
             result,
@@ -1182,6 +1243,7 @@ def backtest(
             free_parameters=free_params,
             significance=significance,
             regimes=regime_report,
+            monte_carlo=monte_carlo_report,
         )
     )
     write_equity_csv(result, out, bench_result)
@@ -1227,6 +1289,7 @@ def backtest(
         benchmark_curve=bench_result.equity_curve if bench_result is not None else None,
         significance=significance,
         regimes=regime_report,
+        monte_carlo=monte_carlo_report,
     )
     typer.echo(f"Wrote result JSON to {result_json}")
     if plot:
