@@ -66,6 +66,11 @@ Sharpe quoted without the 24 is the number this bench exists not to print.
   cross-sectional run spanning the whole S&P 500 should not price its 500th name
   like a mega-cap. Off by default; a run without the flag prices every symbol flat,
   exactly as before.
+- ``backtest --cost-budget-pct`` warns (never aborts) when a run's own predicted
+  cost drag -- annual turnover times the effective one-way rate this run actually
+  traded under -- exceeds a stated fraction of equity per year (ADR-0068,
+  KAN-860). Off by default; a run without the flag pays nothing extra and prints
+  exactly the bytes it always did.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -164,7 +169,9 @@ from trading.logging_config import (
 from trading.metrics import (
     DEFAULT_BOOTSTRAP_RESAMPLES,
     DEFAULT_BOOTSTRAP_SEED,
+    CostBudgetReport,
     SignificanceReport,
+    assess_cost_budget,
     assess_significance,
     compute_regime_report,
     monte_carlo_shuffle,
@@ -510,6 +517,13 @@ LIQUIDITY_TIER_ADV_HELP = (
 LIQUIDITY_TIER_SLIPPAGE_HELP = (
     "Slippage bps charged to symbols at/above --liquidity-tier-adv (needs that "
     f"flag). Default {LIQUID_TIER_SLIPPAGE_BPS:g}."
+)
+COST_BUDGET_HELP = (
+    "Warn (never abort) when this run's own predicted cost drag -- annual turnover "
+    "times the effective one-way rate (slippage + taker fee) this run actually "
+    "traded under -- exceeds this fraction of equity per year, e.g. 0.01 for 1% "
+    "(ADR-0068, KAN-860). Off by default (None); a run without the flag pays "
+    "nothing extra and prints nothing new."
 )
 HALT_COOLDOWN_HELP = (
     "Re-arm the halted kill switch after this many bars in force. With "
@@ -1010,6 +1024,23 @@ def _check_monte_carlo_options(*, monte_carlo: bool, resamples: int) -> None:
         raise typer.Exit(2)
 
 
+def _check_cost_budget_options(cost_budget_pct: float | None) -> None:
+    """Reject a non-positive ``--cost-budget-pct`` **before** the backtest runs.
+
+    Mirrors :func:`_check_bootstrap_options`/:func:`_check_monte_carlo_options`:
+    :func:`~trading.metrics.assess_cost_budget` raises ``ValueError`` on a
+    non-positive budget, and that check happens after the engine has finished, so
+    validating here avoids throwing away a completed multi-year run and writing
+    nothing.
+    """
+    if cost_budget_pct is not None and cost_budget_pct <= 0:
+        typer.echo(
+            f"error: --cost-budget-pct must be positive, got {cost_budget_pct}",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+
 def _assess_significance(
     result: BacktestResult,
     benchmark: BacktestResult | None,
@@ -1136,6 +1167,11 @@ def backtest(
         "--liquidity-tier-slippage-bps",
         help=LIQUIDITY_TIER_SLIPPAGE_HELP,
     ),
+    cost_budget_pct: float | None = typer.Option(
+        None,
+        "--cost-budget-pct",
+        help=COST_BUDGET_HELP,
+    ),
     bootstrap: bool = typer.Option(
         False,
         "--bootstrap/--no-bootstrap",
@@ -1211,6 +1247,7 @@ def backtest(
     freq = _parse_frequency(interval, chosen_market.calendar)
     _check_bootstrap_options(bootstrap=bootstrap, resamples=bootstrap_resamples)
     _check_monte_carlo_options(monte_carlo=monte_carlo, resamples=monte_carlo_resamples)
+    _check_cost_budget_options(cost_budget_pct)
 
     try:
         strat = get_strategy(strategy)
@@ -1327,6 +1364,18 @@ def backtest(
         else None
     )
 
+    # Computed ONCE here and handed to both the text summary and result.json
+    # (ADR-0068, the same shape --bootstrap/--regimes/--monte-carlo already use):
+    # neither `summarize` nor `write_result_json` ever derives it, so a run without
+    # --cost-budget-pct pays nothing and prints exactly the bytes it always did.
+    # `costs` is the run's own CostConfig -- including any --liquidity-tier-adv
+    # override -- so the effective rate reflects what this run actually traded at.
+    cost_budget_report: CostBudgetReport | None = (
+        assess_cost_budget(result, costs, cost_budget_pct, freq.periods_per_year)
+        if cost_budget_pct is not None
+        else None
+    )
+
     typer.echo(
         summarize(
             result,
@@ -1336,6 +1385,7 @@ def backtest(
             significance=significance,
             regimes=regime_report,
             monte_carlo=monte_carlo_report,
+            cost_budget=cost_budget_report,
         )
     )
     write_equity_csv(result, out, bench_result)
@@ -1382,6 +1432,7 @@ def backtest(
         significance=significance,
         regimes=regime_report,
         monte_carlo=monte_carlo_report,
+        cost_budget=cost_budget_report,
     )
     typer.echo(f"Wrote result JSON to {result_json}")
     if plot:
