@@ -43,6 +43,16 @@ regime with too few classified bars for :data:`MIN_BOOTSTRAP_OBSERVATIONS` to me
 anything is still computed (never hidden) but flagged, exactly as ADR-0029 flags a
 thin trades-per-parameter ratio rather than suppressing it.
 
+The turnover/cost-budget check (ADR-0068, KAN-860) sits right after the
+trades-per-parameter block, the same honesty-check neighbourhood: given a stated
+annual cost budget (a fraction of equity, e.g. 0.01 for 1%) and the
+:class:`~trading.config.CostConfig` the run actually traded under,
+:func:`assess_cost_budget` restates the arithmetic CLAUDE.md's cost-model ADRs
+already use informally — cost drag equals annual turnover times the one-way rate —
+as a computed, always-reported figure rather than something an operator does by
+hand. It is a warning, never a guardrail: like ADR-0029's trades-per-parameter
+check, it never vetoes an order or aborts a run.
+
 Monte Carlo path shuffling (ADR-0067) sits at the very end: :func:`monte_carlo_shuffle`
 draws thousands of random *permutations* of a run's own per-bar returns — every
 observed return used exactly once, just reordered, never resampled with replacement
@@ -69,6 +79,7 @@ from math import e, sqrt
 from statistics import NormalDist, median
 from typing import TYPE_CHECKING
 
+from trading.config import CostConfig
 from trading.types import SHARE_EPS, Side
 
 if TYPE_CHECKING:
@@ -338,6 +349,156 @@ def trades_per_parameter(
     if free_parameters is None or free_parameters <= 0:
         return None
     return entry_count(fills) / free_parameters
+
+
+# --- Turnover / cost-budget check (ADR-0068, KAN-860) ------------------------
+
+
+def effective_cost_rate_bps(
+    fills: Sequence[tuple[object, Fill]],
+    costs: CostConfig,
+) -> float | None:
+    """Notional-weighted average one-way cost rate a run's own fills actually paid.
+
+    ``slippage_bps`` (or, per fill, its :class:`~trading.config.CostConfig.
+    symbol_slippage_bps` override — ADR-0063) plus ``taker_fee_bps``, weighted by
+    each fill's own notional (``abs(qty * price)``). This is the *modelled* rate,
+    reconstructed from the same ``CostConfig`` the broker priced every fill at — a
+    backtest fill's slippage is not something to estimate after the fact, it is
+    exactly the config's rate for that symbol, deterministically (unlike a live
+    fill, where the realized cost is an independent observation; see
+    :mod:`trading.divergence` for that question).
+
+    Blending by notional (rather than using the flat ``slippage_bps`` alone) is
+    what makes this honest under ``--liquidity-tier-adv`` (ADR-0063): a
+    mixed-liquidity universe trades some symbols at a lower tiered rate and some at
+    the default, and a single static number would misstate whichever direction the
+    universe actually skewed.
+
+    ``None`` when there is no traded notional to weight — a run that entered
+    nothing has no rate to speak of, not a rate of zero.
+    """
+    traded = sum(abs(fill.qty * fill.price) for _ts, fill in fills)
+    if traded <= 0.0:
+        return None
+    tiers = costs.symbol_slippage_bps
+    weighted = 0.0
+    for _ts, fill in fills:
+        notional = abs(fill.qty * fill.price)
+        rate = costs.slippage_bps
+        if tiers is not None and fill.symbol in tiers:
+            rate = tiers[fill.symbol]
+        weighted += notional * (rate + costs.taker_fee_bps)
+    return weighted / traded
+
+
+@dataclass(frozen=True, slots=True)
+class CostBudgetReport:
+    """Whether a run's own turnover fits inside a stated annual cost budget.
+
+    The arithmetic this bench's cost-model ADRs (0060/0061/0063) already state
+    informally every time they quote a "predicted drag" — measured directly against
+    a real crypto run at 1454% annual turnover and a 25 bps one-way rate, which
+    predicted 3.6% of equity lost to cost and measured 4.0 percentage points — is
+    ``cost_drag = turnover * one_way_rate``. This makes it a computed, always-
+    reported figure (KAN-860) rather than something an operator works out by hand
+    before deciding a strategy's turnover is reasonable for its asset class.
+
+    ``effective_rate_bps`` is this run's own notional-weighted rate
+    (:func:`effective_cost_rate_bps`) — the blend of ``slippage_bps``/
+    ``symbol_slippage_bps``/``taker_fee_bps`` the run's fills actually priced at,
+    never a single flat assumption plugged in from outside the run. ``None`` only
+    when the run traded nothing, in which case every other field below describes
+    "no turnover, no cost, no constraint to violate" rather than an undefined ratio
+    (mirroring :func:`trades_per_parameter`'s "unknowable, not failing" convention).
+
+    ``implied_max_turnover`` is the annual turnover ``cost_budget_pct`` allows at
+    this rate — ``cost_budget_pct / (effective_rate_bps / 10_000)`` — the number in
+    the units CLAUDE.md's cost-model corollary already states it in ("Alpaca crypto
+    at 22-25 bps allows ~400% turnover"). ``None`` when the effective rate is
+    non-positive: a commission-free, unslipped run has no rate this budget could
+    ever be exceeded by, so there is no ceiling to name.
+
+    ``predicted_drag_pct`` is ``turnover * effective_rate_bps / 10_000`` — the same
+    arithmetic restated directly as a fraction of equity, which is what
+    :attr:`exceeds_budget` actually compares against ``cost_budget_pct``
+    (mathematically equivalent to comparing turnover against
+    ``implied_max_turnover``, but well-defined even when the rate is zero).
+    """
+
+    cost_budget_pct: float
+    turnover: float
+    effective_rate_bps: float | None
+    implied_max_turnover: float | None
+    predicted_drag_pct: float | None
+    notes: list[str] = field(default_factory=list)
+
+    @property
+    def exceeds_budget(self) -> bool:
+        """Whether this run's own turnover would cost more than the stated budget.
+
+        ``False`` — never a fabricated violation — when ``predicted_drag_pct`` is
+        unknown (the run traded nothing): an absent measurement is not a failing
+        one, the same distinction :class:`PerformanceMetrics.underpowered` draws
+        for an absent trades-per-parameter ratio (ADR-0029).
+        """
+        return (
+            self.predicted_drag_pct is not None and self.predicted_drag_pct > self.cost_budget_pct
+        )
+
+
+def assess_cost_budget(
+    result: BacktestResult,
+    costs: CostConfig,
+    cost_budget_pct: float,
+    periods_per_year: float = 252.0,
+) -> CostBudgetReport:
+    """Check a run's own turnover against a stated annual cost-drag budget (KAN-860).
+
+    ``costs`` should be the exact :class:`~trading.config.CostConfig` the run's
+    broker traded under — including any ``symbol_slippage_bps`` tiering — so
+    :func:`effective_cost_rate_bps` reconstructs the rate this run actually paid,
+    not a rate assumed from outside it.
+
+    Always returns a report (never ``None``): a run that traded nothing still has a
+    well-defined "no turnover, no cost" answer, reported via
+    :attr:`CostBudgetReport.notes` rather than an absent object a caller must
+    special-case.
+
+    Raises ``ValueError`` for a non-positive ``cost_budget_pct`` — a caller mistake
+    (a budget of zero or less admits no turnover at any positive rate, which is not
+    a meaningful check to run), not a property of the data.
+    """
+    if cost_budget_pct <= 0.0:
+        raise ValueError(f"cost_budget_pct must be positive, got {cost_budget_pct}")
+    annual_turnover = turnover(result.fills, result.equity_curve, periods_per_year)
+    rate_bps = effective_cost_rate_bps(result.fills, costs)
+    if rate_bps is None:
+        return CostBudgetReport(
+            cost_budget_pct=cost_budget_pct,
+            turnover=annual_turnover,
+            effective_rate_bps=None,
+            implied_max_turnover=None,
+            predicted_drag_pct=None,
+            notes=["no cost-budget check: the run traded nothing, so there is no rate to assess"],
+        )
+    notes: list[str] = []
+    implied_max: float | None = None
+    if rate_bps > 0.0:
+        implied_max = cost_budget_pct / (rate_bps / 10_000.0)
+    else:
+        notes.append(
+            "effective cost rate is 0 bps (no slippage or fee modelled) — turnover "
+            "can never exceed a positive budget at a zero rate, so no ceiling is stated"
+        )
+    return CostBudgetReport(
+        cost_budget_pct=cost_budget_pct,
+        turnover=annual_turnover,
+        effective_rate_bps=rate_bps,
+        implied_max_turnover=implied_max,
+        predicted_drag_pct=annual_turnover * (rate_bps / 10_000.0),
+        notes=notes,
+    )
 
 
 # --- Exposure-adjusted and benchmark-relative figures (ADR-0037) -------------
