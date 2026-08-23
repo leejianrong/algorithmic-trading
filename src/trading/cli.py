@@ -83,6 +83,15 @@ Sharpe quoted without the 24 is the number this bench exists not to print.
   beta/alpha/correlation/information ratio (ADR-0071, KAN-641). A strategy that
   cannot beat naive diversification is not earning its complexity. Off by
   default; a run without the flag prints exactly the bytes it always did.
+- ``--symbols @sp500`` (``backtest``/``paper``/``sweep``/``gen-data``, also
+  ``--baseline-basket``) resolves the S&P 500 constituents as they actually stood
+  on the run's own ``--from`` date, not today's list (ADR-0072, KAN-639) — ranking
+  today's survivors over history is the exact hindsight ``blue20`` is already
+  documented to have. A **static, point-in-time snapshot resolved once**, not a
+  membership that mutates mid-run as names are added/removed (that needs an
+  engine-level mutable universe — KAN-633, a separate deferred card). ``--sector-map
+  @sp500`` is refused with the existing "unknown basket" error: there is no
+  committed sector map for 500 names.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -141,6 +150,7 @@ from trading.data.recent_window import (
     default_is_complete,
     interval_is_complete,
 )
+from trading.data.sp500_membership import PointInTimeSP500
 from trading.data.synthetic import SyntheticAdapter
 from trading.data.yfinance_adapter import YFinanceAdapter, cache_filename
 from trading.divergence import (
@@ -362,10 +372,50 @@ def _parse_date(label: str, value: str) -> datetime:
         raise typer.Exit(2) from exc
 
 
-def _parse_symbols(symbols: str) -> list[str]:
-    # `@name` expands a curated basket (universe.py); a plain comma list is verbatim.
+# `@sp500` is deliberately NOT a `universe.BASKETS` entry (ADR-0072, KAN-639): a
+# static basket is a fixed symbol list, but the whole point of this sigil is that
+# its answer depends on *when* you ask (`PointInTimeSP500.members_as_of`). Handled
+# in `_parse_symbols` before falling through to `universe.get_universe`, so it
+# stays a plain lookup miss (KeyError) for `universe.py` and cannot collide with a
+# real basket name added there later.
+SP500_SIGIL = "sp500"
+
+
+def _parse_sp500_universe(as_of: datetime | None) -> list[str]:
+    """Resolve `@sp500` to the S&P 500 membership as of ``as_of`` (ADR-0072).
+
+    Ranking today's constituents over history is the exact survivorship trap
+    ADR-0027 documents: the removed names are disproportionately the losers, and
+    excluding them inflates the result. This asks `sp500_membership.py`
+    (ADR-0064) for who was actually in the index on the run's own start date, not
+    today's list. ``as_of`` is ``None`` when the calling command has no date in
+    scope (e.g. `verify-universe`) -- there is no "today" fallback, because a
+    silent fallback to current membership is precisely the survivorship bug this
+    sigil exists to avoid.
+    """
+    if as_of is None:
+        typer.echo(
+            f"error: @{SP500_SIGIL} needs a start date to resolve point-in-time "
+            "membership (ADR-0064/0072) and this command has none in scope -- use "
+            "backtest/paper/sweep/gen-data, or pass a plain comma list here.",
+            err=True,
+        )
+        raise typer.Exit(2)
+    try:
+        return PointInTimeSP500.from_fixture().members_as_of(as_of)
+    except ValueError as exc:
+        typer.echo(f"error: {exc}", err=True)
+        raise typer.Exit(2) from exc
+
+
+def _parse_symbols(symbols: str, as_of: datetime | None = None) -> list[str]:
+    # `@name` expands a curated basket (universe.py) or the point-in-time S&P 500
+    # (ADR-0072); a plain comma list is verbatim. `as_of` is the caller's own
+    # backtest/session start date, threaded through by every command that has one.
     if symbols.startswith("@"):
         name = symbols[1:].strip()
+        if name == SP500_SIGIL:
+            return _parse_sp500_universe(as_of)
         try:
             return get_universe(name)
         except KeyError as exc:
@@ -1293,7 +1343,7 @@ def backtest(
     """Backtest a strategy over adjusted daily bars (real or synthetic)."""
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
-    tickers = _parse_symbols(symbols)
+    tickers = _parse_symbols(symbols, as_of=start)
     chosen_market = _resolve_market(market)
     _check_symbol_shapes(chosen_market, tickers)
     freq = _parse_frequency(interval, chosen_market.calendar)
@@ -1367,7 +1417,7 @@ def backtest(
     # buy_and_hold + one symbol.
     diversified_baseline_report: DiversifiedBaselineReport | None = None
     if diversified_baseline:
-        baseline_symbols = _parse_symbols(baseline_basket)
+        baseline_symbols = _parse_symbols(baseline_basket, as_of=start)
         _check_symbol_shapes(chosen_market, baseline_symbols)
         baseline_display = (
             baseline_basket[1:] if baseline_basket.startswith("@") else ", ".join(baseline_symbols)
@@ -1538,7 +1588,7 @@ def gen_data(
     """
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
-    tickers = _parse_symbols(symbols)
+    tickers = _parse_symbols(symbols, as_of=start)
 
     adapter = SyntheticAdapter(seed=seed)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -1755,7 +1805,7 @@ def paper(
     """
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
-    tickers = _parse_symbols(symbols)
+    tickers = _parse_symbols(symbols, as_of=start)
     chosen_market = _resolve_market(market)
     _check_symbol_shapes(chosen_market, tickers)
     freq = _parse_frequency(interval, chosen_market.calendar)
@@ -2517,7 +2567,7 @@ def sweep(
     """
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
-    tickers = _parse_symbols(symbols)
+    tickers = _parse_symbols(symbols, as_of=start)
     chosen_market = _resolve_market(market)
     _check_symbol_shapes(chosen_market, tickers)
     freq = _parse_frequency(interval, chosen_market.calendar)
