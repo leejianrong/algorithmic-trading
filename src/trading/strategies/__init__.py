@@ -17,6 +17,7 @@ from trading.strategies.equal_weight import EqualWeight
 from trading.strategies.mean_reversion import MeanReversion
 from trading.strategies.momentum import Momentum
 from trading.strategies.sma_crossover import SmaCrossover
+from trading.strategies.trend_following import TrendFollowing
 
 # A factory per name so each run gets a fresh, un-shared strategy instance.
 STRATEGIES: dict[str, Callable[[], Strategy]] = {
@@ -26,6 +27,7 @@ STRATEGIES: dict[str, Callable[[], Strategy]] = {
     "momentum": Momentum,
     "mean_reversion": MeanReversion,
     "cross_sectional": CrossSectional,
+    "trend_following": TrendFollowing,
 }
 
 
