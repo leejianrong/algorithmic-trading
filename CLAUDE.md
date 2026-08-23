@@ -1168,18 +1168,66 @@ As of this writing:
   default, mirroring `--bootstrap`'s exact shape; the `result.json` `"monte_carlo"`
   key is **omitted** (not `null`) when absent, matching `regimes` rather than
   `significance`'s always-null convention. `RESULT_SCHEMA_VERSION` stays **1**.
+- **Time-series trend-following, long-or-cash (2026-08-23, ADR-0070, KAN-640):**
+  `trend_following` joins the registry — per-asset absolute momentum (classic
+  12-1: 252-bar lookback, 21-bar skip of the most recent month), long-or-cash,
+  monthly rebalance, equal-weighted across whichever subset of the universe
+  currently signals a positive trailing return (not the whole universe, unlike
+  `momentum.py`'s existing normalization). New `trend_etfs` basket (12 liquid
+  ETFs: SPY, QQQ, IWM, EFA, EEM, XLE, XLF, TLT, IEF, GLD, DBC, UUP) spans
+  equities/international/bonds/commodities/currency, sharing 8 names with
+  `core10`'s reduced-survivorship-bias reasoning. Measured on real yfinance data
+  2007-2023: under default guardrails the drawdown kill switch permanently
+  latches in the 2008 and 2020 crashes (ADR-0031/0055's documented failure mode,
+  now reproduced on a third strategy family) — with `--halt-cooldown-bars` letting
+  it re-arm, the strategy returns **+68.16%** (Sharpe 0.36, max drawdown 21.85%,
+  Correlation to SPY 0.66) against SPY's own **+326.13%**, the modest-standalone/
+  diversification-focused profile the strategy is expected to have. EPIC-105's
+  first landed card (1/5). Portfolio-level correlation/drawdown benefit is
+  KAN-641's job, not measured here. Vol-scaled weighting deliberately not built
+  (`indicators.rolling_std` is price-level, not return, volatility).
+- **Turnover/cost-budget check (2026-08-23, ADR-0068, KAN-860):** cost drag =
+  annual turnover × effective one-way rate, made a computed, always-reported
+  figure (`metrics.assess_cost_budget`) instead of arithmetic an operator did by
+  hand — the exact multiplication ADR-0060 already used informally (1454%
+  turnover, 25 bps, 3.6% predicted vs. 4.0pp measured). The effective rate is
+  reconstructed from the run's own fills, notional-weighted across
+  `slippage_bps`/`symbol_slippage_bps` (ADR-0063 tiering)/`taker_fee_bps` —
+  never a caller-supplied flat guess — so a `--liquidity-tier-adv` run is
+  checked against the rate it actually traded at. Reporting only, ADR-0029's
+  shape: `backtest --cost-budget-pct` warns loudly when a run's predicted drag
+  exceeds the stated budget, never vetoes an order. Verified offline: an hourly
+  crypto `sma_crossover` run at 33989% turnover / 30 bps predicts 101.97% drag
+  against a 1% budget and fires; `buy_and_hold` on the same market stays under
+  budget silently. `result.json`'s `cost_budget` key is additive and **omitted**
+  (not `null`) when absent, matching `regimes`/`monte_carlo`.
+  `RESULT_SCHEMA_VERSION` stays 1. Not wired into `sweep`/`paper` yet.
+- **Cost-sensitivity sweep (2026-08-23, ADR-0069, KAN-618):**
+  `sweep.run_cost_sensitivity_sweep` re-runs a plain sweep's own winning combo
+  across a slippage-bps grid, holding parameters fixed;
+  `CostSensitivitySummary.edge_death` interpolates the bps level where
+  Sharpe/total return crosses zero (`already_dead`/`survives_grid` when the
+  crossing sits outside the tested range). Refuses to combine with
+  `CostConfig.symbol_slippage_bps` tiering (ADR-0063) — sweeping the flat rate
+  wouldn't move a tiered symbol's effective rate, silently under-reporting its
+  sensitivity. CLI `sweep --slippage-sweep 5,10,25,50` (off by default) writes a
+  sibling `*_cost_sensitivity.csv` and prints the concrete crossing point — closes
+  the "cost fragility" gap this doc had flagged as manual-only. Measured on
+  synthetic data: `sma_crossover`'s edge dies at **~29.15 bps** (5.8x the 5 bps
+  default) while `equal_weight` survives the whole 5-50bps grid (only 13% Sharpe
+  decay, 0.981 → 0.856), tracking each strategy's turnover (1362.97% vs 238.43%,
+  5.7x). Not yet wired into `--folds`, same gap shape as `--stability`/`--ledger`
+  there.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
   the dashboard server needs the `dashboard` extra (`uv sync --extra dashboard`).
-  Also open: **per-bar rolling liquidity** (the ADV screen, and now the KAN-861
-  liquidity-cost tiering, are both point-in-time, judged once before the run — a
-  symbol whose liquidity dries up mid-run keeps its screen/tier decision), an
-  automated **cost-sensitivity sweep** (KAN-618 — today this is a manual
-  `--slippage-bps`/`--taker-fee-bps` rerun), and a **turnover/cost budget check**
-  (KAN-860, now unblocked by KAN-861's per-tier rate) that would fail a run loudly
-  when its turnover times its tier's rate exceeds a stated budget, the way
-  ADR-0029's trades-per-parameter warning already does.
+  Also open: **per-bar rolling liquidity** (KAN-633 — the ADV screen, and the
+  KAN-861 liquidity-cost tiering, are both point-in-time, judged once before the
+  run; a symbol whose liquidity dries up mid-run keeps its screen/tier decision,
+  and fixing it needs an engine-level mutable universe). The cost-sensitivity
+  sweep (KAN-618) and turnover/cost-budget check (KAN-860) that used to be listed
+  here as gaps are now both built — see the two bullets above.
 
   The **paper-vs-simulated fill divergence report** is built (ADR-0038) and now has
   **60 equity paired fills** (ADR-0052: 0.51 bps realized against 5.00 modelled,
@@ -1412,7 +1460,8 @@ src/trading/
                            #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed,
                            #    --divergence, --bootstrap, --lookback, --log-level, --log-format,
                            #    --max-empty-polls, --market, --ledger, --hypothesis, --regimes,
-                           #    --monte-carlo, --liquidity-tier-adv; sweep also has --stability);
+                           #    --monte-carlo, --liquidity-tier-adv, --cost-budget-pct; sweep also
+                           #    has --stability, --slippage-sweep);
                            #   --market selects calendar + completeness + risk posture at once, and
                            #   refuses crypto-shaped symbols on a session market (ADR-0057);
                            #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032);
@@ -1448,11 +1497,15 @@ src/trading/
   data/recent_window.py    # completed-bars feed for paper; per-mode raw (ADR-0021) + interval completeness (ADR-0022);
                            #   per-symbol fetch guard: retry forever, escalate, never quarantine (ADR-0035);
                            #   bounded fetch window — datetime.min is a request no provider answers (ADR-0047)
-  strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion, cross_sectional + registry
+  strategies/              # buy_and_hold, sma_crossover, equal_weight, momentum, mean_reversion,
+                           #   cross_sectional, trend_following + registry
                            #   buy_and_hold retries its entry until the position exists (ADR-0037 amended)
-  universe.py              # curated baskets (blue20, crypto10) + @name expansion (ADR-0024)
+                           #   trend_following: per-asset absolute momentum, long-or-cash,
+                           #   normalized across the in-trend subset not the whole universe (ADR-0070)
+  universe.py              # curated baskets (blue20, crypto10, trend_etfs) + @name expansion (ADR-0024)
                            #   + broker verification (ADR-0028); crypto10 verifies 10/10 with no
-                           #     --market, and carries the repo's worst survivorship caveat (ADR-0058)
+                           #     --market, and carries the repo's worst survivorship caveat (ADR-0058);
+                           #     trend_etfs — 12 liquid cross-asset ETFs for trend_following (ADR-0070)
   data/sp500_membership.py # point-in-time S&P 500 membership from a committed free-data fixture,
                            #   usable from 1996-01-02 (ADR-0064); PointInTimeSP500.members_as_of
   liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029);
@@ -1466,13 +1519,16 @@ src/trading/
                            #   compute_regime_report — two independent regime axes, vol + trend,
                            #   split at the run's own median (ADR-0066); monte_carlo_shuffle —
                            #   random permutations of a run's own returns vs. its real path-ordered
-                           #   max drawdown (ADR-0067)
+                           #   max drawdown (ADR-0067); assess_cost_budget — turnover x effective
+                           #   one-way rate vs. a stated annual budget, reporting only (ADR-0068)
   sweep.py                 # parameter sweep (ADR-0016) + true IS->OOS walk-forward (ADR-0026);
                            #   annualizes on the caller's periods_per_year, recorded on the summary —
                            #   deflating at a basis the trials were not scored on raises (ADR-0059);
                            #   trial_count + deflated_winner() — best-of-N is not a finding (ADR-0039);
                            #   neighbor_stability — each combo's score vs. its grid-neighbour mean,
-                           #   surfacing a "cliff" a real search wouldn't reliably land on (ADR-0065)
+                           #   surfacing a "cliff" a real search wouldn't reliably land on (ADR-0065);
+                           #   run_cost_sensitivity_sweep — re-runs one fixed combo across a
+                           #   slippage-bps grid, reporting where the edge dies (ADR-0069)
 tests/
   unit/           # fast, no infra
   integration/    # marked; needs network/yfinance (CI-only)
