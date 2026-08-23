@@ -156,6 +156,33 @@ def test_backtest_symbols_sp500_at_a_later_start_sees_later_membership(
     assert "Symbols:       BBB, CCC" in result.output
 
 
+def test_backtest_baseline_basket_sp500_resolves_from_the_start_date(
+    fake_pit: None, tmp_path: Path
+) -> None:
+    # --baseline-basket is a second, independent `_parse_symbols` call site
+    # (ADR-0071's diversified baseline) -- it must see the same as_of=start the
+    # main --symbols argument does, not "no date in scope".
+    out = tmp_path / "equity.csv"
+    result = runner.invoke(
+        app,
+        [
+            "backtest",
+            "--strategy",
+            "equal_weight",
+            "--symbols",
+            "AAPL,MSFT",
+            "--diversified-baseline",
+            "--baseline-basket",
+            "@sp500",
+            "--out",
+            str(out),
+            *_COMMON,
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "Diversified baseline" in result.output
+
+
 def test_backtest_sector_map_sp500_fails_the_existing_unknown_basket_way(
     tmp_path: Path,
 ) -> None:
