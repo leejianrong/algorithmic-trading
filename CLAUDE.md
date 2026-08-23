@@ -1253,6 +1253,47 @@ As of this writing:
   `--target-vol` run without it hit the 20.4% floor in 2009 and died to -10.88% over
   18 years, which reads as "vol-targeting failed" rather than "the unrelated
   guardrail latched."
+- **`@sp500` universe sigil for cross-sectional strategies (2026-08-23, ADR-0072,
+  KAN-639):** `_parse_symbols` resolves `@sp500` via point-in-time S&P 500
+  membership (ADR-0064) as of the run's own `--from` date — not today's list, which
+  is the exact survivorship trap `blue20` already documents — wired into
+  `backtest`/`paper`/`sweep`/`gen-data` and `--baseline-basket`. A **static
+  snapshot resolved once**, not a membership that mutates mid-run (that needs an
+  engine-level mutable universe, KAN-633, deferred). `--sector-map @sp500` is
+  refused (no committed sector map for 500 names); a command with no date in scope
+  (`verify-universe`) gets a dedicated error rather than silently falling back to
+  today's membership. Real yfinance measurement, 2015-2023: `@sp500` as of
+  2015-01-01 resolves **499** real historical constituents vs today's 503, only
+  **311 (61.8%)** overlap (independently re-verified: exact match) — the turnover
+  the fix targets. Absence rate on real yfinance data: 122/499 (24.4%) PIT-2015
+  names had no bars vs 11/503 (2.2%) for today's membership, an 11x difference
+  replicating ADR-0064's 2007 finding at a different era. The return comparison
+  itself is noisy at this sample size (both universes beat SPY and the diversified
+  baseline under `--halt-cooldown-bars`, but disagree on which wins) — only the
+  absence-rate finding is trustworthy here, consistent with ADR-0064's own caution.
+  Two pre-existing free-data gaps surfaced, not fixed: `BRK.B`/`BF.B` 404 on
+  yfinance from a dot-vs-hyphen ticker mismatch between the ADR-0064 fixture and
+  yfinance's convention, and a plain 404 for a still-listed name (`BK`)
+  misclassified as historical absence by the rate-limit-only refusal detector
+  (ADR-0032/0040). EPIC-105 is now 4/5.
+- **Crypto universe screened by venue tape density, not market cap (2026-08-23,
+  ADR-0073, KAN-863):** `trading.tape_density` (`screen_by_tape_density`, sibling
+  to the ADV screen) measures actual/expected bar coverage over a pre-backtest
+  formation window, reusing `MarketCalendar`/`Frequency` for the 24/7 day-shape
+  math rather than re-deriving it. New `AlpacaClient.list_assets()` (8th seam call)
+  enumerates the venue's real listing rather than a hand-guessed candidate set —
+  `_crypto_symbol_map` now derives from it too. Measured live against the real
+  paper account (independently re-verified: exact match): the real listing gives
+  **73** total assets, **36** USD-quoted, **32** non-stablecoin candidates
+  (excluding `USDC`/`USDT`/`USDG`/`PAXG`) — matching the ticket's cited figure
+  exactly; the default 0.80 floor keeps 19/32 at 5m and **0/32 at 1m** — fine-
+  interval crypto is confirmed not viable on this venue. `backtest
+  --min-tape-density`/`--tape-density-window`, off by default, mirrors
+  `--min-adv` exactly; refuses a non-continuous `--market`. **Finding, not yet
+  acted on:** `crypto10`'s own 10 symbols fail this screen 4/10 at 5m (ETH, SOL,
+  DOGE, LTC) and 10/10 at 1m — the basket was picked by name recognition, not
+  measured venue order flow; left unchanged since other cards may depend on its
+  exact symbols. EPIC-105 is now **5/5 — complete**.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -1496,8 +1537,10 @@ src/trading/
                            #    --divergence, --bootstrap, --lookback, --log-level, --log-format,
                            #    --max-empty-polls, --market, --ledger, --hypothesis, --regimes,
                            #    --monte-carlo, --liquidity-tier-adv, --cost-budget-pct,
-                           #    --diversified-baseline, --baseline-basket; sweep also
-                           #    has --stability, --slippage-sweep);
+                           #    --diversified-baseline, --baseline-basket, --min-tape-density,
+                           #    --tape-density-window; sweep also has --stability, --slippage-sweep);
+                           #   @sp500 sigil resolves point-in-time S&P 500 membership as of the run's
+                           #   own --from date, not today's list (ADR-0072);
                            #   --market selects calendar + completeness + risk posture at once, and
                            #   refuses crypto-shaped symbols on a session market (ADR-0057);
                            #   _run_benchmark warns instead of aborting on a bad --benchmark (ADR-0032);
@@ -1527,6 +1570,8 @@ src/trading/
                            #   + crypto venue: a client construction property chosen by the
                            #     market's calendar; positions canonicalized BTCUSD -> BTC/USD,
                            #     GTC not DAY, no feed, cancel idempotent on a filled order (ADR-0058)
+                           #   + list_assets, the seam's 8th call — enumerates the venue's real
+                           #     listing; _crypto_symbol_map derives from it (ADR-0073)
   data/alpaca_adapter.py   # DataAdapter over Alpaca bars; per-call adjusted (ADR-0021) + interval (ADR-0022);
                            #   verifies an adjusted series really is adjusted; RAW never checked (ADR-0045);
                            #   crypto has no adjustment and no feed concept at all (ADR-0058)
@@ -1547,6 +1592,8 @@ src/trading/
   liquidity.py             # ADV screen over a pre-backtest formation window — no look-ahead (ADR-0029);
                            #   classify_liquidity_tier + liquidity_tier_rates reuse the same
                            #   formation-window ADV to assign CostConfig.symbol_slippage_bps (ADR-0063)
+  tape_density.py          # screen_by_tape_density — venue-observed bar-coverage floor, sibling to
+                           #   the ADV screen; measures order flow, not dollar volume (ADR-0073)
   metrics.py               # perf metrics: return, Sharpe, Sortino, Calmar, drawdown, turnover, exposure,
                            #   entry count + trades-per-parameter significance (ADR-0029);
                            #   benchmark-relative beta/alpha/correlation/IR (ADR-0037);
