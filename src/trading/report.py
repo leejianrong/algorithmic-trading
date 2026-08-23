@@ -55,6 +55,7 @@ if TYPE_CHECKING:
     from trading.engine import BacktestResult, EquityPoint
     from trading.metrics import (
         BenchmarkComparison,
+        CostBudgetReport,
         DeflatedSharpe,
         MonteCarloShuffleReport,
         PairedBootstrap,
@@ -92,6 +93,7 @@ def summarize(
     significance: SignificanceReport | None = None,
     regimes: RegimeReport | None = None,
     monte_carlo: MonteCarloShuffleReport | None = None,
+    cost_budget: CostBudgetReport | None = None,
 ) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
 
@@ -127,6 +129,12 @@ def summarize(
     thousands of random reorderings of its own returns, and the run's Sharpe
     printed once (it does not change under reordering). Caller-supplied and never
     derived here, for the same reason ``significance``/``regimes`` are not.
+
+    ``cost_budget`` (from :func:`trading.metrics.assess_cost_budget`, ADR-0068)
+    adds the turnover/cost-budget line right after the trades-per-parameter check —
+    the same neighbourhood, since both are run-level honesty checks that need
+    nothing from a benchmark or a bootstrap. A warning appears only when the run's
+    own predicted cost drag exceeds the stated budget; omitted, nothing changes.
     """
     metrics = compute(result, periods_per_year, free_parameters=free_parameters)
     lines = [f"Symbols:       {', '.join(result.symbols)}"]
@@ -160,6 +168,8 @@ def summarize(
                 "too small a sample to distinguish edge from noise; widen the "
                 "universe or the date range before trusting these numbers"
             )
+    if cost_budget is not None:
+        lines.extend(cost_budget_lines(cost_budget))
     if benchmark is not None:
         bench_symbol = ", ".join(benchmark.symbols)
         bench_metrics = compute(benchmark, periods_per_year)
@@ -426,6 +436,41 @@ def summarize_significance(significance: SignificanceReport | None) -> str:
     if significance is None:
         return ""
     return "\n".join(significance_lines(significance))
+
+
+def cost_budget_lines(report: CostBudgetReport) -> list[str]:
+    """Render the ADR-0068 turnover/cost-budget block, notes included.
+
+    The headline figures print whenever there was a rate to assess at all — the
+    same "compute it, then let the reader see it" rule ADR-0029 already applies to
+    trades-per-parameter — and the ``⚠`` warning line appears only when the run's
+    own predicted cost drag actually exceeds the stated budget. This is reporting
+    only: nothing here vetoes an order or aborts a run.
+    """
+    lines = [f"Cost budget:   {report.cost_budget_pct * 100:.2f}% of equity/year"]
+    if report.effective_rate_bps is None:
+        lines.extend(f"  note: {note}" for note in report.notes)
+        return lines
+    assert report.predicted_drag_pct is not None
+    lines[0] += (
+        f" at {report.effective_rate_bps:.2f} bps effective rate -> turnover "
+        f"{report.turnover * 100:.1f}% -> predicted drag {report.predicted_drag_pct * 100:.2f}%"
+    )
+    if report.implied_max_turnover is not None:
+        lines.append(
+            f"  implied max turnover at this budget/rate: {report.implied_max_turnover * 100:.1f}%"
+        )
+    if report.exceeds_budget:
+        assert report.implied_max_turnover is not None
+        multiple = report.turnover / report.implied_max_turnover
+        lines.append(
+            f"  ⚠ predicted cost drag {report.predicted_drag_pct * 100:.2f}% exceeds the "
+            f"{report.cost_budget_pct * 100:.2f}% budget — turnover {report.turnover * 100:.1f}% "
+            f"is {multiple:.1f}x the {report.implied_max_turnover * 100:.1f}% this budget allows "
+            f"at {report.effective_rate_bps:.2f} bps one-way"
+        )
+    lines.extend(f"  note: {note}" for note in report.notes)
+    return lines
 
 
 def _regime_metrics_lines(label: str, regime: RegimeMetrics) -> list[str]:
@@ -703,6 +748,7 @@ def result_to_dict(
     significance: SignificanceReport | None = None,
     regimes: RegimeReport | None = None,
     monte_carlo: MonteCarloShuffleReport | None = None,
+    cost_budget: CostBudgetReport | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
 
@@ -790,30 +836,37 @@ def result_to_dict(
             "shuffled_high": float | null,
             "actual_percentile": float | null,    # actual's rank in the shuffled population
             "notes": list[str]
-          }   # present only when the caller supplied a MonteCarloShuffleReport
+          },   # present only when the caller supplied a MonteCarloShuffleReport
+          "cost_budget": {   # ADR-0068, additive; KEY OMITTED ENTIRELY when not computed
+            "cost_budget_pct": float, "turnover": float,
+            "effective_rate_bps": float | null,      # null only when the run traded nothing
+            "implied_max_turnover": float | null,    # null when the effective rate is 0
+            "predicted_drag_pct": float | null,      # turnover * effective_rate_bps / 10000
+            "notes": list[str]
+          }   # present only when the caller supplied a CostBudgetReport
         }
 
     The ``episode_count``/``episodes`` keys (ADR-0031), the top-level ``absent``
     list (ADR-0032), the top-level ``benchmark_metrics`` block plus the
     ``metrics.return_per_unit_exposure`` field (ADR-0037), the top-level
     ``significance`` block (ADR-0039), the top-level ``market`` name (ADR-0057),
-    the top-level ``regimes`` block (ADR-0066), and the top-level ``monte_carlo``
-    block (ADR-0067) are purely additive: every pre-existing key keeps its exact
-    meaning and value — ``symbols`` is still the *requested* universe, ``metrics``
-    is still exactly ``dataclasses.asdict`` of what the caller passed — so
-    ``RESULT_SCHEMA_VERSION`` does **not** move (see the constant's note). A v1
-    reader that ignores them behaves exactly as it did. ``regimes`` and
-    ``monte_carlo`` are the two keys among these that are **omitted** rather than
-    emitted as ``null`` when absent (every earlier one keeps the
-    always-present-null shape established by ``significance``) — chosen so a run
-    that never passes the corresponding flag writes the byte-identical document it
-    always has. That always-null shape was only ever safe for the ADR that first
-    introduced a given top-level key: once a baseline `result.json` hash is pinned
-    (as it was the moment ADR-0066 shipped), any *later* additive key must be
-    omitted rather than nulled, or it moves that already-pinned hash for every run
-    that never asked for the new feature. A v1 reader already tolerates a missing
-    key exactly as it tolerates a ``null`` one, so nothing downstream distinguishes
-    the two conventions.
+    the top-level ``regimes`` block (ADR-0066), the top-level ``monte_carlo``
+    block (ADR-0067), and the top-level ``cost_budget`` block (ADR-0068) are purely
+    additive: every pre-existing key keeps its exact meaning and value —
+    ``symbols`` is still the *requested* universe, ``metrics`` is still exactly
+    ``dataclasses.asdict`` of what the caller passed — so ``RESULT_SCHEMA_VERSION``
+    does **not** move (see the constant's note). A v1 reader that ignores them
+    behaves exactly as it did. ``regimes``, ``monte_carlo``, and ``cost_budget``
+    are the keys among these that are **omitted** rather than emitted as ``null``
+    when absent (every earlier one keeps the always-present-null shape established
+    by ``significance``) — chosen so a run that never passes the corresponding flag
+    writes the byte-identical document it always has. That always-null shape was
+    only ever safe for the ADR that first introduced a given top-level key: once a
+    baseline `result.json` hash is pinned (as it was the moment ADR-0066 shipped),
+    any *later* additive key must be omitted rather than nulled, or it moves that
+    already-pinned hash for every run that never asked for the new feature. A v1
+    reader already tolerates a missing key exactly as it tolerates a ``null`` one,
+    so nothing downstream distinguishes the two conventions.
 
     ``benchmark_metrics`` sits at the top level rather than inside ``metrics``
     because it describes a *relation between two runs*, not a property of this
@@ -880,6 +933,15 @@ def result_to_dict(
         predates a pinned baseline hash), the ``monte_carlo`` key is **omitted
         entirely** when ``None`` rather than emitted as ``null``, so a run that
         never passes ``--monte-carlo`` emits the exact bytes it always has.
+    cost_budget:
+        An already-computed :class:`~trading.metrics.CostBudgetReport` (ADR-0068),
+        or ``None``. Never derived here, for the same reason
+        ``significance``/``regimes``/``monte_carlo`` are not: the caller already
+        has the run's :class:`~trading.config.CostConfig` in hand and computing it
+        here a second time would mean a run that never passes
+        ``--cost-budget-pct`` silently pays for it. Same omitted-entirely
+        convention as ``regimes``/``monte_carlo``, so a run without that flag
+        emits the exact bytes it always has.
     """
     payload: dict[str, Any] = {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -973,6 +1035,11 @@ def result_to_dict(
     # ``--monte-carlo`` must write the exact bytes it always has.
     if monte_carlo is not None:
         payload["monte_carlo"] = asdict(monte_carlo)
+    # The turnover/cost-budget block (ADR-0068). Same omitted-entirely convention
+    # as ``regimes``/``monte_carlo``: a run without ``--cost-budget-pct`` must
+    # write the exact bytes it always has.
+    if cost_budget is not None:
+        payload["cost_budget"] = asdict(cost_budget)
     return payload
 
 
@@ -990,6 +1057,7 @@ def write_result_json(
     significance: SignificanceReport | None = None,
     regimes: RegimeReport | None = None,
     monte_carlo: MonteCarloShuffleReport | None = None,
+    cost_budget: CostBudgetReport | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
 
@@ -1008,6 +1076,7 @@ def write_result_json(
         significance=significance,
         regimes=regimes,
         monte_carlo=monte_carlo,
+        cost_budget=cost_budget,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:
