@@ -5,11 +5,13 @@ by name from the CLI (``--symbols @blue20``, ``--sector-map @blue20``). It seeds
 run with a diversified, liquid candidate set without hard-coding a comma list, and
 gives the sector-cap guardrail (ADR-0019) a matching, hand-checkable map.
 
-Three baskets ship today: ``blue20`` (20 of today's mega-cap US single stocks),
+Four baskets ship today: ``blue20`` (20 of today's mega-cap US single stocks),
 ``core10`` (10 long-lived, broad ETFs across asset classes, built for
-long-horizon runs), and ``crypto10`` (10 USD-quoted pairs from Alpaca's crypto
-venue, for ``--market crypto``). The map values are *bucket labels*, not
-necessarily GICS sectors — see caveat 3.
+long-horizon runs), ``crypto10`` (10 USD-quoted pairs from Alpaca's crypto
+venue, for ``--market crypto``), and ``trend_etfs`` (12 liquid, long-history
+ETFs spanning equities/bonds/commodities/FX, built for the `trend_following`
+strategy — ADR-0070). The map values are *bucket labels*, not necessarily GICS
+sectors — see caveat 3.
 
 ``crypto10`` is the only basket whose symbols are **pairs** (``BTC/USD``), which
 is what the ADR-0057 shape guard reads: passing it under a session market is
@@ -96,6 +98,8 @@ It is **not** survivorship-bias-free:
 
 So: bias reduced, not removed. Everything in ADR-0027 still applies — read the
 numbers as an upper bound and weight forward paper results more heavily.
+``trend_etfs`` (below, ADR-0070) is built from the same reasoning and shares
+eight of ``core10``'s ten names outright, so this caveat applies to it in full.
 
 Honesty caveat 4 — ``crypto10``'s survivorship bias is the worst of the three
 ----------------------------------------------------------------------------
@@ -269,6 +273,34 @@ _CRYPTO10_SECTORS: dict[str, str] = {
     "AVAX/USD": "smart_contract",  # 2021-11-18
 }
 
+# ``trend_etfs`` — 12 liquid, long-history ETFs for the `trend_following`
+# strategy (ADR-0070): time-series momentum needs a genuinely multi-asset-class
+# candidate set, since the whole edge is diversification across independently
+# trending markets, not diversification across correlated single names. Eight
+# of the ten are shared with `core10` deliberately (the same survivorship
+# reasoning applies, and there is no benefit in re-litigating well-vetted,
+# broker-verified ETF picks); DBC and UUP are new here because `core10` has no
+# broad-commodities or currency exposure, both of which are core managed-futures
+# asset classes.
+#
+# Every symbol traded by 2007 except DBC (2006) and UUP (2007) themselves, so
+# the same "shorter universe in the early years" caveat as `core10` applies
+# (see the module docstring) — a run starting in 2000 sees a much smaller set.
+_TREND_ETF_SECTORS: dict[str, str] = {
+    "SPY": "us_large",  # SPDR S&P 500 — 1993
+    "QQQ": "us_tech",  # Invesco QQQ (Nasdaq-100) — 1999
+    "IWM": "us_small",  # iShares Russell 2000 — 2000 (May)
+    "EFA": "intl_developed",  # iShares MSCI EAFE — 2001
+    "EEM": "intl_emerging",  # iShares MSCI Emerging Markets — 2003
+    "XLE": "energy",  # Energy Select Sector SPDR — 1998
+    "XLF": "financials",  # Financial Select Sector SPDR — 1998
+    "TLT": "treasuries_long",  # iShares 20+ Year Treasury — 2002
+    "IEF": "treasuries_mid",  # iShares 7-10 Year Treasury — 2002
+    "GLD": "gold",  # SPDR Gold Shares — 2004 (Nov)
+    "DBC": "commodities",  # Invesco DB Commodity Index Tracking Fund — 2006 (Feb)
+    "UUP": "currency",  # Invesco DB US Dollar Index Bullish Fund — 2007 (Feb)
+}
+
 BASKETS: dict[str, Basket] = {
     "blue20": Basket(
         name="blue20",
@@ -284,6 +316,11 @@ BASKETS: dict[str, Basket] = {
         name="crypto10",
         symbols=tuple(_CRYPTO10_SECTORS),
         sectors=dict(_CRYPTO10_SECTORS),
+    ),
+    "trend_etfs": Basket(
+        name="trend_etfs",
+        symbols=tuple(_TREND_ETF_SECTORS),
+        sectors=dict(_TREND_ETF_SECTORS),
     ),
 }
 
