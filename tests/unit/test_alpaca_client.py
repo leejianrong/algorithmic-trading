@@ -257,6 +257,37 @@ class TestGetAsset:
         assert client.get_asset("AAPL").tradable is True
 
 
+class TestListAssets:
+    """The seam's eighth call (KAN-863): enumerate a venue's whole listing."""
+
+    def test_protocol_includes_list_assets(self) -> None:
+        client = FakeAlpacaClient()
+        assert isinstance(client, AlpacaClient)
+        assert hasattr(AlpacaClient, "list_assets")
+
+    def test_unscripted_fake_lists_nothing(self) -> None:
+        """The fake has no notion of a venue-wide listing beyond what a test declares."""
+        assert FakeAlpacaClient().list_assets() == []
+
+    def test_lists_every_scripted_asset(self) -> None:
+        client = FakeAlpacaClient()
+        client.set_asset("BTC/USD")
+        client.set_asset("ETH/USD", fractionable=False)
+        symbols = {a.symbol for a in client.list_assets()}
+        assert symbols == {"BTC/USD", "ETH/USD"}
+
+    def test_assets_supplied_at_construction_are_listed(self) -> None:
+        supplied = AssetInfo(symbol="LINK/USD", tradable=True, fractionable=True)
+        client = FakeAlpacaClient(assets={"LINK/USD": supplied})
+        assert client.list_assets() == [supplied]
+
+    def test_get_asset_does_not_add_to_the_listing(self) -> None:
+        """Looking up an unscripted symbol invents a default answer but is not registration."""
+        client = FakeAlpacaClient()
+        client.get_asset("AAPL")  # falls back to the generic default, unscripted
+        assert client.list_assets() == []
+
+
 class TestCancelOrder:
     """The seam's sixth call (ADR-0017's anticipated widening, ADR-0036).
 

@@ -383,6 +383,25 @@ class AlpacaClient(Protocol):
         """
         ...
 
+    def list_assets(self) -> list[AssetInfo]:
+        """Every asset this client's venue lists, in our own :class:`AssetInfo` shape.
+
+        The eighth call on the seam (KAN-863), and the third widening ADR-0017
+        anticipated, following the pattern :meth:`cancel_order` (ADR-0036) and
+        :meth:`get_splits` (ADR-0045) set. It exists because :meth:`get_asset`
+        only answers for one symbol you already know the name of — there was no
+        way to ask "what does this venue trade at all", which a tape-density
+        screen over the venue's whole crypto listing needs
+        (:mod:`trading.tape_density`) and which :meth:`get_asset` cannot answer
+        by construction.
+
+        Scoped to this client's own ``asset_class`` (a construction property, like
+        the interval and the feed), not a runtime argument — the same reasoning
+        :data:`ASSET_CLASS_US_EQUITY` / :data:`ASSET_CLASS_CRYPTO` already apply
+        to every other call on this seam.
+        """
+        ...
+
 
 # --- Fake: the offline workhorse ----------------------------------------------
 
@@ -675,6 +694,17 @@ class FakeAlpacaClient:
             exchange=_FAKE_EXCHANGE,
             shortable=True,
         )
+
+    def list_assets(self) -> list[AssetInfo]:
+        """Every asset registered via the constructor's ``assets=`` or :meth:`set_asset`.
+
+        Unlike :meth:`get_asset`, which invents a fully-usable default for any
+        symbol it has never heard of (there being no way to be wrong about a
+        symbol nobody asked about), this has no such fallback: the fake has no
+        concept of "everything a venue lists" beyond what a test declared, so an
+        unscripted fake enumerates as empty rather than guessing at a listing.
+        """
+        return list(self._assets.values())
 
     # -- internal accounting (mirrors Portfolio.apply_fill semantics) --
 
@@ -1274,28 +1304,49 @@ class RealAlpacaClient:
         session, paid the first time a crypto position is read, never per bar. A
         failure propagates rather than degrading to the concatenated key — a run
         that cannot name what it holds must stop, not narrate (ADR-0028).
+
+        Derives from :meth:`list_assets` (KAN-863) rather than a second,
+        parallel ``get_all_assets`` request — the reuse rule ADR-0035 already
+        applies elsewhere on this seam.
         """
         if self._crypto_symbols is None:
-            from alpaca.trading.enums import AssetClass
-            from alpaca.trading.requests import GetAssetsRequest
-
-            assets = self._trading.get_all_assets(GetAssetsRequest(asset_class=AssetClass.CRYPTO))
-            symbol_map: dict[str, str] = {}
-            for asset in assets:
-                # alpaca-py types the listing as ``list[Asset | str]``; the str arm
-                # is the raw-data mode we never enable, so it is unreachable by our
-                # construction and asserted rather than assumed (see _require_model).
-                raw_symbol = getattr(asset, "symbol", None)
-                if raw_symbol is None:
-                    raise TypeError(
-                        "Alpaca returned a crypto asset listing entry with no symbol "
-                        f"({type(asset).__name__}); crypto position symbols cannot be "
-                        "mapped without it"
-                    )
-                symbol = str(raw_symbol)
-                symbol_map[symbol.replace("/", "")] = symbol
-            self._crypto_symbols = symbol_map
+            self._crypto_symbols = {
+                asset.symbol.replace("/", ""): asset.symbol for asset in self.list_assets()
+            }
         return self._crypto_symbols
+
+    def list_assets(self) -> list[AssetInfo]:  # pragma: no cover - needs the SDK
+        """Every asset this client's venue lists (KAN-863).
+
+        One ``get_all_assets`` request, scoped to this client's own
+        ``asset_class`` -- the crypto tape-density screen
+        (:mod:`trading.tape_density`) is the first caller, needing the venue's
+        real ~73-asset listing as its screening input rather than a hand-guessed
+        candidate set. Not cached: unlike :meth:`_crypto_symbol_map` (paid once
+        per session because a position's symbol cannot change venue mid-run), a
+        caller enumerating the listing directly may reasonably want a fresh read.
+        """
+        from alpaca.trading.enums import AssetClass
+        from alpaca.trading.requests import GetAssetsRequest
+
+        sdk_class = (
+            AssetClass.CRYPTO if self._asset_class == ASSET_CLASS_CRYPTO else AssetClass.US_EQUITY
+        )
+        assets = self._trading.get_all_assets(GetAssetsRequest(asset_class=sdk_class))
+        result: list[AssetInfo] = []
+        for asset in assets:
+            # alpaca-py types the listing as ``list[Asset | str]``; the str arm
+            # is the raw-data mode we never enable, so it is unreachable by our
+            # construction and asserted rather than assumed (see _require_model).
+            raw_symbol = getattr(asset, "symbol", None)
+            if raw_symbol is None:
+                raise TypeError(
+                    "Alpaca returned an asset listing entry with no symbol "
+                    f"({type(asset).__name__}); the venue's listing cannot be "
+                    "enumerated without it"
+                )
+            result.append(self._to_asset(str(raw_symbol), asset))
+        return result
 
     def get_asset(self, symbol: str) -> AssetInfo:  # pragma: no cover - needs the SDK
         """Look up broker-authoritative asset metadata for ``symbol`` (ADR-0028).

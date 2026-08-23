@@ -52,6 +52,15 @@ from trading.data.alpaca_client import (
     RealAlpacaClient,
     canonical_crypto_symbol,
 )
+from trading.frequency import Frequency
+from trading.tape_density import screen_by_tape_density
+
+# The venue's own stablecoin/pegged-asset pairs (matching universe.py's crypto10
+# exclusion reasoning): a pegged asset has no meaningful tape-density question
+# because it is not something a trend/relative-strength strategy would hold, so
+# it is excluded from the tape-density candidate set the same way it is excluded
+# from crypto10.
+_STABLE_OR_PEGGED = frozenset({"USDC/USD", "USDT/USD", "USDG/USD", "PAXG/USD"})
 
 _HAVE_CREDS = bool(os.environ.get("ALPACA_API_KEY") and os.environ.get("ALPACA_SECRET_KEY"))
 _HAVE_SDK = importlib.util.find_spec("alpaca") is not None
@@ -394,3 +403,72 @@ class TestAdapterThroughTheSeam:
         client = RealAlpacaClient(asset_class=ASSET_CLASS_CRYPTO)
         symbol_map = client._crypto_symbol_map()
         assert canonical_crypto_symbol("BTCUSD", "crypto", symbol_map) == SYMBOL
+
+
+@_NEEDS_CREDS
+class TestTapeDensityLive:
+    """KAN-863 / ADR-0073: the tape-density screen, driven against the real venue.
+
+    Reproduced the ticket's own cited numbers exactly on 2026-08-15 bars (see the
+    ADR) before this was written; these tests are the ongoing nightly watch, not
+    a re-assertion of that one day's figures -- coverage moves day to day (BTC/USD
+    measured 98.6% on 2026-08-15 and 100.0% eight days later), so nothing here
+    pins a specific coverage number.
+    """
+
+    def test_list_assets_agrees_with_the_symbol_map(self) -> None:
+        """`list_assets` (KAN-863's seam widening) and `_crypto_symbol_map` must agree.
+
+        The latter now derives from the former (ADR-0035's reuse rule), so this is
+        really a change-detector on that refactor rather than two independent
+        mechanisms happening to agree.
+        """
+        client = RealAlpacaClient(asset_class=ASSET_CLASS_CRYPTO)
+        listed = {asset.symbol for asset in client.list_assets()}
+        mapped = set(client._crypto_symbol_map().values())
+        assert listed == mapped
+        assert len(listed) >= 50, f"suspiciously few crypto assets: {len(listed)}"
+
+    def test_the_non_stablecoin_usd_candidate_set_is_a_few_dozen(self) -> None:
+        """Ballpark, not a pin: KAN-863 measured 32 on 2026-08-15; the venue's listing grows."""
+        client = RealAlpacaClient(asset_class=ASSET_CLASS_CRYPTO)
+        assets = client.list_assets()
+        candidates = [
+            asset.symbol
+            for asset in assets
+            if asset.symbol.endswith("/USD") and asset.symbol not in _STABLE_OR_PEGGED
+        ]
+        assert 20 <= len(candidates) <= 60, candidates
+
+    def test_screen_by_tape_density_runs_end_to_end_on_the_real_listing(self) -> None:
+        """The screen actually discriminates: some real pairs clear the default floor, some don't.
+
+        This is the finding the whole ticket is about, checked structurally
+        (not a specific number) so it survives day-to-day coverage drift: a
+        universe screened by tape density is not simply "everything" or
+        "nothing".
+        """
+        client = RealAlpacaClient(asset_class=ASSET_CLASS_CRYPTO)
+        assets = client.list_assets()
+        candidates = sorted(
+            asset.symbol
+            for asset in assets
+            if asset.symbol.endswith("/USD") and asset.symbol not in _STABLE_OR_PEGGED
+        )
+        adapter = AlpacaAdapter(client=client, interval=timedelta(minutes=5), calendar=CRYPTO_24_7)
+        freq = Frequency.parse("5m", calendar=CRYPTO_24_7)
+        # Formation window ends "yesterday" relative to right now, so it always
+        # has a full day of real, settled trading behind it.
+        backtest_start = datetime.now(UTC).replace(hour=0, minute=0, second=0, microsecond=0)
+        screen = screen_by_tape_density(adapter, candidates, backtest_start, freq)
+
+        assert screen.verdicts
+        assert all(v.coverage is None or 0.0 <= v.coverage <= 1.05 for v in screen.verdicts), (
+            "a coverage ratio outside [0, ~1] means the expected-bar-count arithmetic broke"
+        )
+        assert screen.kept, "nothing cleared the default floor -- the whole venue looks dead"
+
+        btc = next((v for v in screen.verdicts if v.symbol == SYMBOL), None)
+        assert btc is not None and not btc.unverified, (
+            "BTC/USD -- the venue's deepest market -- had no formation-window bars at all"
+        )
