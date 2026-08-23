@@ -834,6 +834,118 @@ def compute(
     )
 
 
+# --- Diversified baseline comparison (ADR-0071, KAN-641) ---------------------
+
+
+@dataclass(frozen=True, slots=True)
+class DiversifiedBaselineReport:
+    """A naive multi-asset equal-weight run, compared against the strategy.
+
+    ``--benchmark`` (ADR-0037) answers "did this beat one unconstrained
+    buy-and-hold symbol"; this answers a harder, more honest question — "did this
+    beat doing nothing clever at all, just holding a diversified basket at equal
+    weight". CLAUDE.md's own headline finding is that the dumbest strategy on
+    ``core10`` beat SPY on return, Sharpe, *and* drawdown, which is
+    diversification, not alpha — so a strategy that cannot clear this bar is not
+    earning its complexity.
+
+    Self-contained rather than a view over fields already in ``result.json``
+    (unlike :class:`BenchmarkComparison`, which is joined against the separate
+    top-level ``benchmark_curve``): there is exactly one baseline run behind this
+    report, so its own :class:`PerformanceMetrics` — return, Sharpe, drawdown —
+    travel alongside the relative :class:`BenchmarkComparison` rather than
+    requiring a second lookup.
+
+    ``label`` names the strategy/basket pair for display (e.g.
+    ``"equal_weight/core10"``); ``symbols`` is the basket actually traded
+    (:attr:`~trading.engine.BacktestResult.symbols`). ``notes`` carries the same
+    "never invested" / "invested late" honesty check ADR-0037 already applies to
+    ``--benchmark`` (:func:`assess_diversified_baseline`), so a baseline that
+    could not fund its own entry cannot print a flattering ``+0.00%``
+    unchallenged either.
+    """
+
+    label: str
+    symbols: tuple[str, ...]
+    metrics: PerformanceMetrics
+    comparison: BenchmarkComparison
+    notes: list[str] = field(default_factory=list)
+
+
+def _diversified_baseline_notes(
+    baseline: BacktestResult, baseline_metrics: PerformanceMetrics
+) -> list[str]:
+    """The ADR-0037 deployment honesty check, restated as plain-text notes.
+
+    Mirrors ``trading.report._benchmark_deployment_lines`` (same two conditions:
+    zero peak exposure, or a first exposed bar later than the first fillable one),
+    but returns plain sentences with no CLI-formatting markers — this feeds a
+    JSON ``notes`` list as well as the terminal, the same convention
+    :class:`RegimeReport`/:class:`SignificanceReport` already use.
+    """
+    if baseline_metrics.peak_exposure <= 0.0:
+        note = (
+            "the diversified baseline never took a position — its return is idle "
+            "cash, not a market return, and every comparison figure describes a "
+            "flat line"
+        )
+        if baseline.rejections:
+            order, reason = baseline.rejections[0]
+            note += (
+                f" ({len(baseline.rejections)} order(s) rejected; first: "
+                f"{order.symbol} {order.side.value} {order.qty:g} — {reason})"
+            )
+        return [note]
+    entered = next(
+        (i for i, point in enumerate(baseline.equity_curve) if point.exposure > 0.0), None
+    )
+    if entered is not None and entered > 1:
+        note = (
+            f"the diversified baseline held nothing until bar {entered + 1} of "
+            f"{len(baseline.equity_curve)} — its return understates the basket "
+            "held over the full span"
+        )
+        if baseline.rejections:
+            order, reason = baseline.rejections[0]
+            note += (
+                f" ({len(baseline.rejections)} order(s) rejected; first: "
+                f"{order.symbol} {order.side.value} {order.qty:g} — {reason})"
+            )
+        return [note]
+    return []
+
+
+def assess_diversified_baseline(
+    result: BacktestResult,
+    baseline: BacktestResult,
+    periods_per_year: float = 252.0,
+    *,
+    label: str,
+) -> DiversifiedBaselineReport:
+    """Assemble the diversified-baseline block for one finished baseline run.
+
+    ``baseline`` is a completed run of a naive multi-asset strategy (the CLI's
+    default is ``equal_weight`` over ``core10``) under the same cash/costs/dates
+    as ``result``, run with unconstrained guardrails exactly as ``--benchmark``
+    is (ADR-0037's reasoning applies unchanged: the comparison must not be
+    clamped, but a baseline exempt from the venue's fees would flatter itself by
+    the fees the strategy paid and it did not).
+
+    Always returns an object; the caller decides whether to render it — the same
+    contract :func:`compare_to_benchmark`/:func:`assess_cost_budget` already
+    keep.
+    """
+    baseline_metrics = compute(baseline, periods_per_year)
+    comparison = compare_to_benchmark(result.equity_curve, baseline.equity_curve, periods_per_year)
+    return DiversifiedBaselineReport(
+        label=label,
+        symbols=tuple(baseline.symbols),
+        metrics=baseline_metrics,
+        comparison=comparison,
+        notes=_diversified_baseline_notes(baseline, baseline_metrics),
+    )
+
+
 # --- Statistical significance of a Sharpe ratio (ADR-0039) -------------------
 
 # How many resamples a confidence interval is built from. 1,000 is the usual

@@ -76,6 +76,13 @@ Sharpe quoted without the 24 is the number this bench exists not to print.
   traded under -- exceeds a stated fraction of equity per year (ADR-0068,
   KAN-860). Off by default; a run without the flag pays nothing extra and prints
   exactly the bytes it always did.
+- ``backtest --diversified-baseline`` runs a second, independent comparison
+  alongside ``--benchmark``: a naive ``equal_weight`` allocation across a
+  multi-asset basket (``--baseline-basket``, default ``@core10``), reported the
+  same way -- total return, the never-invested/invested-late honesty check, and
+  beta/alpha/correlation/information ratio (ADR-0071, KAN-641). A strategy that
+  cannot beat naive diversification is not earning its complexity. Off by
+  default; a run without the flag prints exactly the bytes it always did.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -175,8 +182,10 @@ from trading.metrics import (
     DEFAULT_BOOTSTRAP_RESAMPLES,
     DEFAULT_BOOTSTRAP_SEED,
     CostBudgetReport,
+    DiversifiedBaselineReport,
     SignificanceReport,
     assess_cost_budget,
+    assess_diversified_baseline,
     assess_significance,
     compute_regime_report,
     monte_carlo_shuffle,
@@ -936,52 +945,63 @@ def _make_paper_broker(
 
 def _run_benchmark(
     adapter: DataAdapter,
-    symbol: str,
+    strategy_name: str,
+    symbols: list[str],
     *,
     cash: float,
     start: datetime,
     end: datetime,
     costs: CostConfig | None = None,
+    label: str | None = None,
 ) -> BacktestResult | None:
-    """Run the unconstrained buy-and-hold benchmark, or warn and return ``None``.
+    """Run an unconstrained comparison strategy, or warn and return ``None``.
 
-    ``costs`` is the selected market's cost model (ADR-0060) and the benchmark pays
-    it too. It is *unconstrained* in the guardrail sense only — ADR-0037's point is
-    that the comparison must not be clamped — but a benchmark exempt from the
-    venue's fees would be a different thing entirely: on a 25 bps venue it would
-    beat the strategy by the fees the strategy paid and the benchmark did not, and
-    ADR-0039's paired bootstrap reads that curve. Buy-and-hold pays the fee roughly
-    once, which is precisely why it is the right baseline for a turnover cost.
+    Generalized beyond the original single-symbol ``buy_and_hold`` benchmark
+    (ADR-0037) to also drive the ADR-0071 diversified baseline —
+    ``strategy_name``/``symbols`` let a caller run any registered strategy over
+    any universe under the same unconstrained-guardrail/same-cost machinery,
+    rather than duplicating this function's error handling a second time.
+    ``label`` names the run for display/warnings; it defaults to the
+    comma-joined symbols (exactly the old single-symbol behaviour when
+    ``symbols`` has one element and ``label`` is omitted).
 
-    The benchmark is a comparison bolted onto a backtest that has *already*
-    finished, so a benchmark that cannot be run must cost one warning line, not
-    the summary, the equity CSV, and the result.json the operator asked for.
-    Previously the exception escaped after the main run had succeeded and the
-    whole command died with a traceback.
+    ``costs`` is the selected market's cost model (ADR-0060) and the comparison
+    run pays it too. It is *unconstrained* in the guardrail sense only —
+    ADR-0037's point is that the comparison must not be clamped — but a run
+    exempt from the venue's fees would be a different thing entirely: on a
+    25 bps venue it would beat the strategy by the fees the strategy paid and it
+    did not, and ADR-0039's paired bootstrap reads that curve.
+
+    The comparison is bolted onto a backtest that has *already* finished, so one
+    that cannot be run must cost one warning line, not the summary, the equity
+    CSV, and the result.json the operator asked for. Previously the exception
+    escaped after the main run had succeeded and the whole command died with a
+    traceback.
 
     Exactly one exception type is tolerated, and the narrowness is deliberate.
-    After ADR-0032 every way the benchmark's *data* can fail arrives here as
+    After ADR-0032 every way the comparison's *data* can fail arrives here as
     :class:`~trading.engine.EmptyUniverseError`: a mistyped ticker, a symbol that
     had not listed in the range, and a transport/credentials/unreadable-file
     failure all end up as an :class:`~trading.engine.AbsentSymbol` inside
-    :func:`~trading.engine.load_series`, and a one-symbol universe with nothing
-    in it raises. The three failure shapes therefore share one handler *and* stay
+    :func:`~trading.engine.load_series`, and a universe with nothing in it
+    raises. The three failure shapes therefore share one handler *and* stay
     distinguishable, because the error message carries the per-symbol reason.
     Anything else — a broken guardrail, a sizing crash, a misbehaving broker —
     means the bench itself is faulty, which makes the strategy numbers suspect
     too, so it is left to propagate.
     """
+    display = label if label is not None else ", ".join(symbols)
     bench_broker = SimulatedBroker(Portfolio(cash=cash), costs)
     engine = Engine(adapter, bench_broker, Guardrails(RiskConfig.unlimited()))
     try:
-        bench = engine.run(get_strategy("buy_and_hold"), [symbol], start, end)
+        bench = engine.run(get_strategy(strategy_name), symbols, start, end)
     except EmptyUniverseError as exc:
         typer.echo(
-            f"warning: benchmark {symbol} could not be run, continuing without it — {exc}",
+            f"warning: {display} could not be run, continuing without it — {exc}",
             err=True,
         )
         return None
-    _warn_if_benchmark_never_invested(symbol, bench)
+    _warn_if_benchmark_never_invested(display, bench)
     return bench
 
 
@@ -1159,6 +1179,23 @@ def backtest(
     benchmark: str = typer.Option(
         "", "--benchmark", help="Benchmark symbol for a buy-and-hold comparison, e.g. SPY."
     ),
+    diversified_baseline: bool = typer.Option(
+        False,
+        "--diversified-baseline/--no-diversified-baseline",
+        help=(
+            "Also compare against a naive equal_weight allocation across "
+            "--baseline-basket (ADR-0071). Off by default."
+        ),
+    ),
+    baseline_basket: str = typer.Option(
+        "@core10",
+        "--baseline-basket",
+        help=(
+            "Symbols for --diversified-baseline's equal_weight comparison; accepts "
+            "@name (e.g. @core10) or a plain comma list. Ignored without "
+            "--diversified-baseline."
+        ),
+    ),
     min_adv: float | None = typer.Option(
         None,
         "--min-adv",
@@ -1320,8 +1357,36 @@ def backtest(
     bench_symbol = benchmark.strip().upper()
     if bench_symbol:
         bench_result = _run_benchmark(
-            adapter, bench_symbol, cash=cash, start=start, end=end, costs=costs
+            adapter, "buy_and_hold", [bench_symbol], cash=cash, start=start, end=end, costs=costs
         )
+
+    # Optional diversified baseline (ADR-0071, KAN-641): a second, independent
+    # comparison — naive equal-weight across a multi-asset basket — reusing
+    # exactly the same unconstrained-guardrail/same-cost machinery as
+    # --benchmark above, generalized to a strategy + symbol list rather than
+    # buy_and_hold + one symbol.
+    diversified_baseline_report: DiversifiedBaselineReport | None = None
+    if diversified_baseline:
+        baseline_symbols = _parse_symbols(baseline_basket)
+        _check_symbol_shapes(chosen_market, baseline_symbols)
+        baseline_display = (
+            baseline_basket[1:] if baseline_basket.startswith("@") else ", ".join(baseline_symbols)
+        )
+        baseline_label = f"equal_weight/{baseline_display}"
+        baseline_result = _run_benchmark(
+            adapter,
+            "equal_weight",
+            baseline_symbols,
+            cash=cash,
+            start=start,
+            end=end,
+            costs=costs,
+            label=baseline_label,
+        )
+        if baseline_result is not None:
+            diversified_baseline_report = assess_diversified_baseline(
+                result, baseline_result, freq.periods_per_year, label=baseline_label
+            )
 
     # Read BEFORE the significance is assembled, not after: the whole point of the
     # ledger (ADR-0062) is that this invocation's own trial count is widened by
@@ -1401,6 +1466,7 @@ def backtest(
             regimes=regime_report,
             monte_carlo=monte_carlo_report,
             cost_budget=cost_budget_report,
+            diversified_baseline=diversified_baseline_report,
         )
     )
     write_equity_csv(result, out, bench_result)
@@ -1448,6 +1514,7 @@ def backtest(
         regimes=regime_report,
         monte_carlo=monte_carlo_report,
         cost_budget=cost_budget_report,
+        diversified_baseline=diversified_baseline_report,
     )
     typer.echo(f"Wrote result JSON to {result_json}")
     if plot:
