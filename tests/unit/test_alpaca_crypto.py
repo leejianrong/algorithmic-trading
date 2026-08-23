@@ -647,8 +647,11 @@ class TestSeamStaysTyped:
         """The venue split cost the seam **no** new method (ADR-0017/0058).
 
         `cancel_order` (ADR-0036) and `get_splits` (ADR-0045) were each a widening
-        the seam paid for. This one is not: crypto rides the seven calls that
-        already exist, which is the load-bearing claim that the seam was right.
+        the seam paid for. Crypto itself is not: it rides the seven calls that
+        already existed at the time, which was the load-bearing claim that the seam
+        was right. `list_assets` (KAN-863, ADR-0073) is a later, unrelated eighth
+        call -- it exists so a tape-density screen can enumerate a venue's whole
+        listing, not because crypto needed a new call of its own.
         """
         calls = {name for name in vars(AlpacaClient) if not name.startswith("_")}
         assert calls == {
@@ -661,6 +664,7 @@ class TestSeamStaysTyped:
             "get_account",
             "list_positions",
             "get_asset",
+            "list_assets",
         }
 
 

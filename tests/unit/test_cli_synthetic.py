@@ -477,6 +477,78 @@ class TestLiquidityScreenCli:
         assert "Liquidity screen" not in result.output
 
 
+class TestTapeDensityScreenCli:
+    """`--min-tape-density` wiring (KAN-863, ADR-0073)."""
+
+    def test_screen_reports_and_runs_on_a_continuous_market(self, tmp_path: Path) -> None:
+        out = tmp_path / "equity.csv"
+        result = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "equal_weight",
+                "--source",
+                "synthetic",
+                "--market",
+                "crypto",
+                "--interval",
+                "5m",
+                "--min-tape-density",
+                "0.5",
+                "--out",
+                str(out),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Tape-density screen" in result.output
+        assert "no look-ahead" in result.output
+        assert "Final equity" in result.output
+
+    def test_screen_is_off_by_default(self, tmp_path: Path) -> None:
+        out = tmp_path / "equity.csv"
+        result = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "equal_weight",
+                "--source",
+                "synthetic",
+                "--market",
+                "crypto",
+                "--out",
+                str(out),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "Tape-density screen" not in result.output
+
+    def test_requires_a_continuous_market(self, tmp_path: Path) -> None:
+        """The equity calendar's session shape isn't what this screen computes."""
+        out = tmp_path / "equity.csv"
+        result = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "equal_weight",
+                "--source",
+                "synthetic",
+                "--min-tape-density",
+                "0.5",
+                "--out",
+                str(out),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 2, result.output
+        assert "needs a continuous --market" in result.output
+        assert not out.exists()
+
+
 class TestSignificanceCli:
     """Trades-per-parameter reaches the printed summary (ADR-0029)."""
 

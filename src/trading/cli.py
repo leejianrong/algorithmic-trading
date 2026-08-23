@@ -83,6 +83,12 @@ Sharpe quoted without the 24 is the number this bench exists not to print.
   beta/alpha/correlation/information ratio (ADR-0071, KAN-641). A strategy that
   cannot beat naive diversification is not earning its complexity. Off by
   default; a run without the flag prints exactly the bytes it always did.
+- ``backtest --min-tape-density`` screens a continuous-market universe by how much
+  of a symbol's possible bar count the venue actually printed before the backtest
+  starts (KAN-863, ADR-0073) — a sibling to ``--min-adv`` that measures venue order
+  flow, not market cap: on Alpaca's crypto tape, ETH prints far fewer 5m/1m bars
+  than LINK despite being the larger coin. Every dropped symbol is printed. Off by
+  default; needs a continuous ``--market``.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -211,6 +217,11 @@ from trading.sweep import (
     run_cost_sensitivity_sweep,
     run_sweep,
     run_walk_forward,
+)
+from trading.tape_density import (
+    DEFAULT_MIN_TAPE_DENSITY,
+    DEFAULT_TAPE_DENSITY_FORMATION_DAYS,
+    screen_by_tape_density,
 )
 from trading.types import Portfolio
 from trading.universe import get_sector_map, get_universe, validate_universe
@@ -404,6 +415,54 @@ def _apply_liquidity_screen(
     return screen.kept
 
 
+def _apply_tape_density_screen(
+    adapter: DataAdapter,
+    tickers: list[str],
+    start: datetime,
+    freq: Frequency,
+    min_density: float,
+    formation_days: int,
+) -> list[str]:
+    """Screen ``tickers`` by pre-backtest venue tape density, return the keepers.
+
+    Mirrors :func:`_apply_liquidity_screen` exactly (KAN-863): the screen reads
+    only bars from before ``start``, every dropped symbol is printed with its
+    reason, and a screen that removed everything is a hard error (exit 2) rather
+    than a silent empty run.
+    """
+    screen = screen_by_tape_density(
+        adapter, tickers, start, freq, min_density=min_density, formation_days=formation_days
+    )
+    typer.echo(screen.describe() + "\n")
+    if not screen.kept:
+        typer.echo(
+            f"error: no symbol met the {min_density:.1%} tape-density floor at "
+            f"{freq.label} — lower --min-tape-density, widen --symbols, or use a "
+            "coarser --interval",
+            err=True,
+        )
+        raise typer.Exit(2)
+    return screen.kept
+
+
+def _check_tape_density_options(min_density: float | None, market: _Market) -> None:
+    """Reject ``--min-tape-density`` on a market it cannot be computed for.
+
+    :func:`~trading.tape_density.expected_bar_count` needs a continuous calendar
+    (KAN-863): a session market's expected bar count also depends on which hours
+    are open, which the venue-flow question this screen asks does not model. Exit
+    2 before any fetch, the same shape :func:`_check_symbol_shapes` uses.
+    """
+    if min_density is not None and not market.calendar.is_continuous:
+        typer.echo(
+            f"error: --min-tape-density needs a continuous --market (got "
+            f"{market.name!r}); a session market's expected bar count is not "
+            "what this screen computes",
+            err=True,
+        )
+        raise typer.Exit(2)
+
+
 def _apply_liquidity_tiering(
     adapter: DataAdapter,
     tickers: list[str],
@@ -534,6 +593,13 @@ LIQUIDITY_TIER_ADV_HELP = (
 LIQUIDITY_TIER_SLIPPAGE_HELP = (
     "Slippage bps charged to symbols at/above --liquidity-tier-adv (needs that "
     f"flag). Default {LIQUID_TIER_SLIPPAGE_BPS:g}."
+)
+MIN_TAPE_DENSITY_HELP = (
+    "Drop symbols whose fraction of possible bars this venue actually printed BEFORE "
+    "--from (actual/expected bar count at --interval) is under this (KAN-863, "
+    "ADR-0073). Measures venue order flow, not market cap: on Alpaca's crypto tape "
+    "ETH — a top-3 coin — prints far fewer 5m bars than LINK. Needs a continuous "
+    f"--market. Off by default (None); a reasonable floor is {DEFAULT_MIN_TAPE_DENSITY:.2f}."
 )
 COST_BUDGET_HELP = (
     "Warn (never abort) when this run's own predicted cost drag -- annual turnover "
@@ -1209,6 +1275,16 @@ def backtest(
         "--adv-window",
         help="Calendar days of pre-backtest history the --min-adv screen measures over.",
     ),
+    min_tape_density: float | None = typer.Option(
+        None,
+        "--min-tape-density",
+        help=MIN_TAPE_DENSITY_HELP,
+    ),
+    tape_density_window: int = typer.Option(
+        DEFAULT_TAPE_DENSITY_FORMATION_DAYS,
+        "--tape-density-window",
+        help="Calendar days of pre-backtest history the --min-tape-density screen measures over.",
+    ),
     liquidity_tier_adv: float | None = typer.Option(
         None,
         "--liquidity-tier-adv",
@@ -1300,6 +1376,7 @@ def backtest(
     _check_bootstrap_options(bootstrap=bootstrap, resamples=bootstrap_resamples)
     _check_monte_carlo_options(monte_carlo=monte_carlo, resamples=monte_carlo_resamples)
     _check_cost_budget_options(cost_budget_pct)
+    _check_tape_density_options(min_tape_density, chosen_market)
 
     try:
         strat = get_strategy(strategy)
@@ -1333,6 +1410,10 @@ def backtest(
     adapter = _make_adapter(source, cache_dir, seed, freq)
     if min_adv is not None:
         tickers = _apply_liquidity_screen(adapter, tickers, start, min_adv, adv_window)
+    if min_tape_density is not None:
+        tickers = _apply_tape_density_screen(
+            adapter, tickers, start, freq, min_tape_density, tape_density_window
+        )
     if liquidity_tier_adv is not None:
         tiered_rates = _apply_liquidity_tiering(
             adapter,
