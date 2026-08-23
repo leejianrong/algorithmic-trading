@@ -12,7 +12,7 @@ from typer.testing import CliRunner, Result
 from trading.cli import app
 from trading.data.synthetic import SyntheticAdapter
 from trading.frequency import Frequency
-from trading.sweep import combo_key, run_sweep, run_walk_forward
+from trading.sweep import combo_key, run_cost_sensitivity_sweep, run_sweep, run_walk_forward
 
 runner = CliRunner()
 
@@ -608,3 +608,174 @@ class TestStabilityCli:
         assert result.exit_code == 0, result.output
         assert "\\" not in result.output
         assert (tmp_path / "sweep_stability.csv").exists()
+
+
+class TestSlippageSweepCli:
+    """``--slippage-sweep`` (KAN-618, ADR-0069): cost-sensitivity re-run of the winner.
+
+    Off by default, additive: the main sweep CSV and stdout table are unaffected
+    either way, and the new report is a sibling file next to ``--out``.
+    """
+
+    def _sweep(self, tmp_path: Path, out_name: str = "sweep.csv", *extra: str) -> Result:
+        return runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "sma_crossover",
+                "--param",
+                "fast=5,10",
+                "--param",
+                "slow=30,50",
+                "--source",
+                "synthetic",
+                "--seed",
+                "5",
+                "--out",
+                str(tmp_path / out_name),
+                *extra,
+                *_COMMON,
+            ],
+        )
+
+    def test_off_by_default_writes_no_cost_sensitivity_output(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path)
+        assert result.exit_code == 0, result.output
+        assert "cost sensitivity" not in result.output.lower()
+        assert not (tmp_path / "sweep_cost_sensitivity.csv").exists()
+
+    def test_writes_a_sibling_csv_next_to_out(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path, "sweep.csv", "--slippage-sweep", "5,10,25,50")
+        assert result.exit_code == 0, result.output
+        cost_path = tmp_path / "sweep_cost_sensitivity.csv"
+        assert cost_path.exists()
+        assert f"Wrote cost-sensitivity report to {cost_path}" in result.output
+
+    def test_csv_has_one_row_per_level_ascending_with_expected_columns(
+        self, tmp_path: Path
+    ) -> None:
+        assert self._sweep(tmp_path, "sweep.csv", "--slippage-sweep", "50,5,25,10").exit_code == 0
+        with (tmp_path / "sweep_cost_sensitivity.csv").open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        assert len(rows) == 4
+        assert set(rows[0]) == {
+            "slippage_bps",
+            "taker_fee_bps",
+            "sharpe",
+            "total_return",
+            "annualized_return",
+            "max_drawdown",
+            "win_rate",
+            "avg_exposure",
+            "peak_exposure",
+        }
+        levels = [float(r["slippage_bps"]) for r in rows]
+        assert levels == [5.0, 10.0, 25.0, 50.0]
+
+    def test_re_runs_the_sweeps_own_winner_holding_params_fixed(self, tmp_path: Path) -> None:
+        """The CLI's report is exactly `run_cost_sensitivity_sweep` on the winner."""
+        result = self._sweep(tmp_path, "sweep.csv", "--slippage-sweep", "5,50")
+        assert result.exit_code == 0, result.output
+
+        winner = (
+            run_sweep(
+                "sma_crossover",
+                {"fast": [5, 10], "slow": [30, 50]},
+                SyntheticAdapter(seed=5),
+                ["AAA", "BBB"],
+                datetime(2021, 1, 1, tzinfo=UTC),
+                datetime(2022, 12, 31, tzinfo=UTC),
+                periods_per_year=252.0,
+            )
+            .ranked()[0]
+            .params
+        )
+        expected = run_cost_sensitivity_sweep(
+            "sma_crossover",
+            winner,
+            SyntheticAdapter(seed=5),
+            ["AAA", "BBB"],
+            datetime(2021, 1, 1, tzinfo=UTC),
+            datetime(2022, 12, 31, tzinfo=UTC),
+            slippage_bps=[5.0, 50.0],
+            periods_per_year=252.0,
+        )
+        winner_pretty = ", ".join(f"{k}={v:g}" for k, v in winner.items())
+        assert f"params={{{winner_pretty}}}" in result.output
+
+        with (tmp_path / "sweep_cost_sensitivity.csv").open(newline="") as fh:
+            rows = list(csv.DictReader(fh))
+        expected_by_level = {run.slippage_bps: run for run in expected.runs}
+        for row in rows:
+            want = expected_by_level[float(row["slippage_bps"])]
+            assert float(row["sharpe"]) == pytest.approx(want.metrics.sharpe, abs=5e-5)
+            assert float(row["total_return"]) == pytest.approx(want.metrics.total_return, abs=5e-5)
+
+    def test_prints_where_the_edge_dies(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path, "sweep.csv", "--slippage-sweep", "5,500,5000,50000")
+        assert result.exit_code == 0, result.output
+        # An absurdly wide grid guarantees a crossing somewhere for a traded strategy.
+        assert "Edge" in result.output
+
+    def test_mutually_exclusive_with_slippage_bps(self, tmp_path: Path) -> None:
+        result = self._sweep(
+            tmp_path, "sweep.csv", "--slippage-sweep", "5,10", "--slippage-bps", "7"
+        )
+        assert result.exit_code == 2
+        assert "mutually exclusive" in result.output
+
+    def test_malformed_level_exits_2(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path, "sweep.csv", "--slippage-sweep", "5,abc")
+        assert result.exit_code == 2
+        assert "--slippage-sweep" in result.output
+
+    def test_negative_level_exits_2(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path, "sweep.csv", "--slippage-sweep", "-5")
+        assert result.exit_code == 2
+        assert "non-negative" in result.output
+
+    def test_not_wired_into_folds_prints_a_note_and_writes_nothing(self, tmp_path: Path) -> None:
+        result = self._sweep(tmp_path, "wf.csv", "--slippage-sweep", "5,10", "--folds", "2")
+        assert result.exit_code == 0, result.output
+        assert "not yet wired into --folds walk-forward" in result.output
+        assert not (tmp_path / "wf_cost_sensitivity.csv").exists()
+
+    def test_does_not_touch_the_main_sweep_csv_or_table(self, tmp_path: Path) -> None:
+        """Purely additive: the pre-existing artifacts are byte-identical either way."""
+        without = self._sweep(tmp_path, "a.csv")
+        with_flag = self._sweep(tmp_path, "b.csv", "--slippage-sweep", "5,10,25,50")
+        assert without.exit_code == 0
+        assert with_flag.exit_code == 0
+        assert (tmp_path / "a.csv").read_text() == (tmp_path / "b.csv").read_text()
+        without_head = without.output.split("Wrote sweep results to", 1)[0]
+        with_head = with_flag.output.split("Wrote sweep results to", 1)[0]
+        assert without_head == with_head
+
+    def test_no_runs_produced_prints_no_cost_sensitivity_block(self, tmp_path: Path) -> None:
+        """A grid with no valid combo has no winner to re-run — no crash, no block."""
+        result = runner.invoke(
+            app,
+            [
+                "sweep",
+                "--strategy",
+                "sma_crossover",
+                "--param",
+                "fast=40",
+                "--param",
+                "slow=30",  # fast >= slow: rejected by the constructor
+                "--source",
+                "synthetic",
+                "--seed",
+                "5",
+                "--slippage-sweep",
+                "5,10",
+                "--out",
+                str(tmp_path / "sweep.csv"),
+                *_COMMON,
+            ],
+        )
+        assert result.exit_code == 0, result.output
+        assert "No runs produced" in result.output
+        assert "cost sensitivity" not in result.output.lower()
+        assert not (tmp_path / "sweep_cost_sensitivity.csv").exists()

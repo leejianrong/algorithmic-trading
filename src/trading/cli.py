@@ -66,6 +66,11 @@ Sharpe quoted without the 24 is the number this bench exists not to print.
   cross-sectional run spanning the whole S&P 500 should not price its 500th name
   like a mega-cap. Off by default; a run without the flag prices every symbol flat,
   exactly as before.
+- ``sweep --slippage-sweep 5,10,25,50`` re-runs the sweep's own winning combo at
+  every slippage level in the grid, holding the strategy's parameters fixed, and
+  prints the interpolated bps level where Sharpe/total return crosses zero — where
+  the edge dies as cost rises (KAN-618, ADR-0069). Off by default; the main sweep
+  table and CSV are unchanged whether or not it is passed.
 
 The trades-per-parameter sample-size check is wired automatically: every run
 reports its entry count, and a run with too few trades for its number of tunable
@@ -181,10 +186,13 @@ from trading.report import (
 from trading.risk import Guardrails
 from trading.strategies import free_parameter_count, get_strategy
 from trading.sweep import (
+    CostSensitivitySummary,
+    EdgeDeath,
     NeighborStability,
     SweepSummary,
     WalkForwardSummary,
     combo_key,
+    run_cost_sensitivity_sweep,
     run_sweep,
     run_walk_forward,
 )
@@ -527,6 +535,13 @@ LEDGER_HELP = (
 HYPOTHESIS_HELP = (
     "Pre-registered rationale for this run, recorded verbatim in the ledger (needs "
     "--ledger; harmless, but not yet used, without it). For KAN-862's playbook."
+)
+SLIPPAGE_SWEEP_HELP = (
+    "Cost-sensitivity sweep (KAN-618, ADR-0069): comma-separated slippage-bps grid, "
+    "e.g. 5,10,25,50. Re-runs the sweep's own winning combo (by --rank-by) at each "
+    "level, holding its parameters fixed, and reports where Sharpe/total return "
+    "crosses zero as cost rises. Off by default; the main sweep table and CSV are "
+    "unchanged whether or not this is passed."
 )
 
 # Quote currencies that make a symbol a *pair* rather than a ticker. Deliberately
@@ -1975,6 +1990,36 @@ def _parse_grid(params: list[str]) -> dict[str, list[object]]:
     return grid
 
 
+def _parse_bps_grid(raw: str) -> list[float]:
+    """Parse ``--slippage-sweep 5,10,25,50`` into a list of non-negative floats.
+
+    A malformed entry, an empty grid, or a negative level exits with code 2 —
+    the same "fail before running anything" discipline ``_parse_grid`` and
+    ``_parse_date`` already use.
+    """
+    values: list[float] = []
+    for chunk in raw.split(","):
+        text = chunk.strip()
+        if not text:
+            continue
+        try:
+            value = float(text)
+        except ValueError:
+            typer.echo(
+                f"error: --slippage-sweep must be a comma-separated list of numbers, got {text!r}",
+                err=True,
+            )
+            raise typer.Exit(2) from None
+        if value < 0:
+            typer.echo(f"error: --slippage-sweep level {value:g} must be non-negative", err=True)
+            raise typer.Exit(2)
+        values.append(value)
+    if not values:
+        typer.echo("error: --slippage-sweep has no values", err=True)
+        raise typer.Exit(2)
+    return values
+
+
 # The metric columns written for every sweep run, in order (attr, header).
 _SWEEP_METRIC_COLUMNS: list[tuple[str, str]] = [
     ("sharpe", "sharpe"),
@@ -2154,6 +2199,83 @@ def _format_param(value: object) -> str:
     return str(value)
 
 
+def _cost_sensitivity_csv_path(out: Path) -> Path:
+    """The cost-sensitivity report's path, a sibling of the main sweep CSV.
+
+    ``results/sweep.csv`` -> ``results/sweep_cost_sensitivity.csv``, the same
+    no-new-``--out``-flag idiom :func:`_stability_csv_path` (ADR-0065) and
+    ``paper --divergence``'s ``fill_divergence.csv`` already use.
+    """
+    suffix = out.suffix or ".csv"
+    return out.with_name(f"{out.stem}_cost_sensitivity{suffix}")
+
+
+def _write_cost_sensitivity_csv(summary: CostSensitivitySummary, path: Path) -> None:
+    """Write one row per slippage level, ascending, with the same metric columns
+    :func:`_write_sweep_csv` uses so the two files read the same way.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    ordered = sorted(summary.runs, key=lambda run: run.slippage_bps)
+    header = ["slippage_bps", "taker_fee_bps"] + [name for _attr, name in _SWEEP_METRIC_COLUMNS]
+    with path.open("w", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(header)
+        for run in ordered:
+            row: list[object] = [run.slippage_bps, run.taker_fee_bps]
+            row.extend(
+                round(getattr(run.metrics, attr), 6) for attr, _name in _SWEEP_METRIC_COLUMNS
+            )
+            writer.writerow(row)
+
+
+def _format_cost_sensitivity_table(summary: CostSensitivitySummary) -> str:
+    """Render one row per slippage level, ascending, as a plain-text table."""
+    ordered = sorted(summary.runs, key=lambda run: run.slippage_bps)
+    headers = ["slippage_bps", "sharpe", "total_return", "max_drawdown"]
+    rows: list[list[str]] = []
+    for run in ordered:
+        rows.append(
+            [
+                f"{run.slippage_bps:g}",
+                f"{run.metrics.sharpe:.3f}",
+                f"{run.metrics.total_return * 100:.2f}%",
+                f"{run.metrics.max_drawdown * 100:.2f}%",
+            ]
+        )
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+    lines = ["  ".join(h.ljust(widths[i]) for i, h in enumerate(headers))]
+    lines.append("  ".join("-" * widths[i] for i in range(len(headers))))
+    lines.extend("  ".join(cell.ljust(widths[i]) for i, cell in enumerate(row)) for row in rows)
+    return "\n".join(lines)
+
+
+def _format_edge_death(death: EdgeDeath) -> str:
+    """One human-readable line naming exactly where the edge died (KAN-618).
+
+    The concrete number the ticket asks for, not a table the reader has to
+    eyeball: an interpolated bps level, or one of the two honest non-answers
+    (:attr:`EdgeDeath.already_dead` / :attr:`EdgeDeath.survives_grid`).
+    """
+    label = "Sharpe" if death.metric == "sharpe" else "total return"
+    threshold = f"{death.threshold:g}"
+    if death.already_dead:
+        return (
+            f"Edge already dead: {label} is at/below {threshold} at the cheapest "
+            f"level tested ({death.crossing_bps:g} bps)."
+        )
+    if death.survives_grid:
+        return (
+            f"Edge survives this grid: {label} never crosses {threshold} within the levels tested."
+        )
+    assert death.crossing_bps is not None  # narrowed by the two branches above
+    return (
+        f"Edge dies (~{label} crosses {threshold}) at ~{death.crossing_bps:.2f} bps (interpolated)."
+    )
+
+
 @app.command()
 def sweep(
     strategy: str = typer.Option(..., "--strategy", "-s", help="Registered strategy name."),
@@ -2262,6 +2384,11 @@ def sweep(
             "into --folds walk-forward."
         ),
     ),
+    slippage_sweep: str = typer.Option(
+        "",
+        "--slippage-sweep",
+        help=SLIPPAGE_SWEEP_HELP,
+    ),
 ) -> None:
     """Grid-sweep a strategy's parameters over a date range, ranked by a metric.
 
@@ -2277,9 +2404,18 @@ def sweep(
     _check_symbol_shapes(chosen_market, tickers)
     freq = _parse_frequency(interval, chosen_market.calendar)
     grid = _parse_grid(param)
+    slippage_grid = _parse_bps_grid(slippage_sweep) if slippage_sweep else None
     if rank_by not in {"sharpe", "total_return"}:
         typer.echo(
             f"error: --rank-by must be 'sharpe' or 'total_return', got {rank_by!r}", err=True
+        )
+        raise typer.Exit(2)
+
+    if slippage_grid is not None and slippage_bps is not None:
+        typer.echo(
+            "error: --slippage-bps and --slippage-sweep are mutually exclusive; use "
+            "--slippage-sweep to test a grid of rates instead of overriding a single one",
+            err=True,
         )
         raise typer.Exit(2)
 
@@ -2349,6 +2485,15 @@ def sweep(
                 "(ADR-0065); nothing was written",
                 err=True,
             )
+        if slippage_grid is not None:
+            # KAN-618: cost-sensitivity re-runs a plain sweep's single winning
+            # combo; a walk-forward fold has no single winner across the whole
+            # range to re-run at each cost level, same shape as the two gaps above.
+            typer.echo(
+                "note: --slippage-sweep is not yet wired into --folds walk-forward "
+                "(ADR-0069); nothing was written",
+                err=True,
+            )
         _run_walk_forward_command(
             strategy=strategy,
             grid=grid,
@@ -2413,6 +2558,40 @@ def sweep(
                 typer.echo(f"Wrote parameter-stability report to {stability_path}")
                 if len(param_keys) == 2:
                     typer.echo("\n" + _format_stability_heatmap(stability_rows, param_keys, grid))
+
+        if slippage_grid is not None:
+            # KAN-618: re-run the sweep's own winner at every cost level, holding
+            # its parameters fixed — read-only reporting on top of the summary
+            # already computed above, same shape as --stability.
+            winner_params = summary.ranked(rank_by)[0].params
+            cost_summary = run_cost_sensitivity_sweep(
+                strategy,
+                winner_params,
+                adapter,
+                tickers,
+                start,
+                end,
+                slippage_bps=slippage_grid,
+                cash=cash,
+                risk=risk,
+                base_costs=costs,
+                periods_per_year=freq.periods_per_year,
+            )
+            winner_pretty = ", ".join(f"{k}={_format_param(v)}" for k, v in winner_params.items())
+            typer.echo(
+                f"\nCost sensitivity: strategy={strategy} params={{{winner_pretty}}} "
+                f"levels={len(cost_summary.runs)}\n"
+            )
+            if cost_summary.runs:
+                typer.echo(_format_cost_sensitivity_table(cost_summary))
+                death = cost_summary.edge_death(metric=rank_by)
+                if death is not None:
+                    typer.echo("\n" + _format_edge_death(death))
+                cost_path = _cost_sensitivity_csv_path(out)
+                _write_cost_sensitivity_csv(cost_summary, cost_path)
+                typer.echo(f"Wrote cost-sensitivity report to {cost_path}")
+            for level, reason in cost_summary.unusable_levels:
+                typer.echo(f"unusable slippage level {level:g} bps: {reason}")
 
         # Appended after the deflation above so a failure building the report never
         # costs the log entry, and before the caller sees "Wrote sweep results" so

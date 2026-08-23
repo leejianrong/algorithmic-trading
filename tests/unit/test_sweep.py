@@ -25,11 +25,13 @@ from typing import ClassVar
 
 import pytest
 
-from trading.config import RiskConfig
+from trading.config import CostConfig, RiskConfig
 from trading.data.fake import FakeAdapter
 from trading.data.synthetic import SyntheticAdapter
 from trading.metrics import PerformanceMetrics
 from trading.sweep import (
+    CostSensitivityRun,
+    CostSensitivitySummary,
     SweepRun,
     SweepSummary,
     WalkForwardFold,
@@ -37,6 +39,7 @@ from trading.sweep import (
     combo_key,
     expand_grid,
     neighbor_stability,
+    run_cost_sensitivity_sweep,
     run_sweep,
     run_walk_forward,
     split_folds,
@@ -1201,3 +1204,290 @@ class TestSweepSummaryStability:
         expected_scores = {combo_key(r.params): r.score for r in rows}
         for run in summary.runs:
             assert expected_scores[combo_key(run.params)] == pytest.approx(run.metrics.total_return)
+
+
+# --- cost-sensitivity sweep: re-run one fixed combo across a slippage grid ----
+
+
+def _cost_run(
+    slippage_bps: float, *, total_return: float = 0.0, sharpe: float = 0.0
+) -> CostSensitivityRun:
+    # _metrics(sharpe, total_return) is the module-level helper defined above,
+    # under "aggregate honesty figures" — reused rather than re-declared.
+    return CostSensitivityRun(
+        slippage_bps=slippage_bps,
+        taker_fee_bps=0.0,
+        metrics=_metrics(sharpe, total_return),
+    )
+
+
+class TestEdgeDeathPure:
+    """`CostSensitivitySummary.edge_death` on hand-built runs — no engine calls."""
+
+    def test_no_runs_is_none(self) -> None:
+        summary = CostSensitivitySummary(strategy="sma_crossover", symbols=["AAA"], params={})
+        assert summary.edge_death() is None
+
+    def test_interpolates_the_crossing_between_the_bracketing_levels(self) -> None:
+        # total_return: +0.04 at 10 bps, -0.01 at 25 bps -> crosses zero 4/5 of the
+        # way from 10 to 25, i.e. at 22 bps.
+        runs = [
+            _cost_run(10.0, total_return=0.04),
+            _cost_run(25.0, total_return=-0.01),
+        ]
+        summary = CostSensitivitySummary(strategy="s", symbols=["AAA"], params={}, runs=runs)
+        death = summary.edge_death(metric="total_return")
+        assert death is not None
+        assert not death.already_dead
+        assert not death.survives_grid
+        assert death.crossing_bps == pytest.approx(22.0)
+
+    def test_reads_runs_in_ascending_slippage_order_regardless_of_input_order(self) -> None:
+        # Same scenario as above, but the runs list is built out of order.
+        runs = [
+            _cost_run(25.0, total_return=-0.01),
+            _cost_run(10.0, total_return=0.04),
+        ]
+        summary = CostSensitivitySummary(strategy="s", symbols=["AAA"], params={}, runs=runs)
+        death = summary.edge_death(metric="total_return")
+        assert death is not None
+        assert death.crossing_bps == pytest.approx(22.0)
+
+    def test_already_dead_at_the_cheapest_level(self) -> None:
+        runs = [_cost_run(5.0, total_return=-0.02), _cost_run(50.0, total_return=-0.10)]
+        summary = CostSensitivitySummary(strategy="s", symbols=["AAA"], params={}, runs=runs)
+        death = summary.edge_death(metric="total_return")
+        assert death is not None
+        assert death.already_dead
+        assert not death.survives_grid
+        assert death.crossing_bps == pytest.approx(5.0)
+
+    def test_already_dead_when_the_cheapest_level_sits_exactly_at_the_threshold(self) -> None:
+        # threshold is inclusive: an exact 0.0 at the cheapest level is already dead,
+        # not "still alive by a hair".
+        runs = [_cost_run(5.0, total_return=0.0), _cost_run(50.0, total_return=-0.10)]
+        summary = CostSensitivitySummary(strategy="s", symbols=["AAA"], params={}, runs=runs)
+        death = summary.edge_death(metric="total_return")
+        assert death is not None
+        assert death.already_dead
+        assert death.crossing_bps == pytest.approx(5.0)
+
+    def test_survives_the_whole_grid(self) -> None:
+        runs = [_cost_run(5.0, total_return=0.10), _cost_run(50.0, total_return=0.02)]
+        summary = CostSensitivitySummary(strategy="s", symbols=["AAA"], params={}, runs=runs)
+        death = summary.edge_death(metric="total_return")
+        assert death is not None
+        assert death.survives_grid
+        assert not death.already_dead
+        assert death.crossing_bps is None
+
+    def test_exact_zero_at_a_tested_level_is_the_crossing_not_an_interpolation(self) -> None:
+        runs = [_cost_run(10.0, total_return=0.02), _cost_run(25.0, total_return=0.0)]
+        summary = CostSensitivitySummary(strategy="s", symbols=["AAA"], params={}, runs=runs)
+        death = summary.edge_death(metric="total_return")
+        assert death is not None
+        assert death.crossing_bps == pytest.approx(25.0)
+
+    def test_sharpe_metric_is_read_independently_of_total_return(self) -> None:
+        runs = [
+            _cost_run(10.0, total_return=0.5, sharpe=0.2),
+            _cost_run(25.0, total_return=0.4, sharpe=-0.1),
+        ]
+        summary = CostSensitivitySummary(strategy="s", symbols=["AAA"], params={}, runs=runs)
+        by_sharpe = summary.edge_death(metric="sharpe")
+        by_return = summary.edge_death(metric="total_return")
+        assert by_sharpe is not None
+        assert by_sharpe.survives_grid is False
+        assert by_return is not None
+        assert by_return.survives_grid is True
+
+    def test_unknown_metric_raises(self) -> None:
+        summary = CostSensitivitySummary(
+            strategy="s", symbols=["AAA"], params={}, runs=[_cost_run(5.0)]
+        )
+        with pytest.raises(ValueError, match="unknown"):
+            summary.edge_death(metric="bogus")
+
+    def test_a_custom_threshold_is_honored(self) -> None:
+        runs = [_cost_run(10.0, total_return=0.10), _cost_run(25.0, total_return=0.03)]
+        summary = CostSensitivitySummary(strategy="s", symbols=["AAA"], params={}, runs=runs)
+        # Never crosses 0.0, but does cross a 0.05 threshold.
+        at_zero = summary.edge_death(metric="total_return", threshold=0.0)
+        assert at_zero is not None
+        assert at_zero.survives_grid
+        death = summary.edge_death(metric="total_return", threshold=0.05)
+        assert death is not None
+        assert not death.survives_grid
+
+
+class TestRunCostSensitivitySweep:
+    """`run_cost_sensitivity_sweep`: one fixed combo re-run at every slippage level."""
+
+    def test_runs_once_per_deduplicated_sorted_level(self) -> None:
+        summary = run_cost_sensitivity_sweep(
+            "sma_crossover",
+            {"fast": 5, "slow": 30},
+            _adapter(),
+            _SYMBOLS,
+            _START,
+            _END,
+            slippage_bps=[50.0, 5.0, 25.0, 10.0, 10.0],
+        )
+        assert [run.slippage_bps for run in summary.runs] == [5.0, 10.0, 25.0, 50.0]
+        assert summary.params == {"fast": 5, "slow": 30}
+
+    def test_params_are_held_fixed_across_every_level(self) -> None:
+        summary = run_cost_sensitivity_sweep(
+            "sma_crossover",
+            {"fast": 5, "slow": 30},
+            _adapter(),
+            _SYMBOLS,
+            _START,
+            _END,
+            slippage_bps=[5.0, 50.0],
+        )
+        assert summary.params == {"fast": 5, "slow": 30}
+
+    def test_higher_slippage_never_improves_a_high_turnover_strategys_return(self) -> None:
+        # sma_crossover trades on every crossover; more slippage can only cost more.
+        summary = run_cost_sensitivity_sweep(
+            "sma_crossover",
+            {"fast": 5, "slow": 20},
+            _adapter(),
+            _SYMBOLS,
+            _START,
+            _END,
+            slippage_bps=[5.0, 10.0, 25.0, 50.0],
+        )
+        returns = [run.metrics.total_return for run in summary.runs]
+        assert returns == sorted(returns, reverse=True)
+
+    def test_is_deterministic(self) -> None:
+        params = {"fast": 5, "slow": 30}
+        first = run_cost_sensitivity_sweep(
+            "sma_crossover", params, _adapter(), _SYMBOLS, _START, _END, slippage_bps=[5.0, 25.0]
+        )
+        second = run_cost_sensitivity_sweep(
+            "sma_crossover", params, _adapter(), _SYMBOLS, _START, _END, slippage_bps=[5.0, 25.0]
+        )
+        assert [(r.slippage_bps, r.metrics) for r in first.runs] == [
+            (r.slippage_bps, r.metrics) for r in second.runs
+        ]
+
+    def test_unknown_strategy_raises(self) -> None:
+        with pytest.raises(KeyError):
+            run_cost_sensitivity_sweep(
+                "no-such-strategy", {}, _adapter(), _SYMBOLS, _START, _END, slippage_bps=[5.0]
+            )
+
+    def test_invalid_combo_raises_before_running_anything(self) -> None:
+        with pytest.raises((ValueError, TypeError)):
+            run_cost_sensitivity_sweep(
+                "sma_crossover",
+                {"fast": 40, "slow": 30},  # fast >= slow: rejected by the constructor
+                _adapter(),
+                _SYMBOLS,
+                _START,
+                _END,
+                slippage_bps=[5.0, 10.0],
+            )
+
+    def test_empty_slippage_grid_raises(self) -> None:
+        with pytest.raises(ValueError, match="empty"):
+            run_cost_sensitivity_sweep(
+                "sma_crossover",
+                {"fast": 5, "slow": 30},
+                _adapter(),
+                _SYMBOLS,
+                _START,
+                _END,
+                slippage_bps=[],
+            )
+
+    def test_a_symbol_slippage_tier_is_refused(self) -> None:
+        """Sweeping the flat rate wouldn't move a tiered symbol's effective cost (ADR-0063)."""
+        tiered = CostConfig(symbol_slippage_bps={"AAA": 2.0})
+        with pytest.raises(ValueError, match="per-symbol"):
+            run_cost_sensitivity_sweep(
+                "sma_crossover",
+                {"fast": 5, "slow": 30},
+                _adapter(),
+                _SYMBOLS,
+                _START,
+                _END,
+                slippage_bps=[5.0, 10.0],
+                base_costs=tiered,
+            )
+
+    def test_a_dataless_span_is_recorded_as_an_unusable_level_not_raised(self) -> None:
+        summary = run_cost_sensitivity_sweep(
+            "sma_crossover",
+            {"fast": 5, "slow": 30},
+            FakeAdapter([]),
+            _SYMBOLS,
+            _START,
+            _END,
+            slippage_bps=[5.0, 10.0],
+        )
+        assert summary.runs == []
+        assert [level for level, _reason in summary.unusable_levels] == [5.0, 10.0]
+
+    def test_every_run_records_its_return_moments(self) -> None:
+        summary = run_cost_sensitivity_sweep(
+            "sma_crossover",
+            {"fast": 5, "slow": 30},
+            _adapter(),
+            _SYMBOLS,
+            _START,
+            _END,
+            slippage_bps=[5.0, 25.0],
+        )
+        assert all(run.moments is not None for run in summary.runs)
+
+    def test_taker_fee_and_commission_are_held_at_the_base_cost_model(self) -> None:
+        base = CostConfig(commission_per_share=0.01, taker_fee_bps=3.0)
+        summary = run_cost_sensitivity_sweep(
+            "sma_crossover",
+            {"fast": 5, "slow": 30},
+            _adapter(),
+            _SYMBOLS,
+            _START,
+            _END,
+            slippage_bps=[5.0, 25.0],
+            base_costs=base,
+        )
+        assert all(run.taker_fee_bps == 3.0 for run in summary.runs)
+
+    def test_a_low_turnover_strategy_degrades_slower_than_a_high_turnover_one(self) -> None:
+        """The headline claim (KAN-618): high turnover should die faster under cost.
+
+        Same universe, same range, same slippage grid — only the strategy's own
+        turnover differs (`sma_crossover` trades every crossover; `equal_weight`
+        rebalances to one static target once and mostly holds).
+        """
+        levels = [5.0, 10.0, 25.0, 50.0]
+        high_turnover = run_cost_sensitivity_sweep(
+            "sma_crossover",
+            {"fast": 5, "slow": 20},
+            _adapter(),
+            _SYMBOLS,
+            _START,
+            _END,
+            slippage_bps=levels,
+        )
+        low_turnover = run_cost_sensitivity_sweep(
+            "equal_weight",
+            {},
+            _adapter(),
+            _SYMBOLS,
+            _START,
+            _END,
+            slippage_bps=levels,
+        )
+        high_degradation = (
+            high_turnover.runs[0].metrics.total_return - high_turnover.runs[-1].metrics.total_return
+        )
+        low_degradation = (
+            low_turnover.runs[0].metrics.total_return - low_turnover.runs[-1].metrics.total_return
+        )
+        assert high_degradation > low_degradation
