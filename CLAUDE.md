@@ -1218,6 +1218,41 @@ As of this writing:
   decay, 0.981 → 0.856), tracking each strategy's turnover (1362.97% vs 238.43%,
   5.7x). Not yet wired into `--folds`, same gap shape as `--stability`/`--ledger`
   there.
+- **Diversified baseline as a mandatory second bar (2026-08-23, ADR-0071, KAN-641):**
+  `backtest --diversified-baseline` (off by default) runs naive `equal_weight` over
+  `--baseline-basket` (default `@core10`) under the run's own cash/costs/unconstrained
+  guardrails and reports it exactly like `--benchmark` — total return, the
+  never-invested honesty check, and beta/alpha/correlation/IR
+  (`metrics.assess_diversified_baseline`, `DiversifiedBaselineReport`).
+  `cli._run_benchmark` is generalized to any strategy/symbol-list pair (not just
+  `buy_and_hold` + one symbol) so both comparisons share one code path. Measured on
+  real yfinance data 2015-2023 (`AAPL,MSFT,GOOGL,AMZN,JPM`): `sma_crossover` beats
+  SPY by +2.34pp and the diversified baseline by +53.66pp; `mean_reversion` is
+  honestly flagged as underperforming both (-77.29pp vs SPY, -25.98pp vs baseline).
+  `result.json` gains an additive, omitted-when-absent `diversified_baseline` key
+  (regimes/monte_carlo/cost_budget convention); `RESULT_SCHEMA_VERSION` stays 1. Not
+  wired into `sweep`/`paper`; no paired-bootstrap win rate against it yet. EPIC-105
+  is now 3/5.
+- **`--target-vol`, measured on real data for the first time (2026-08-23, KAN-638,
+  measurement only — no code change):** tested `trend_following`/`@trend_etfs`
+  (2006-2024, spans GFC/COVID/2022) and `sma_crossover`/`@blue20` (2013-2024). Real
+  result: a modest, directionally consistent but not statistically distinguishable
+  Sharpe gain — `trend_following` 0.45→0.50 at a 10% target (1 fewer halt episode: it
+  de-risked into the 2020 COVID spike, 0.75 vs 0.86 gross exposure on 2020-03-18, and
+  dodged the latch entirely), `sma_crossover` 1.37→1.43-1.44 at a 5-10% target,
+  trading ~90pp of total return away at the tightest setting. Bootstrapped 95%
+  Sharpe CIs overlap heavily across every target level tested (0.05/0.10/0.15/0.20)
+  — real effect, small sample. **SPY's own unconstrained Sharpe measured 0.89 over
+  2013-2024** (independently re-verified: exact match) — not the ~0.42 sometimes
+  quoted in planning docs and Pandan cards, which is stale/period-dependent; both
+  sma_crossover variants clear it at 98-99% paired-bootstrap win rate. No defect in
+  `risk.py`'s vol-scale formula — matches ADR-0015 exactly, verified on the exposure
+  trace and at an extreme target (0.001, no crash). **Real trap found, not a bug:**
+  any multi-year backtest spanning 2008 or 2020 trips the default drawdown latch and
+  freezes for the rest of the run unless `--halt-cooldown-bars` is set — a naive
+  `--target-vol` run without it hit the 20.4% floor in 2009 and died to -10.88% over
+  18 years, which reads as "vol-targeting failed" rather than "the unrelated
+  guardrail latched."
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -1460,7 +1495,8 @@ src/trading/
                            #   (--source, --broker, --interval, @basket, --min-adv, --folds, --data-feed,
                            #    --divergence, --bootstrap, --lookback, --log-level, --log-format,
                            #    --max-empty-polls, --market, --ledger, --hypothesis, --regimes,
-                           #    --monte-carlo, --liquidity-tier-adv, --cost-budget-pct; sweep also
+                           #    --monte-carlo, --liquidity-tier-adv, --cost-budget-pct,
+                           #    --diversified-baseline, --baseline-basket; sweep also
                            #    has --stability, --slippage-sweep);
                            #   --market selects calendar + completeness + risk posture at once, and
                            #   refuses crypto-shaped symbols on a session market (ADR-0057);
@@ -1520,7 +1556,9 @@ src/trading/
                            #   split at the run's own median (ADR-0066); monte_carlo_shuffle —
                            #   random permutations of a run's own returns vs. its real path-ordered
                            #   max drawdown (ADR-0067); assess_cost_budget — turnover x effective
-                           #   one-way rate vs. a stated annual budget, reporting only (ADR-0068)
+                           #   one-way rate vs. a stated annual budget, reporting only (ADR-0068);
+                           #   assess_diversified_baseline — naive equal_weight/core10 as a second,
+                           #   mandatory comparison alongside --benchmark (ADR-0071)
   sweep.py                 # parameter sweep (ADR-0016) + true IS->OOS walk-forward (ADR-0026);
                            #   annualizes on the caller's periods_per_year, recorded on the summary —
                            #   deflating at a basis the trials were not scored on raises (ADR-0059);
