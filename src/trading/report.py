@@ -25,6 +25,12 @@ against the distribution of max drawdowns from thousands of random reorderings o
 the same per-bar returns, alongside the run's Sharpe (unchanged by any reordering,
 so printed once rather than as a resampled distribution) — and again, omitting it
 leaves the summary byte-identical.
+When the caller supplies a :class:`~trading.metrics.DiversifiedBaselineReport` it
+also renders the ADR-0071 diversified-baseline block — a naive multi-asset
+equal-weight run (``core10`` by default) compared the same way ``--benchmark``
+is: total return side-by-side, the same never-invested/invested-late honesty
+check, and beta/alpha/correlation/information ratio — and again, omitting it
+leaves the summary byte-identical.
 ``write_equity_csv`` writes one
 row per trading day with an ``exposure`` column and, when a benchmark run is
 supplied, a ``benchmark_equity`` column aligned by timestamp. ``write_equity_png``
@@ -57,6 +63,7 @@ if TYPE_CHECKING:
         BenchmarkComparison,
         CostBudgetReport,
         DeflatedSharpe,
+        DiversifiedBaselineReport,
         MonteCarloShuffleReport,
         PairedBootstrap,
         PerformanceMetrics,
@@ -94,6 +101,7 @@ def summarize(
     regimes: RegimeReport | None = None,
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
+    diversified_baseline: DiversifiedBaselineReport | None = None,
 ) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
 
@@ -135,6 +143,13 @@ def summarize(
     the same neighbourhood, since both are run-level honesty checks that need
     nothing from a benchmark or a bootstrap. A warning appears only when the run's
     own predicted cost drag exceeds the stated budget; omitted, nothing changes.
+
+    ``diversified_baseline`` (from :func:`trading.metrics.assess_diversified_baseline`,
+    ADR-0071) appends a second, independent comparison block — the strategy against a
+    naive multi-asset equal-weight run — rendered right after the ``--benchmark``
+    block in the same shape (total return, deployment honesty check,
+    beta/alpha/correlation/information ratio). Caller-supplied and never derived
+    here, for the same reason ``significance``/``regimes``/``monte_carlo`` are not.
     """
     metrics = compute(result, periods_per_year, free_parameters=free_parameters)
     lines = [f"Symbols:       {', '.join(result.symbols)}"]
@@ -185,6 +200,10 @@ def summarize(
         )
         lines.extend(
             _benchmark_relative_lines(comparison, metrics, bench_metrics, len(result.equity_curve))
+        )
+    if diversified_baseline is not None:
+        lines.extend(
+            diversified_baseline_lines(diversified_baseline, metrics, len(result.equity_curve))
         )
     if significance is not None:
         lines.extend(significance_lines(significance))
@@ -342,6 +361,59 @@ def _benchmark_relative_lines(
             f"(annualized return per unit of avg exposure; "
             f"{metrics.avg_exposure * 100:.2f}% vs "
             f"{bench_metrics.avg_exposure * 100:.2f}% invested)",
+        ]
+    )
+    return lines
+
+
+def diversified_baseline_lines(
+    baseline: DiversifiedBaselineReport,
+    metrics: PerformanceMetrics,
+    strategy_bars: int,
+) -> list[str]:
+    """The ADR-0071 diversified-baseline block: a second, harder bar to clear.
+
+    Deliberately the same shape as the ``--benchmark`` block
+    (:func:`_benchmark_relative_lines`): total return side-by-side, the
+    never-invested/invested-late honesty check (as ``baseline.notes``, computed
+    once in :func:`trading.metrics.assess_diversified_baseline` rather than
+    re-derived here), then beta/alpha/correlation/information ratio and the
+    exposure-adjusted return. So the reader can scan "beat SPY? beat naive
+    diversification?" as two answers in the same format, not two different
+    reports.
+    """
+    baseline_metrics = baseline.metrics
+    delta = metrics.total_return - baseline_metrics.total_return
+    lines = [
+        f"Diversified baseline ({baseline.label}): "
+        f"{baseline_metrics.total_return * 100:+.2f}% "
+        f"(strategy {delta * 100:+.2f}% vs baseline)"
+    ]
+    lines.extend(f"  ⚠ {note}" for note in baseline.notes)
+    comparison = baseline.comparison
+    if comparison.shared_bars < 2:
+        lines.append(
+            f"Baseline overlap: {comparison.shared_bars} shared bar(s) with the "
+            "diversified baseline — too few to compute beta, alpha, correlation, "
+            "or information ratio"
+        )
+        return lines
+    if comparison.shared_bars < strategy_bars:
+        lines.append(
+            f"Baseline overlap: {comparison.shared_bars} of {strategy_bars} strategy "
+            "bars; the figures below cover only the shared span"
+        )
+    lines.extend(
+        [
+            f"Baseline beta:           {_stat(comparison.beta)}",
+            f"Baseline alpha (ann.):   {_stat_pct(comparison.alpha)}",
+            f"Baseline correlation:    {_stat(comparison.correlation)}",
+            f"Baseline info ratio:     {_stat(comparison.information_ratio)}",
+            f"Baseline ret/exposure:   {_stat_pct(metrics.return_per_unit_exposure)} "
+            f"vs baseline {_stat_pct(baseline_metrics.return_per_unit_exposure)} "
+            f"(annualized return per unit of avg exposure; "
+            f"{metrics.avg_exposure * 100:.2f}% vs "
+            f"{baseline_metrics.avg_exposure * 100:.2f}% invested)",
         ]
     )
     return lines
@@ -749,6 +821,7 @@ def result_to_dict(
     regimes: RegimeReport | None = None,
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
+    diversified_baseline: DiversifiedBaselineReport | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
 
@@ -843,7 +916,14 @@ def result_to_dict(
             "implied_max_turnover": float | null,    # null when the effective rate is 0
             "predicted_drag_pct": float | null,      # turnover * effective_rate_bps / 10000
             "notes": list[str]
-          }   # present only when the caller supplied a CostBudgetReport
+          },   # present only when the caller supplied a CostBudgetReport
+          "diversified_baseline": {   # ADR-0071, additive; KEY OMITTED ENTIRELY when not computed
+            "label": str, "symbols": list[str],
+            "metrics": dataclasses.asdict(PerformanceMetrics),
+            "comparison": {"shared_bars": int, "beta": float | null, "alpha": float | null,
+                           "correlation": float | null, "information_ratio": float | null},
+            "notes": list[str]
+          }   # present only when the caller supplied a DiversifiedBaselineReport
         }
 
     The ``episode_count``/``episodes`` keys (ADR-0031), the top-level ``absent``
@@ -851,13 +931,15 @@ def result_to_dict(
     ``metrics.return_per_unit_exposure`` field (ADR-0037), the top-level
     ``significance`` block (ADR-0039), the top-level ``market`` name (ADR-0057),
     the top-level ``regimes`` block (ADR-0066), the top-level ``monte_carlo``
-    block (ADR-0067), and the top-level ``cost_budget`` block (ADR-0068) are purely
+    block (ADR-0067), the top-level ``cost_budget`` block (ADR-0068), and the
+    top-level ``diversified_baseline`` block (ADR-0071) are purely
     additive: every pre-existing key keeps its exact meaning and value —
     ``symbols`` is still the *requested* universe, ``metrics`` is still exactly
     ``dataclasses.asdict`` of what the caller passed — so ``RESULT_SCHEMA_VERSION``
     does **not** move (see the constant's note). A v1 reader that ignores them
-    behaves exactly as it did. ``regimes``, ``monte_carlo``, and ``cost_budget``
-    are the keys among these that are **omitted** rather than emitted as ``null``
+    behaves exactly as it did. ``regimes``, ``monte_carlo``, ``cost_budget``, and
+    ``diversified_baseline`` are the keys among these that are **omitted** rather
+    than emitted as ``null``
     when absent (every earlier one keeps the always-present-null shape established
     by ``significance``) — chosen so a run that never passes the corresponding flag
     writes the byte-identical document it always has. That always-null shape was
@@ -942,6 +1024,14 @@ def result_to_dict(
         ``--cost-budget-pct`` silently pays for it. Same omitted-entirely
         convention as ``regimes``/``monte_carlo``, so a run without that flag
         emits the exact bytes it always has.
+    diversified_baseline:
+        An already-computed :class:`~trading.metrics.DiversifiedBaselineReport`
+        (ADR-0071), or ``None``. Never derived here, for the same reason
+        ``significance``/``regimes``/``monte_carlo``/``cost_budget`` are not: the
+        baseline is a whole second backtest run, so a caller that never passes
+        ``--diversified-baseline`` must not silently pay for one. Same
+        omitted-entirely convention as ``regimes``/``monte_carlo``/``cost_budget``,
+        so a run without that flag emits the exact bytes it always has.
     """
     payload: dict[str, Any] = {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -1040,6 +1130,11 @@ def result_to_dict(
     # write the exact bytes it always has.
     if cost_budget is not None:
         payload["cost_budget"] = asdict(cost_budget)
+    # The diversified-baseline block (ADR-0071). Same omitted-entirely convention
+    # as ``regimes``/``monte_carlo``/``cost_budget``: a run without
+    # ``--diversified-baseline`` must write the exact bytes it always has.
+    if diversified_baseline is not None:
+        payload["diversified_baseline"] = asdict(diversified_baseline)
     return payload
 
 
@@ -1058,6 +1153,7 @@ def write_result_json(
     regimes: RegimeReport | None = None,
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
+    diversified_baseline: DiversifiedBaselineReport | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
 
@@ -1077,6 +1173,7 @@ def write_result_json(
         regimes=regimes,
         monte_carlo=monte_carlo,
         cost_budget=cost_budget,
+        diversified_baseline=diversified_baseline,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:
