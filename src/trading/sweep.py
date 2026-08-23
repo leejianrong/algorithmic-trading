@@ -53,6 +53,15 @@ already computed: it changes no ranking, no metric, and no existing field, and i
 off by default in the CLI (the same additive, opt-in shape as ``--bootstrap``,
 ADR-0039). :func:`run_walk_forward` does not carry it yet — see ADR-0065's known gaps.
 
+A third kind of sweep varies the *cost model* instead of the strategy or the grid:
+:func:`run_cost_sensitivity_sweep` (KAN-618) re-runs one fixed strategy combo — no
+grid, no windows — at every slippage level in a caller-supplied bps grid (5/10/25/50
+is the ticket's example), and :meth:`CostSensitivitySummary.edge_death` reports the
+interpolated bps level at which Sharpe or total return first crosses a threshold as
+cost rises. It composes :func:`_run_combo` exactly like the other two loops; the only
+new mechanism is :class:`EdgeDeath`'s linear interpolation between the two tested
+levels that bracket the crossing.
+
 Everything here is pure with respect to the inputs: no wall clock, no RNG, no
 network. Determinism comes entirely from the injected adapter (seed a
 ``SyntheticAdapter`` for offline, repeatable sweeps) and the deterministic grid
@@ -64,7 +73,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
-from itertools import product
+from itertools import pairwise, product
 from statistics import fmean, median
 from typing import TYPE_CHECKING, cast
 
@@ -712,6 +721,216 @@ def run_sweep(
         empty_windows=empty_windows,
         periods_per_year=periods_per_year,
         grid={key: list(values) for key, values in grid.items()},
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CostSensitivityRun:
+    """One re-run of a fixed strategy combo at one slippage level (KAN-618).
+
+    ``taker_fee_bps`` is carried for the record even though it never varies across
+    a :class:`CostSensitivitySummary` — the fee term is held at the caller's base
+    cost model throughout, so a reader can see it was constant rather than infer
+    that from its absence.
+    """
+
+    slippage_bps: float
+    taker_fee_bps: float
+    metrics: PerformanceMetrics
+    moments: ReturnMoments | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class EdgeDeath:
+    """Where, as slippage rises, a metric first crosses a threshold (KAN-618).
+
+    Read the levels in ascending ``slippage_bps`` order and walk from cheap to
+    expensive: ``already_dead`` means the metric was already at/below
+    ``threshold`` at the *cheapest* level tested, so there is nothing to
+    interpolate below the grid; ``survives_grid`` means it never reached
+    ``threshold`` at the *most expensive* level tested, so the edge did not die
+    within the grid rather than "the edge never dies". Otherwise ``crossing_bps``
+    is a linear interpolation between the first adjacent pair of tested levels
+    where the metric goes from above ``threshold`` to at/below it — a
+    piecewise-linear estimate of where the edge dies, not a claim about the true
+    (and generally nonlinear) cost-response curve between the two tested points.
+    """
+
+    metric: str
+    threshold: float
+    crossing_bps: float | None
+    already_dead: bool
+    survives_grid: bool
+
+
+@dataclass(frozen=True, slots=True)
+class CostSensitivitySummary:
+    """A fixed strategy combo re-run at every slippage level in a grid (KAN-618).
+
+    ``params`` is the single combination held fixed throughout — this is not a
+    parameter search, it is the same backtest re-priced. ``unusable_levels``
+    carries ``(slippage_bps, reason)`` for a level whose span produced no data
+    (ADR-0032); since the span and universe are identical at every level, this
+    either happens at every level or none, but is recorded per-level rather than
+    assumed.
+    """
+
+    strategy: str
+    symbols: list[str]
+    params: ParamCombo
+    runs: list[CostSensitivityRun] = field(default_factory=list)
+    unusable_levels: list[tuple[float, str]] = field(default_factory=list)
+    periods_per_year: float = DEFAULT_PERIODS_PER_YEAR
+
+    def edge_death(self, metric: str = "total_return", threshold: float = 0.0) -> EdgeDeath | None:
+        """Where ``metric`` first crosses ``threshold`` as slippage rises.
+
+        ``None`` when there are no runs. Raises ``ValueError`` for an unknown
+        ``metric`` — the same two keys :meth:`SweepSummary.ranked` accepts
+        (``'sharpe'`` or ``'total_return'``), since those are the only two
+        :class:`~trading.metrics.PerformanceMetrics` readers this module already
+        knows how to look up.
+        """
+        if not self.runs:
+            return None
+        key = _rank_key(metric)
+        ordered = sorted(self.runs, key=lambda run: run.slippage_bps)
+        values = [(run.slippage_bps, key(run.metrics)) for run in ordered]
+
+        first_bps, first_value = values[0]
+        if first_value <= threshold:
+            return EdgeDeath(
+                metric=metric,
+                threshold=threshold,
+                crossing_bps=first_bps,
+                already_dead=True,
+                survives_grid=False,
+            )
+
+        for (lo_bps, lo_value), (hi_bps, hi_value) in pairwise(values):
+            if hi_value <= threshold:
+                if hi_value == lo_value:
+                    crossing = hi_bps
+                else:
+                    frac = (lo_value - threshold) / (lo_value - hi_value)
+                    crossing = lo_bps + frac * (hi_bps - lo_bps)
+                return EdgeDeath(
+                    metric=metric,
+                    threshold=threshold,
+                    crossing_bps=crossing,
+                    already_dead=False,
+                    survives_grid=False,
+                )
+
+        return EdgeDeath(
+            metric=metric,
+            threshold=threshold,
+            crossing_bps=None,
+            already_dead=False,
+            survives_grid=True,
+        )
+
+
+def run_cost_sensitivity_sweep(
+    strategy: str,
+    params: Mapping[str, object],
+    adapter: DataAdapter,
+    symbols: Sequence[str],
+    start: datetime,
+    end: datetime,
+    *,
+    slippage_bps: Sequence[float],
+    cash: float = 1_000.0,
+    risk: RiskConfig | None = None,
+    base_costs: CostConfig | None = None,
+    periods_per_year: float = DEFAULT_PERIODS_PER_YEAR,
+) -> CostSensitivitySummary:
+    """Re-run one fixed strategy combo at every slippage level in ``slippage_bps``.
+
+    KAN-618: "cost fragility is the most common way a backtest lies" — rerun the
+    *same* combo the caller already chose (typically a sweep's own winner) at
+    5/10/25/50 bps and show where the edge dies, rather than sweeping strategy
+    parameters again. This composes :func:`_run_combo` exactly the way
+    :func:`run_sweep` does, holding the strategy's own parameters fixed and
+    varying only the cost model between calls — a fresh
+    :class:`~trading.broker.SimulatedBroker` and
+    :class:`~trading.risk.Guardrails` per level, so no state leaks between them.
+
+    ``slippage_bps`` is deduplicated and sorted ascending before running, because
+    "where the edge dies" is a statement about cost *rising* — the order the grid
+    was typed in on the command line does not matter, only cheap-to-expensive
+    does. ``taker_fee_bps`` and ``commission_per_share`` are held at
+    ``base_costs`` (or the equity defaults) throughout; only ``slippage_bps``
+    varies, which is what keeps :meth:`CostSensitivitySummary.edge_death`'s
+    single-axis interpolation well-defined.
+
+    Refuses (``ValueError``) a ``base_costs`` carrying a per-symbol tier
+    (:attr:`~trading.config.CostConfig.symbol_slippage_bps`, ADR-0063): sweeping
+    the flat rate would not move the effective rate on any symbol the tier
+    actually applies to, silently under-reporting that symbol's true cost
+    sensitivity rather than measuring it.
+    """
+    _require_known_strategy(strategy)
+    if not slippage_bps:
+        raise ValueError("slippage_bps grid must not be empty")
+    base = base_costs if base_costs is not None else CostConfig()
+    if base.symbol_slippage_bps is not None:
+        raise ValueError(
+            "cost-sensitivity sweep cannot combine with a per-symbol slippage "
+            "tier (CostConfig.symbol_slippage_bps): sweeping the flat rate would "
+            "not move the effective rate on a tiered symbol, silently under-"
+            "reporting its cost sensitivity rather than measuring it (ADR-0063)"
+        )
+    fixed_params: ParamCombo = dict(params)
+    # Fail fast on an invalid combo, before running any level — the same
+    # discipline _partition_grid applies to a whole grid, applied to this one
+    # fixed combo.
+    _build_strategy(strategy, fixed_params)
+
+    tickers = list(symbols)
+    risk_config = risk if risk is not None else RiskConfig()
+    levels = sorted({float(bps) for bps in slippage_bps})
+
+    runs: list[CostSensitivityRun] = []
+    unusable: list[tuple[float, str]] = []
+    for level in levels:
+        costs = CostConfig(
+            commission_per_share=base.commission_per_share,
+            slippage_bps=level,
+            taker_fee_bps=base.taker_fee_bps,
+        )
+        try:
+            metrics, _points, moments = _run_combo(
+                strategy,
+                fixed_params,
+                adapter,
+                tickers,
+                start,
+                end,
+                cash=cash,
+                risk=risk_config,
+                costs=costs,
+                periods_per_year=periods_per_year,
+            )
+        except EmptyUniverseError as exc:
+            unusable.append((level, str(exc)))
+            continue
+        runs.append(
+            CostSensitivityRun(
+                slippage_bps=level,
+                taker_fee_bps=base.taker_fee_bps,
+                metrics=metrics,
+                moments=moments,
+            )
+        )
+
+    return CostSensitivitySummary(
+        strategy=strategy,
+        symbols=tickers,
+        params=fixed_params,
+        runs=runs,
+        unusable_levels=unusable,
+        periods_per_year=periods_per_year,
     )
 
 
