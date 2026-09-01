@@ -1875,6 +1875,37 @@ def paper(
         f"{MIN_LIVE_EMPTY_POLLS} polls (5m -> 12, 1d -> 4). Under --once the "
         "default stays 1.",
     ),
+    bootstrap: bool = typer.Option(
+        False,
+        "--bootstrap/--no-bootstrap",
+        help=(
+            "Bootstrap the session's own Sharpe: a stationary-block confidence "
+            "interval and the trial-count deflation (ADR-0039, ADR-0074). Arguably "
+            "matters most here, since paper results are survivorship-free "
+            "(ADR-0027). Off by default — the same expense backtest --bootstrap is."
+        ),
+    ),
+    bootstrap_resamples: int = typer.Option(
+        DEFAULT_BOOTSTRAP_RESAMPLES,
+        "--bootstrap-resamples",
+        help="Resamples per bootstrap figure (needs --bootstrap). Cost is linear in this.",
+    ),
+    bootstrap_seed: int = typer.Option(
+        DEFAULT_BOOTSTRAP_SEED,
+        "--bootstrap-seed",
+        help="Seed for the bootstrap RNG (needs --bootstrap). Printed with the interval, "
+        "so the figure is reproducible.",
+    ),
+    ledger: Path | None = typer.Option(
+        None,
+        "--ledger",
+        help=LEDGER_HELP,
+    ),
+    hypothesis: str = typer.Option(
+        "",
+        "--hypothesis",
+        help=HYPOTHESIS_HELP,
+    ),
     cache_dir: Path = typer.Option(Path(".cache/data"), "--cache-dir"),
     out: Path = typer.Option(Path("results/paper"), "--out", help="Result directory."),
 ) -> None:
@@ -1890,6 +1921,10 @@ def paper(
     chosen_market = _resolve_market(market)
     _check_symbol_shapes(chosen_market, tickers)
     freq = _parse_frequency(interval, chosen_market.calendar)
+    # Validated before the session runs, exactly as backtest's --bootstrap is: a
+    # --live session can run for weeks, and a bad --bootstrap-resamples must not be
+    # discovered only once the operator finally stops it.
+    _check_bootstrap_options(bootstrap=bootstrap, resamples=bootstrap_resamples)
 
     try:
         strat = get_strategy(strategy)
@@ -2153,6 +2188,32 @@ def paper(
         # The canonical machine-readable artifact the dashboard consumes, alongside
         # the CSV. Metrics are computed at the run's frequency (252/yr for daily).
         free_params = free_parameter_count(strat)
+
+        # Read BEFORE the significance is assembled, same as backtest's --ledger
+        # (ADR-0062): a ledger that does not exist yet (the very first logged
+        # session) reads as 0, so it widens nothing.
+        prior_trials = TrialLedger(ledger).cumulative_trials() if ledger is not None else 0
+
+        # Computed ONCE here and handed to both the text summary and result.json —
+        # the exact backtest --bootstrap pattern (ADR-0039/ADR-0074). Off by
+        # default so a session without the flag pays nothing and prints exactly the
+        # bytes it always did; arguably matters most for paper, since paper results
+        # are survivorship-free (ADR-0027) while a curated backtest is not. No
+        # ``--benchmark`` on this command, so there is no paired win rate to pass —
+        # ``assess_significance`` records that absence in its own notes.
+        significance = (
+            _assess_significance(
+                result,
+                None,
+                periods_per_year=freq.periods_per_year,
+                resamples=bootstrap_resamples,
+                seed=bootstrap_seed,
+                prior_trials=prior_trials,
+            )
+            if bootstrap
+            else None
+        )
+
         metrics = compute_metrics(result, freq.periods_per_year, free_parameters=free_params)
         result_json = out / "result.json"
         write_result_json(
@@ -2162,7 +2223,29 @@ def paper(
             frequency=freq.label,
             market=chosen_market.name,
             metrics=metrics,
+            significance=significance,
         )
+
+        # Appended whether or not --bootstrap ran: the ledger's own bookkeeping is
+        # a count of trials, not a significance figure, so a plain session still
+        # adds its one trial for a LATER invocation's --ledger to see (ADR-0062). A
+        # paper session is always exactly one trial, unlike a sweep.
+        if ledger is not None:
+            TrialLedger(ledger).append(
+                TrialRecord(
+                    timestamp=datetime.now(UTC).isoformat(),
+                    command="paper",
+                    strategy=strategy,
+                    symbols=tuple(sorted(tickers)),
+                    date_from=from_,
+                    date_to=to,
+                    interval=interval,
+                    market=chosen_market.name,
+                    trial_count=1,
+                    observed_sharpe=metrics.sharpe,
+                    hypothesis=hypothesis,
+                )
+            )
 
         typer.echo(
             "\n"
@@ -2170,6 +2253,7 @@ def paper(
                 result,
                 periods_per_year=freq.periods_per_year,
                 free_parameters=free_params,
+                significance=significance,
             )
         )
         artifacts = [
@@ -2638,6 +2722,28 @@ def sweep(
         "--slippage-sweep",
         help=SLIPPAGE_SWEEP_HELP,
     ),
+    bootstrap: bool = typer.Option(
+        False,
+        "--bootstrap/--no-bootstrap",
+        help=(
+            "Bracket each --folds fold's own OUT-OF-SAMPLE Sharpe with a stationary-"
+            "block confidence interval (ADR-0074, KAN-677). Only applies to --folds "
+            "walk-forward — a plain sweep keeps each trial's moments, not its curve "
+            "(ADR-0039), so there is nothing here to bootstrap. Off by default."
+        ),
+    ),
+    bootstrap_resamples: int = typer.Option(
+        DEFAULT_BOOTSTRAP_RESAMPLES,
+        "--bootstrap-resamples",
+        help="Resamples per fold's confidence interval (needs --bootstrap --folds). "
+        "Cost is linear in this, times the fold count.",
+    ),
+    bootstrap_seed: int = typer.Option(
+        DEFAULT_BOOTSTRAP_SEED,
+        "--bootstrap-seed",
+        help="Seed for the bootstrap RNG (needs --bootstrap --folds). Printed with "
+        "each interval, so the figure is reproducible.",
+    ),
 ) -> None:
     """Grid-sweep a strategy's parameters over a date range, ranked by a metric.
 
@@ -2708,6 +2814,10 @@ def sweep(
     if wf_mode not in {"anchored", "rolling"}:
         typer.echo(f"error: --wf-mode must be 'anchored' or 'rolling', got {wf_mode!r}", err=True)
         raise typer.Exit(2)
+    # Validated before any run starts, exactly as _check_bootstrap_options is for
+    # backtest — a bad --bootstrap-resamples must not be discovered only after every
+    # fold has already run.
+    _check_bootstrap_options(bootstrap=bootstrap, resamples=bootstrap_resamples)
 
     market_line = _market_line(chosen_market, freq)
     if market_line:
@@ -2715,16 +2825,12 @@ def sweep(
 
     adapter = _make_adapter(source, cache_dir, seed, freq)
 
+    # Read BEFORE the deflation is scored, same as backtest's --ledger (ADR-0062).
+    # Shared by both branches below: --folds' own pooled IS deflation (ADR-0074)
+    # widens by exactly the same cumulative count a plain sweep already does.
+    prior_trials = TrialLedger(ledger).cumulative_trials() if ledger is not None else 0
+
     if folds > 0:
-        if ledger is not None:
-            # KAN-677: walk-forward prints no deflation of its own yet, so there is
-            # nothing here for --ledger to widen or contribute to. Named rather
-            # than silently ignored (ADR-0062).
-            typer.echo(
-                "note: --ledger is not yet wired into --folds walk-forward (KAN-677); "
-                "nothing was appended",
-                err=True,
-            )
         if stability:
             # ADR-0065: neighbour stability reads a plain grid sweep's SweepSummary;
             # a walk-forward fold does not carry one yet (a later slice, not this
@@ -2758,11 +2864,28 @@ def sweep(
             costs=costs,
             out=out,
             periods_per_year=freq.periods_per_year,
+            bootstrap=bootstrap,
+            bootstrap_resamples=bootstrap_resamples,
+            bootstrap_seed=bootstrap_seed,
+            ledger=ledger,
+            hypothesis=hypothesis,
+            prior_trials=prior_trials,
+            from_=from_,
+            to=to,
+            interval=interval,
+            market_name=chosen_market.name,
         )
         return
 
-    # Read BEFORE the deflation is scored, same as backtest's --ledger (ADR-0062).
-    prior_trials = TrialLedger(ledger).cumulative_trials() if ledger is not None else 0
+    if bootstrap:
+        # ADR-0074: a plain sweep keeps each trial's ReturnMoments, not its curve
+        # (ADR-0039), so there is nothing here for sharpe_confidence_interval to
+        # bootstrap — only --folds walk-forward has a real per-fold OOS curve.
+        typer.echo(
+            "note: --bootstrap only applies to --folds walk-forward (ADR-0074); "
+            "a plain sweep has no curve to bootstrap, so nothing was computed",
+            err=True,
+        )
 
     # The run's own basis, from the --interval x --market Frequency: the sweep's
     # metrics used to take metrics.compute's 252.0 whatever the bars were (KAN-840).
@@ -2952,6 +3075,36 @@ def _write_walk_forward_csv(summary: WalkForwardSummary, path: Path) -> None:
             )
 
 
+def _walk_forward_significance_block(
+    summary: WalkForwardSummary,
+    periods_per_year: float,
+    *,
+    prior_trials: int = 0,
+) -> str:
+    """The walk-forward's own IS-optimisation deflation (ADR-0074, KAN-677).
+
+    The analogue of :func:`_sweep_significance_block`, scoring the **in-sample**
+    side rather than the out-of-sample one: ADR-0026's whole discipline is that the
+    single OOS run per fold is never selected from a search, so treating it as
+    "best of N trials" would silently reintroduce the peeking bug walk-forward
+    exists to prevent. See :meth:`WalkForwardSummary.deflated_in_sample` for the
+    (folds x grid) trial count and the pooled-candidate spread this scores against.
+
+    Free arithmetic on numbers the fold loop already produced — not behind
+    ``--bootstrap`` any more than the plain sweep's own block is (ADR-0039).
+    ``""`` when there are no completed folds or nothing to deflate.
+    """
+    deflated = summary.deflated_in_sample(periods_per_year, prior_trials=prior_trials)
+    if deflated is None:
+        return ""
+    return summarize_significance(
+        SignificanceReport(
+            deflated=deflated,
+            notes=[trial_count_note(deflated.trials, prior_trials=prior_trials)],
+        )
+    )
+
+
 def _run_walk_forward_command(
     *,
     strategy: str,
@@ -2968,6 +3121,16 @@ def _run_walk_forward_command(
     costs: CostConfig,
     out: Path,
     periods_per_year: float,
+    bootstrap: bool = False,
+    bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
+    ledger: Path | None = None,
+    hypothesis: str = "",
+    prior_trials: int = 0,
+    from_: str = "",
+    to: str = "",
+    interval: str = "1d",
+    market_name: str = DEFAULT_MARKET,
 ) -> None:
     """Run and print a true in-sample -> out-of-sample walk-forward (ADR-0026).
 
@@ -2978,10 +3141,27 @@ def _run_walk_forward_command(
     between them is visible.
 
     ``periods_per_year`` is the run's ``Frequency`` basis, threaded through for the
-    same reason the plain sweep threads it (KAN-840). The walk-forward path is the
-    quieter half of that defect: every Sharpe on these fold lines was annualized at
-    252 whatever ``--interval`` said, and unlike the sweep there is no deflation
-    block underneath printing a contradictory figure to notice it by.
+    same reason the plain sweep threads it (KAN-840).
+
+    ``bootstrap`` (ADR-0074, KAN-677) prints each fold's own out-of-sample Sharpe
+    confidence interval when the fold's OOS span cleared
+    :data:`~trading.metrics.MIN_BOOTSTRAP_OBSERVATIONS` (commonly not, since a
+    fold's OOS span is a fraction of the whole range). The IS side instead gets a
+    deflation block, printed unconditionally under the ranking output exactly as
+    the plain sweep's :func:`_sweep_significance_block` already is — walk-forward
+    used to print no deflation of its own at all, which was the quieter half of
+    KAN-840's defect (every fold Sharpe here was annualized at 252 whatever
+    ``--interval`` said, with nothing on screen to contradict it).
+
+    ``ledger``/``hypothesis``/``prior_trials`` (ADR-0062) append one
+    :class:`~trading.ledger.TrialRecord` per invocation with
+    :attr:`WalkForwardSummary.in_sample_trial_count` — the full ``(folds x grid)``
+    search, not the grid once — so a later invocation's ``--ledger`` sees the true
+    size of what this run searched. ``observed_sharpe`` on that record is
+    :attr:`WalkForwardSummary.mean_out_of_sample_sharpe`, the run's own honest
+    headline figure (what the CLI prints as ``OUT-OF-SAMPLE mean sharpe``) — not
+    the deflated IS figure this function also prints, which answers a different
+    question (how much of the search's own optimism was luck).
     """
     summary = run_walk_forward(
         strategy,
@@ -2997,6 +3177,9 @@ def _run_walk_forward_command(
         risk=risk,
         costs=costs,
         periods_per_year=periods_per_year,
+        bootstrap=bootstrap,
+        bootstrap_resamples=bootstrap_resamples,
+        bootstrap_seed=bootstrap_seed,
     )
 
     typer.echo(
@@ -3016,6 +3199,12 @@ def _run_walk_forward_command(
                 f"IS sharpe {fold.in_sample_metrics.sharpe:+.2f} -> "
                 f"OOS sharpe {fold.out_of_sample_metrics.sharpe:+.2f}"
             )
+            if fold.out_of_sample_sharpe_interval is not None:
+                ci_block = summarize_significance(
+                    SignificanceReport(sharpe_interval=fold.out_of_sample_sharpe_interval)
+                )
+                for line in ci_block.splitlines():
+                    typer.echo(f"    {line}")
         retention = summary.sharpe_retention
         retention_text = "n/a" if retention is None else f"{retention * 100:.0f}%"
         typer.echo(
@@ -3028,8 +3217,33 @@ def _run_walk_forward_command(
             "fold(s) profitable out of sample — this is the number that counts; "
             "the in-sample figures are tuned and always flatter."
         )
+        deflation = _walk_forward_significance_block(
+            summary, periods_per_year, prior_trials=prior_trials
+        )
+        if deflation:
+            typer.echo("\n" + deflation)
         _write_walk_forward_csv(summary, out)
         typer.echo(f"\nWrote walk-forward results to {out}")
+
+        # Appended after the deflation above, same placement as the plain sweep's
+        # own --ledger append (ADR-0062): a failure building the report never costs
+        # the log entry, and the ledger lands in the same run as the CSV.
+        if ledger is not None:
+            TrialLedger(ledger).append(
+                TrialRecord(
+                    timestamp=datetime.now(UTC).isoformat(),
+                    command="sweep --folds",
+                    strategy=strategy,
+                    symbols=tuple(sorted(tickers)),
+                    date_from=from_,
+                    date_to=to,
+                    interval=interval,
+                    market=market_name,
+                    trial_count=summary.in_sample_trial_count,
+                    observed_sharpe=summary.mean_out_of_sample_sharpe,
+                    hypothesis=hypothesis,
+                )
+            )
 
     for combo, reason in summary.skipped:
         pretty = ", ".join(f"{k}={_format_param(v)}" for k, v in combo.items())

@@ -79,15 +79,21 @@ from typing import TYPE_CHECKING, cast
 
 from trading.broker import SimulatedBroker
 from trading.config import CostConfig, RiskConfig
-from trading.engine import EmptyUniverseError, Engine
+from trading.engine import EmptyUniverseError, Engine, EquityPoint
 from trading.frequency import TRADING_DAYS_PER_YEAR
 from trading.metrics import (
+    DEFAULT_BOOTSTRAP_RESAMPLES,
+    DEFAULT_BOOTSTRAP_SEED,
     DeflatedSharpe,
     PerformanceMetrics,
     ReturnMoments,
+    SharpeInterval,
     compute,
     curve_moments,
+    daily_returns,
     deflated_sharpe,
+    return_moments,
+    sharpe_confidence_interval,
 )
 from trading.risk import Guardrails
 from trading.strategies import STRATEGIES
@@ -558,8 +564,8 @@ def _run_combo(
     risk: RiskConfig,
     costs: CostConfig,
     periods_per_year: float,
-) -> tuple[PerformanceMetrics, int, ReturnMoments | None]:
-    """Run one combo over one span; return its metrics, bar count, and moments.
+) -> tuple[PerformanceMetrics, int, ReturnMoments | None, list[EquityPoint]]:
+    """Run one combo over one span; return its metrics, bar count, moments, curve.
 
     A *fresh* :class:`~trading.broker.SimulatedBroker` and
     :class:`~trading.risk.Guardrails` per call, so no portfolio or kill-switch
@@ -567,6 +573,15 @@ def _run_combo(
     callers can tell a real result from a span that produced (almost) no bars, and
     the return-series moments (ADR-0039) so the winner can later be deflated
     without re-running anything or retaining the whole curve.
+
+    The fourth element is the run's own ``result.equity_curve`` — free, since
+    ``Engine.run`` already produced it, nothing extra is computed. ``run_sweep``
+    and ``run_cost_sensitivity_sweep`` discard it (a plain sweep keeps
+    ``ReturnMoments``, not curves, by design — ADR-0039); ``run_walk_forward``
+    needs it twice: the IS winner's own per-bar returns pool into the walk-forward's
+    aggregate in-sample deflation (ADR-0074), and the OOS run's curve is what
+    ``--bootstrap`` brackets with a confidence interval, because it is the one
+    number per fold that was actually *observed* rather than selected.
 
     ``periods_per_year`` is **required**, not defaulted, and that is the whole of
     KAN-840: this call used to read ``compute(result)``, taking
@@ -597,6 +612,7 @@ def _run_combo(
         compute(result, periods_per_year),
         len(result.equity_curve),
         curve_moments(result.equity_curve),
+        result.equity_curve,
     )
 
 
@@ -683,7 +699,7 @@ def run_sweep(
     for combo in runnable:
         for window_index, (win_start, win_end) in enumerate(spans):
             try:
-                metrics, _points, moments = _run_combo(
+                metrics, _points, moments, _curve = _run_combo(
                     strategy,
                     combo,
                     adapter,
@@ -900,7 +916,7 @@ def run_cost_sensitivity_sweep(
             taker_fee_bps=base.taker_fee_bps,
         )
         try:
-            metrics, _points, moments = _run_combo(
+            metrics, _points, moments, _curve = _run_combo(
                 strategy,
                 fixed_params,
                 adapter,
@@ -949,6 +965,33 @@ class WalkForwardFold:
     combination (ADR-0026). ``candidates`` is how many combos were scored in-sample
     to pick it, and the ``*_points`` counts are each span's equity-curve length, so
     a near-empty span is visible instead of masquerading as a flat result.
+
+    Three additive fields (ADR-0074, KAN-677) feed the walk-forward's own trial
+    accounting — the deflation ``--folds`` printed nothing about before this:
+
+    ``in_sample_candidate_sharpes`` is every combo scored on this fold's IS span,
+    annualized on :attr:`WalkForwardSummary.periods_per_year`, *including* the
+    winner — the same "count + spread" ingredients :func:`~trading.metrics.deflated_sharpe`
+    needs, at this fold's own granularity. ``()`` for a fold built by hand.
+
+    ``in_sample_winner_returns`` is the *winning* combo's own per-bar IS returns
+    (``daily_returns`` of its equity curve) — not its moments, because moments from
+    separate folds cannot be pooled arithmetically the way raw returns can.
+    :meth:`WalkForwardSummary.deflated_in_sample` concatenates every fold's tuple
+    end to end to score one aggregate observed Sharpe, exactly the way
+    :mod:`trading.metrics`'s regime-split report pools discontiguous bars into one
+    series (ADR-0066) — a derived quantity for analysis, never a claim that this was
+    one tradeable curve. ``()`` for a fold built by hand.
+
+    ``out_of_sample_sharpe_interval`` is a stationary-block-bootstrap confidence
+    interval (:func:`~trading.metrics.sharpe_confidence_interval`) on *this fold's
+    own* OOS curve — computed only when ``run_walk_forward(bootstrap=True)`` asked
+    for it (``None`` otherwise, and always for a hand-built fold). Deliberately
+    scoped to OOS, never IS: OOS is the one number per fold that was *observed*
+    rather than selected from a search, so a confidence interval on it answers "how
+    much does sampling noise alone explain", the question a bootstrap is for. Often
+    ``None`` even with ``--bootstrap``: a fold's OOS span is a fraction of the whole
+    range and commonly falls short of :data:`~trading.metrics.MIN_BOOTSTRAP_OBSERVATIONS`.
     """
 
     index: int
@@ -962,6 +1005,9 @@ class WalkForwardFold:
     candidates: int
     in_sample_points: int
     out_of_sample_points: int
+    in_sample_candidate_sharpes: tuple[float, ...] = ()
+    in_sample_winner_returns: tuple[float, ...] = ()
+    out_of_sample_sharpe_interval: SharpeInterval | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -1064,6 +1110,116 @@ class WalkForwardSummary:
         """How many folds actually made money out of sample (strictly > 0)."""
         return sum(1 for f in self.folds if f.out_of_sample_metrics.total_return > 0.0)
 
+    def in_sample_trial_sharpes(self) -> list[float]:
+        """Every candidate combo's annualized IS Sharpe, pooled across COMPLETED folds.
+
+        (ADR-0074, KAN-677.) Each fold internally sweeps the whole grid in-sample to
+        pick a winner, so the honest count behind a walk-forward's own search is
+        *(folds x grid size)* — not the grid size once, and not the fold count once.
+        This is that pooled population, in fold order then each fold's own
+        grid-expansion order (:attr:`WalkForwardFold.in_sample_candidate_sharpes`).
+
+        Only :attr:`folds` (completed: a full IS selection *and* its one OOS run)
+        contribute — the same "count only what actually ran" rule
+        :attr:`SweepSummary.trial_count` already uses. A fold whose IS span itself
+        raised :class:`~trading.engine.EmptyUniverseError` never scored a candidate
+        and contributes nothing; a fold whose IS succeeded but whose OOS span then
+        failed is also excluded here, conservatively — its combos were genuinely
+        evaluated, but this ledger counts a completed fold's search, not a partial
+        one, matching :attr:`unusable_folds`'s own "did not produce a result" line.
+        """
+        return [s for fold in self.folds for s in fold.in_sample_candidate_sharpes]
+
+    @property
+    def in_sample_trial_count(self) -> int:
+        """``len(in_sample_trial_sharpes())`` — the (folds x grid) honest count.
+
+        Equivalently ``sum(fold.candidates for fold in self.folds)``; the two always
+        agree because a fold's ``candidates`` count is exactly how many entries its
+        ``in_sample_candidate_sharpes`` tuple holds.
+        """
+        return len(self.in_sample_trial_sharpes())
+
+    def deflated_in_sample(
+        self,
+        periods_per_year: float | None = None,
+        *,
+        prior_trials: int = 0,
+    ) -> DeflatedSharpe | None:
+        """Deflate the walk-forward's own IS optimisation, for the whole search it ran.
+
+        (ADR-0074, KAN-677.) Scores the **in-sample** side, deliberately never the
+        out-of-sample Sharpe: ADR-0026's whole discipline is that the OOS run is
+        never selected from a search (exactly one OOS run per fold, on the combo IS
+        alone chose), so treating :attr:`mean_out_of_sample_sharpe` as "best of N
+        trials" would silently reintroduce the peeking bug walk-forward exists to
+        prevent. What deserves discounting is the number a search actually produced:
+        each fold's IS winner, picked from :attr:`WalkForwardFold.candidates`
+        competing combinations.
+
+        **Trial count** is :attr:`in_sample_trial_count` — ``(folds x grid size)``,
+        pooling every completed fold's own candidate count, not the grid once.
+
+        **Spread** (``sharpe_stdev``, which sets how far the luckiest of those
+        trials would drift from zero — :func:`~trading.metrics.expected_max_sharpe`)
+        comes from :meth:`in_sample_trial_sharpes`: the pooled candidate Sharpes
+        across every completed fold. The alternative — the spread of just the fold
+        *winners* (one Sharpe per fold) — was rejected: with the default 3 folds
+        that is 3 numbers, far too few to estimate a distribution's spread from, and
+        it silently discards the very candidates that define how much luck a search
+        this wide could produce. Pooling every candidate a fold actually scored
+        keeps the spread estimate anchored in real trial counts, at the cost of an
+        approximation of its own: candidates from an early, data-poor fold and a
+        late, data-rich one are pooled as if they were exchangeable. Named here
+        rather than silently assumed, matching this codebase's honesty-rail style
+        (e.g. :meth:`SweepSummary.deflated_winner`'s own basis-mismatch guard).
+
+        **Observed Sharpe** comes from :func:`~trading.metrics.return_moments` of
+        the *pooled per-bar returns of each fold's own IS winner*
+        (:attr:`WalkForwardFold.in_sample_winner_returns`, concatenated fold by
+        fold) — the same discontiguous-pooling pattern
+        :func:`~trading.metrics.compute_regime_report` already uses for a run's own
+        non-contiguous regime slices (ADR-0066): a derived statistic for analysis,
+        not a claim that this was one tradeable curve. It is *not* the same number
+        as :attr:`mean_in_sample_sharpe`, which averages each fold's own annualized
+        Sharpe; this instead re-derives one Sharpe from the pooled bars, which is
+        what :func:`~trading.metrics.deflated_sharpe`'s moments argument requires.
+        The two should usually be close and can differ when folds have very
+        different lengths, since the pooled statistic implicitly weights by bar
+        count while the mean-of-fold-Sharpes does not.
+
+        ``periods_per_year`` defaults to :attr:`periods_per_year`, the basis every
+        fold was actually scored on; an explicit value that disagrees raises,
+        mirroring :meth:`SweepSummary.deflated_winner` exactly (KAN-840/ADR-0059) —
+        the trial Sharpes are fixed at the basis they were computed on, so deflating
+        them at a different year has no correct answer to give.
+
+        ``prior_trials`` (ADR-0062) passes straight through to
+        :func:`~trading.metrics.deflated_sharpe`, exactly as
+        :meth:`SweepSummary.deflated_winner` does.
+
+        ``None`` when there are no completed folds, when no fold recorded any
+        candidate Sharpes (a hand-built summary), or when the pooled returns carry
+        no dispersion — an honest absence, never a flattering skip.
+        """
+        basis = self.periods_per_year if periods_per_year is None else periods_per_year
+        if basis != self.periods_per_year:
+            raise ValueError(
+                f"cannot deflate at {basis:g} bars/year: these folds' trial "
+                f"Sharpe(s) are annualized at {self.periods_per_year:g} bars/year, and "
+                "mixing the two bases yields a null threshold on one calendar and an "
+                "observed Sharpe on another (KAN-840). Re-run the walk-forward on the "
+                "basis you want."
+            )
+        sharpes = self.in_sample_trial_sharpes()
+        if not sharpes:
+            return None
+        pooled_returns = [r for fold in self.folds for r in fold.in_sample_winner_returns]
+        moments = return_moments(pooled_returns)
+        if moments is None:
+            return None
+        return deflated_sharpe(moments, sharpes, basis, prior_trials=prior_trials)
+
     def _mean(self, read: Callable[[WalkForwardFold], float]) -> float:
         """Mean of ``read`` over the folds, 0.0 when there are none."""
         if not self.folds:
@@ -1079,11 +1235,18 @@ class WalkForwardSummary:
 
 @dataclass(frozen=True, slots=True)
 class _Scored:
-    """An in-sample candidate: its combo, metrics, and equity-curve length."""
+    """An in-sample candidate: its combo, metrics, equity-curve length, and curve.
+
+    ``curve`` is kept only long enough to compute the eventual fold winner's own
+    per-bar returns for the pooled IS deflation (ADR-0074) — every other
+    candidate's curve is dropped when ``scored`` falls out of scope at the end of
+    its fold's loop iteration; no candidate's curve is retained across folds.
+    """
 
     combo: ParamCombo
     metrics: PerformanceMetrics
     points: int
+    curve: list[EquityPoint]
 
 
 def run_walk_forward(
@@ -1101,6 +1264,9 @@ def run_walk_forward(
     risk: RiskConfig | None = None,
     costs: CostConfig | None = None,
     periods_per_year: float = DEFAULT_PERIODS_PER_YEAR,
+    bootstrap: bool = False,
+    bootstrap_resamples: int = DEFAULT_BOOTSTRAP_RESAMPLES,
+    bootstrap_seed: int = DEFAULT_BOOTSTRAP_SEED,
 ) -> WalkForwardSummary:
     """Walk ``[start, end]`` forward, optimizing on IS and testing once on OOS.
 
@@ -1131,6 +1297,21 @@ def run_walk_forward(
     return all land in ``warnings`` / ``unusable_folds`` / ``skipped``. Only a
     genuinely unusable *argument* raises: an unknown ``strategy`` (``KeyError``), or
     an unknown ``mode`` / ``rank_by`` (``ValueError``).
+
+    ``bootstrap`` (ADR-0074, KAN-677; off by default) brackets each fold's own
+    **out-of-sample** Sharpe with a stationary block bootstrap confidence interval
+    (:func:`~trading.metrics.sharpe_confidence_interval`), stored on
+    :attr:`WalkForwardFold.out_of_sample_sharpe_interval`. Scoped to OOS
+    deliberately: it is the one curve per fold that was genuinely *observed* rather
+    than picked by a search, so a confidence interval on it is the honest question
+    "how much of this OOS number is sampling noise" — the in-sample side gets a
+    *deflation* instead (:meth:`WalkForwardSummary.deflated_in_sample`), which is
+    always computed and never behind this flag, because it is arithmetic on numbers
+    the fold loop already produced rather than a resampling procedure. Every fold's
+    :attr:`~WalkForwardFold.in_sample_candidate_sharpes` and
+    :attr:`~WalkForwardFold.in_sample_winner_returns` are likewise recorded
+    unconditionally — the point of both is inherited from the run each fold already
+    did, so nothing here costs an extra :class:`~trading.engine.Engine` run.
     """
     _require_known_strategy(strategy)
     key = _rank_key(rank_by)
@@ -1169,7 +1350,7 @@ def run_walk_forward(
         scored: list[_Scored] = []
         try:
             for combo in runnable:
-                metrics, points, _moments = _run_combo(
+                metrics, points, _moments, curve = _run_combo(
                     strategy,
                     combo,
                     adapter,
@@ -1181,17 +1362,22 @@ def run_walk_forward(
                     costs=cost_config,
                     periods_per_year=periods_per_year,
                 )
-                scored.append(_Scored(combo=combo, metrics=metrics, points=points))
+                scored.append(_Scored(combo=combo, metrics=metrics, points=points, curve=curve))
         except EmptyUniverseError as exc:
             unusable.append((span.index, f"in-sample span has no data for any symbol: {exc}"))
             continue
         # A stable argmax: ``max`` keeps the first maximal element, so ties resolve
         # to grid-expansion order and the choice is fully deterministic.
         winner = max(scored, key=lambda candidate: key(candidate.metrics))
+        # The pooled-deflation ingredients (ADR-0074): every candidate's own
+        # Sharpe (the spread), and the winner's own per-bar returns (folded into
+        # the aggregate observed Sharpe) — both free, already computed above.
+        candidate_sharpes = tuple(candidate.metrics.sharpe for candidate in scored)
+        winner_returns = tuple(daily_returns(winner.curve))
 
         # --- out-of-sample: the winner, ONCE, on data selection never saw ------
         try:
-            oos_metrics, oos_points, _oos_moments = _run_combo(
+            oos_metrics, oos_points, _oos_moments, oos_curve = _run_combo(
                 strategy,
                 winner.combo,
                 adapter,
@@ -1218,6 +1404,22 @@ def run_walk_forward(
                 f"its metrics are structurally zero, not a result"
             )
 
+        # The one number per fold that is genuinely observed, not selected — see
+        # run_walk_forward's own docstring for why this is OOS-only and the IS
+        # side gets a deflation instead. Off by default (the same cost ADR-0039's
+        # backtest --bootstrap already names); None whenever the OOS span is too
+        # short to bootstrap, exactly as sharpe_confidence_interval already reports.
+        oos_interval = (
+            sharpe_confidence_interval(
+                oos_curve,
+                periods_per_year,
+                resamples=bootstrap_resamples,
+                seed=bootstrap_seed,
+            )
+            if bootstrap
+            else None
+        )
+
         completed.append(
             WalkForwardFold(
                 index=span.index,
@@ -1231,6 +1433,9 @@ def run_walk_forward(
                 candidates=len(scored),
                 in_sample_points=winner.points,
                 out_of_sample_points=oos_points,
+                in_sample_candidate_sharpes=candidate_sharpes,
+                in_sample_winner_returns=winner_returns,
+                out_of_sample_sharpe_interval=oos_interval,
             )
         )
 

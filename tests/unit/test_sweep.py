@@ -990,6 +990,202 @@ def test_the_basis_never_changes_which_combination_wins() -> None:
     ]
 
 
+# --- walk-forward's own trial accounting and IS deflation (ADR-0074, KAN-677) -
+#
+# Each fold internally sweeps the whole grid in-sample to pick a winner, so the
+# honest trial count behind a walk-forward's own search is (folds x grid size),
+# not the grid size once. The deflation must score the IS side — the thing a
+# search actually produced — never the single, never-selected OOS run.
+
+
+def test_fold_records_every_in_sample_candidates_sharpe() -> None:
+    summary = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=2)
+    combos = len(expand_grid(_GRID))
+    assert summary.fold_count == 2
+    for fold in summary.folds:
+        assert fold.candidates == combos
+        assert len(fold.in_sample_candidate_sharpes) == combos
+        # The winner's own Sharpe is one of the pooled candidates, not a stray value.
+        assert fold.in_sample_metrics.sharpe in fold.in_sample_candidate_sharpes
+
+
+def test_fold_records_the_winners_own_per_bar_in_sample_returns() -> None:
+    summary = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=2)
+    for fold in summary.folds:
+        # daily_returns() of an N-point curve has N-1 entries.
+        assert len(fold.in_sample_winner_returns) == fold.in_sample_points - 1
+
+
+def test_in_sample_trial_count_is_folds_times_grid_size() -> None:
+    """The card's central claim, checked directly: (folds) x (grid size)."""
+    combos = len(expand_grid(_GRID))
+    summary = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=3)
+    assert summary.fold_count == 3
+    assert summary.in_sample_trial_count == 3 * combos
+    assert len(summary.in_sample_trial_sharpes()) == summary.in_sample_trial_count
+
+
+def test_in_sample_trial_count_only_counts_completed_folds() -> None:
+    """A fold whose OOS span has no data contributes nothing to the count.
+
+    Mirrors SweepSummary.trial_count's own "only what actually ran" rule: the IS
+    side of this fold really did score candidates, but the fold never completed
+    (no OOS result), so it is excluded exactly as ``unusable_folds`` excludes it
+    from every other aggregate.
+    """
+    # Data only in the first half of the range, so the anchored fold's IS span
+    # (which starts at `start`) has data but the single fold's OOS span does not.
+    bars = [
+        Bar("AAA", datetime(2021, 1, d, tzinfo=UTC), 10.0, 10.0, 10.0, 10.0, 1_000)
+        for d in range(1, 29)
+    ]
+    summary = run_walk_forward(
+        "sma_crossover",
+        {"fast": [5], "slow": [10]},
+        FakeAdapter(bars),
+        ["AAA"],
+        _START,
+        _END,
+        folds=1,
+    )
+    assert summary.folds == []
+    assert summary.unusable_folds
+    assert summary.in_sample_trial_count == 0
+
+
+def test_deflated_in_sample_scores_against_the_full_search() -> None:
+    summary = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=2)
+    deflated = summary.deflated_in_sample()
+    assert deflated is not None
+    assert deflated.trials == summary.in_sample_trial_count
+    assert deflated.trial_sharpe_stdev is not None
+
+
+def test_deflated_in_sample_prior_trials_widens_the_count_and_never_lowers_the_null() -> None:
+    summary = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=2)
+    unledgered = summary.deflated_in_sample()
+    ledgered = summary.deflated_in_sample(prior_trials=10)
+    assert unledgered is not None
+    assert ledgered is not None
+    assert ledgered.trials == unledgered.trials + 10
+    assert ledgered.null_best_sharpe >= unledgered.null_best_sharpe
+    assert summary.deflated_in_sample(prior_trials=0) == unledgered
+
+
+def test_deflated_in_sample_is_none_without_completed_folds() -> None:
+    summary = run_walk_forward(
+        "sma_crossover",
+        {"fast": [5], "slow": [30]},
+        FakeAdapter([]),
+        _SYMBOLS,
+        _START,
+        _END,
+        folds=1,
+    )
+    assert summary.folds == []
+    assert summary.deflated_in_sample() is None
+
+
+def test_deflated_in_sample_is_none_when_pooled_returns_have_no_dispersion() -> None:
+    """A fold with one bar per span has nothing for return_moments to compute."""
+    bars = [
+        Bar("AAA", ts, 10.0, 10.0, 10.0, 10.0, 1_000)
+        for ts in (datetime(2021, 6, 1, tzinfo=UTC), datetime(2022, 6, 1, tzinfo=UTC))
+    ]
+    summary = run_walk_forward(
+        "sma_crossover",
+        {"fast": [5], "slow": [30]},
+        FakeAdapter(bars),
+        ["AAA"],
+        _START,
+        _END,
+        folds=1,
+    )
+    assert summary.fold_count == 1
+    assert summary.folds[0].in_sample_winner_returns == ()
+    assert summary.deflated_in_sample() is None
+
+
+def test_deflating_walk_forward_on_a_basis_not_scored_on_is_refused() -> None:
+    """Mirrors SweepSummary.deflated_winner's own basis-mismatch guard (KAN-840)."""
+    summary = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=2)
+    assert summary.deflated_in_sample(252.0) == summary.deflated_in_sample()
+    with pytest.raises(ValueError, match="annualized at 252"):
+        summary.deflated_in_sample(_FIVE_MINUTE_YEAR)
+
+
+def test_deflated_in_sample_scores_the_in_sample_side_not_out_of_sample() -> None:
+    """The card's core correctness requirement, checked directly.
+
+    Reuses the rigged fixture (see the IS-vs-OOS section above) where the winner
+    looks brilliant in-sample and loses out-of-sample. Deflating the wrong side
+    would report the OOS run's *negative* Sharpe; deflating the right side reports
+    the positive one the search actually produced.
+    """
+    bars = _rigged_bars()
+    adapter = FakeAdapter(bars)
+    end = bars[-1].ts
+    grid = {"lookback": [2, 9]}
+    risk = RiskConfig.unlimited()
+
+    summary = run_walk_forward(
+        "momentum", grid, adapter, ["AAA"], _RIG_START, end, folds=1, risk=risk
+    )
+    (fold,) = summary.folds
+    assert fold.in_sample_metrics.sharpe > 0.0 > fold.out_of_sample_metrics.sharpe
+
+    deflated = summary.deflated_in_sample()
+    assert deflated is not None
+    assert deflated.observed_sharpe > 0.0
+
+
+def test_walk_forward_bootstrap_is_off_by_default() -> None:
+    summary = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=1)
+    assert summary.folds
+    assert all(fold.out_of_sample_sharpe_interval is None for fold in summary.folds)
+
+
+def test_walk_forward_bootstrap_populates_the_oos_interval() -> None:
+    """Scoped to OOS: the one curve per fold that was observed, not selected."""
+    summary = run_walk_forward(
+        "sma_crossover",
+        _GRID,
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+        folds=1,
+        bootstrap=True,
+        bootstrap_resamples=30,
+        bootstrap_seed=7,
+    )
+    (fold,) = summary.folds
+    interval = fold.out_of_sample_sharpe_interval
+    assert interval is not None
+    assert interval.resamples == 30
+    assert interval.seed == 7
+
+
+def test_walk_forward_bootstrap_never_touches_the_in_sample_side() -> None:
+    """--bootstrap changes nothing about the (already-free) IS deflation."""
+    plain = run_walk_forward("sma_crossover", _GRID, _adapter(), _SYMBOLS, _START, _END, folds=2)
+    bootstrapped = run_walk_forward(
+        "sma_crossover",
+        _GRID,
+        _adapter(),
+        _SYMBOLS,
+        _START,
+        _END,
+        folds=2,
+        bootstrap=True,
+        bootstrap_resamples=30,
+    )
+    assert plain.deflated_in_sample() == bootstrapped.deflated_in_sample()
+    for plain_fold, boot_fold in zip(plain.folds, bootstrapped.folds, strict=True):
+        assert plain_fold.in_sample_candidate_sharpes == boot_fold.in_sample_candidate_sharpes
+        assert plain_fold.in_sample_winner_returns == boot_fold.in_sample_winner_returns
+
+
 # --- parameter-stability: a combo's score next to its grid-neighbour mean -----
 #
 # ADR-0065 / KAN-620: a flat ranked CSV hides whether a winner sits on a plateau or
