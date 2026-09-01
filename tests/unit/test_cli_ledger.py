@@ -265,43 +265,16 @@ class TestSweepAppendsTheWholeGrid:
         assert TrialLedger(ledger_path).load()[0].hypothesis == "grid search idea"
 
 
-class TestWalkForwardIsUnaffected:
-    def test_ledger_with_folds_warns_and_appends_nothing(self, tmp_path: Path) -> None:
-        ledger_path = tmp_path / "ledger.jsonl"
-        result = runner.invoke(
-            app,
-            [
-                "sweep",
-                "--strategy",
-                "sma_crossover",
-                "--symbols",
-                "AAA,BBB",
-                "--param",
-                "fast=5,10",
-                "--param",
-                "slow=30",
-                "--folds",
-                "2",
-                "--source",
-                "synthetic",
-                "--seed",
-                "5",
-                "--out",
-                str(tmp_path / "sweep.csv"),
-                "--ledger",
-                str(ledger_path),
-                "--from",
-                "2019-01-01",
-                "--to",
-                "2022-12-31",
-            ],
-        )
-        assert result.exit_code == 0, result.output
-        assert "KAN-677" in result.output
-        assert not ledger_path.exists()
+class TestWalkForwardLedgerIsNowWired:
+    """KAN-677: ``--folds --ledger`` used to warn and append nothing.
 
-    def test_folds_without_ledger_is_unaffected(self, tmp_path: Path) -> None:
-        result = runner.invoke(
+    ADR-0074 wires it for real — see ``test_cli_walk_forward_significance.py`` for
+    the trial-count/deflation specifics; this class only pins that the old
+    "not yet wired" note is gone and a record really lands.
+    """
+
+    def _folds(self, tmp_path: Path, *extra: str) -> Result:
+        return runner.invoke(
             app,
             [
                 "sweep",
@@ -325,7 +298,26 @@ class TestWalkForwardIsUnaffected:
                 "2019-01-01",
                 "--to",
                 "2022-12-31",
+                *extra,
             ],
         )
+
+    def test_ledger_with_folds_no_longer_warns_and_appends_a_record(self, tmp_path: Path) -> None:
+        ledger_path = tmp_path / "ledger.jsonl"
+        result = self._folds(tmp_path, "--ledger", str(ledger_path))
         assert result.exit_code == 0, result.output
         assert "KAN-677" not in result.output
+        assert "not yet wired" not in result.output
+        records = TrialLedger(ledger_path).load()
+        assert len(records) == 1
+        assert records[0].command == "sweep --folds"
+        # 2 folds x 2 combos (fast=5,10 at slow=30) = 4, exactly the honest
+        # (folds x grid) count the card asks for.
+        assert records[0].trial_count == 4
+        assert records[0].observed_sharpe is not None
+
+    def test_folds_without_ledger_is_unaffected(self, tmp_path: Path) -> None:
+        result = self._folds(tmp_path)
+        assert result.exit_code == 0, result.output
+        assert "KAN-677" not in result.output
+        assert not (tmp_path / "ledger.jsonl").exists()
