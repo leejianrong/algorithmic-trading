@@ -1098,11 +1098,12 @@ As of this writing:
   shot via `--folds`, a robustness battery, cumulative-ledger deflation, portfolio
   fit, paper incubation, micro-live, and scale/retire against criteria written at
   step 1. Every worked command was actually run and its real output pasted in. Names
-  what's still a gap rather than describing it as built: no `--folds`↔`--ledger`
-  wiring (KAN-677), no portfolio-fit correlation CLI (library call only), `paper`
-  has neither `--bootstrap` nor `--ledger`, and (at the time it was written) the
-  robustness battery's parameter heatmap/regime-split/Monte Carlo items were still
-  open — see the three bullets below, landed the same day.
+  what's still a gap rather than describing it as built: at the time it was written,
+  no `--folds`↔`--ledger` wiring and `paper` had neither `--bootstrap` nor
+  `--ledger` (both since closed, ADR-0074/KAN-677), no portfolio-fit correlation CLI
+  (still library call only), and the robustness battery's parameter
+  heatmap/regime-split/Monte Carlo items were still open — see the three bullets
+  below, landed the same day.
 - **A sweep's parameter cliff is now visible (2026-08-18, ADR-0065, KAN-620):** a
   flat, best-first sweep CSV couldn't answer whether a winning combo sits on a
   plateau or a spike a real search would not reliably land on again.
@@ -1294,6 +1295,70 @@ As of this writing:
   DOGE, LTC) and 10/10 at 1m — the basket was picked by name recognition, not
   measured venue order flow; left unchanged since other cards may depend on its
   exact symbols. EPIC-105 is now **5/5 — complete**.
+- **`--folds` walk-forward and `paper` get their own trial accounting (2026-09-01,
+  ADR-0074, KAN-677):** two gaps KAN-675 left open. `sweep --folds` printed no
+  deflation of its own despite being the most trial-heavy path in the bench (each
+  fold sweeps the whole grid in-sample before picking a winner); `--ledger`/
+  `--hypothesis` were accepted but only honored on the plain-sweep path, and passing
+  them with `--folds` printed a "not yet wired" note and appended nothing.
+  `WalkForwardFold`/`WalkForwardSummary` gain `in_sample_candidate_sharpes`,
+  `in_sample_winner_returns`, `out_of_sample_sharpe_interval`,
+  `in_sample_trial_sharpes()`, `in_sample_trial_count`, `deflated_in_sample(...)`.
+  Deflates the **in-sample optimisation's own winner-selection Sharpe**, never OOS —
+  ADR-0026's discipline is that each fold's OOS run happens exactly once and is
+  never selected from a search, so deflating it would silently reintroduce the
+  peeking bug walk-forward exists to prevent. Trial count is the honest
+  `(folds x grid size)`, pooled across every completed fold — proven live: a 3-fold,
+  4-combo walk-forward printed `Trials: 12 scored` and a ledger `trial_count: 12`
+  (independently re-verified). Spread comes from the pooled in-sample *candidate*
+  Sharpes across folds (not just the fold winners — too few numbers to estimate a
+  spread from at the default 3 folds). `sweep --folds` gains `--bootstrap`/
+  `--bootstrap-resamples`/`--bootstrap-seed`, bracketing each fold's own
+  **out-of-sample** Sharpe with a confidence interval instead — the one number per
+  fold that was genuinely observed rather than selected. Separately, `trading paper`
+  gains the same `--bootstrap` trio plus `--ledger`/`--hypothesis`
+  (`trial_count=1`, always — a paper session is one trial), firing on both the
+  `--once` completion and the `KeyboardInterrupt`/`SessionTerminated` finalize path
+  (ADR-0033/0043), since a session stopped by SIGTERM is still a real trial. No
+  `engine.py` change: `PaperSession.finalize()` already returns a `BacktestResult`
+  shaped like a backtest's, so `backtest --bootstrap`'s exact pattern applies
+  unchanged. `RESULT_SCHEMA_VERSION` stays 1; equity byte-identical without the new
+  flags. 38 new tests across three files.
+- **A verdict on KAN-642, driven end to end on real data (2026-09-01):** all five
+  real candidate strategies (`sma_crossover`, `momentum`, `mean_reversion`,
+  `cross_sectional`, `trend_following`) run through `docs/research-playbook.md` on
+  real yfinance data — pre-registered hypotheses/kill criteria, in-sample sweeps
+  logged to a shared cross-invocation ledger (`research/kan642_trial_ledger.jsonl`),
+  true `--folds` walk-forward OOS (using ADR-0074's new wiring), a confirm run
+  (bootstrap CI, regime split, Monte Carlo, benchmark + diversified-baseline
+  comparison), and pairwise portfolio-fit correlations. Full evidence and verdict:
+  `docs/deployment-decision-2026-09-01.md`. **`sma_crossover` and `momentum` qualify
+  to enter paper incubation next** — the only two of five clearing every
+  pre-registered bar: OOS Sharpe 1.18/1.15, IS->OOS retention 99%/107% (*improved*
+  OOS vs. IS — the strongest evidence against curve-fitting), cumulative deflated
+  significance 1.00 at 237/238 trials (the whole research program's search, not just
+  their own), paired-bootstrap win rate vs. SPY 99.9%/99.7%. Correlated with each
+  other (0.773) — a book holding both gets one bet, not two. `mean_reversion` fails,
+  **replicating** ADR-0071's prior underperformance finding on a wider universe (20
+  names vs. 5) and longer range (16 years vs. 9) — a confirmation, not a new result.
+  `trend_following` fails its standalone bar (paired win rate 35.5%) but is flagged
+  as the one candidate worth a *portfolio-level* follow-up: positive in all four
+  regime splits (uniquely, among all five), lowest cross-candidate correlation
+  (~0.34 mean vs. the equity-only candidates) — ties to KAN-641. `cross_sectional`
+  is **inconclusive, not a confirmed fail**: its OOS walk-forward could not complete
+  this session — the shared machine hit genuine swap exhaustion (7.4/8GB) from
+  several unrelated concurrent sessions, not primarily this work, and three
+  progressively-scoped-down retries were all killed with no OOM evidence — so every
+  number for this candidate is in-sample only, the exact kind of evidence ADR-0026/
+  0039 exist to distrust most. **Nothing qualifies to trade real money today** — no
+  candidate has forward paper evidence, which KAN-642's own draft bar requires, and
+  playbook steps 9-11 were explicitly out of scope this session (EPIC-86 deferred).
+  Two new tool gaps surfaced, not fixed: `trading backtest` (unlike `sweep`) has
+  **no `--param`/strategy-kwarg override**, so the confirm runs above ran each
+  candidate's shipped defaults rather than the OOS-tested winner; and there is still
+  **no paired-bootstrap win rate against `--diversified-baseline`** (only against
+  `--benchmark`) — ADR-0071's gap, independently re-hit. Recommended next step:
+  pre-committed paper incubation (playbook step 9) for `sma_crossover`/`momentum`.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
@@ -1326,12 +1391,11 @@ As of this writing:
   divergence run dense enough to clear 30 *independent* crypto fills (KAN-863
   tracks the reference-staleness half of that gap) is still open.
 
-  Two ADR-0039 gaps stay open: `paper` has no `--bootstrap`/`--ledger`/
-  `--hypothesis` (only `backtest`/`sweep` do), and `--folds` walk-forward still
-  prints no deflation or ledger entry of its own (**KAN-677** — though ADR-0059
-  gave `WalkForwardSummary` the basis that block will need). Robustness tooling is
-  further along than `docs/research-playbook.md` (KAN-862) assumed at the time it
-  was written: **parameter-stability/heatmap output** from a sweep
+  Both ADR-0039 gaps this doc used to record here are now closed (ADR-0074,
+  KAN-677): `paper` has `--bootstrap`/`--ledger`/`--hypothesis`, and `--folds`
+  walk-forward has its own pooled cross-fold deflation and ledger wiring. Robustness
+  tooling is further along than `docs/research-playbook.md` (KAN-862) assumed at the
+  time it was written: **parameter-stability/heatmap output** from a sweep
   (`sweep --stability`, ADR-0065), **regime-split metrics** (`backtest --regimes`,
   ADR-0066), and **Monte Carlo path shuffling** (`backtest --monte-carlo`,
   ADR-0067) are all built the same day as the playbook — the playbook's own
@@ -1515,7 +1579,8 @@ src/trading/
                            #   None by default so every existing caller is unaffected (ADR-0063)
   ledger.py                # TrialLedger: append-only cross-invocation JSONL trial ledger,
                            #   widens deflated_sharpe's prior_trials count (never the spread,
-                           #   ADR-0062); backtest/sweep --ledger PATH --hypothesis TEXT
+                           #   ADR-0062); backtest/sweep/sweep --folds/paper all take
+                           #   --ledger PATH --hypothesis TEXT (ADR-0074)
   engine.py                # shared per-bar step + Engine.run (backtest) + PaperSession (V5);
                            #   prime_history: a live session's opening window is warmup, not
                            #   orders — data only, no strategy/broker/curve (ADR-0042);
