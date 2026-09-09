@@ -82,8 +82,15 @@ build_cmd() {
 		CMD+=(--data-feed "$PAPER_DATA_FEED")
 	fi
 	if [ -n "$PAPER_EXTRA_ARGS" ]; then
-		# Deliberately word-split: this carries flags like `--max-empty-polls 1`.
-		read -r -a extra <<<"$PAPER_EXTRA_ARGS"
+		# Deliberately word-split -- but `read -a` only splits on IFS, it does not
+		# do quote-removal, so a value like `--hypothesis "two words"` comes apart
+		# into stray tokens with literal quote characters glued on. `eval` performs
+		# real shell parsing (quote-removal included) so a quoted multi-word value
+		# reassembles into one array element. Safe here: PAPER_EXTRA_ARGS is always
+		# operator-supplied at the command line or in a Makefile invocation, never
+		# externally-controlled input -- the same trust level every other launch
+		# parameter in this script already assumes.
+		eval "extra=($PAPER_EXTRA_ARGS)"
 		CMD+=("${extra[@]}")
 	fi
 }
@@ -357,10 +364,15 @@ cmd_status() {
 	fi
 }
 
-case "${1:-}" in
-launch) cmd_launch ;;
-dryrun) cmd_dryrun ;;
-stop) cmd_stop ;;
-status) cmd_status ;;
-*) die "usage: $0 {launch|dryrun|stop|status}" ;;
-esac
+# Only dispatch when executed directly, not when sourced (e.g. by a test that
+# wants build_cmd's array-building logic in isolation) -- a well-known idiom,
+# additive and behaviourally inert for every real invocation of this script.
+if [ "${BASH_SOURCE[0]}" = "${0}" ]; then
+	case "${1:-}" in
+	launch) cmd_launch ;;
+	dryrun) cmd_dryrun ;;
+	stop) cmd_stop ;;
+	status) cmd_status ;;
+	*) die "usage: $0 {launch|dryrun|stop|status}" ;;
+	esac
+fi
