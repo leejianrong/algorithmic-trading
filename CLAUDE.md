@@ -1427,6 +1427,38 @@ As of this writing:
   every result table rather than silently trusting a lookback/rebalance calculation
   that assumes a bar exists at every expected step. Not an ADR — a measurement, no
   behavior changed.
+- **Crypto strategy research pass, stage 1 of KAN-1079 (2026-09-09, EPIC-140):**
+  the first real execution of `docs/crypto-research-pass-2026-09-02.md`'s scoped
+  plan, deliberately bounded (a live equity paper session for a different epic was
+  about to launch on the same Alpaca account) — see
+  `docs/crypto-research-pass-results-2026-09-09.md`. IS/OOS frozen at
+  2021-01-01..2025-07-31 / 2025-08-01..2026-09-08 (OOS untouched this session).
+  Cheap kill test (playbook step 3), all four in-scope candidates on `crypto10`
+  `--interval 1d --market crypto` real Alpaca data, `SOL/USD`'s known ~20% daily
+  gap (KAN-1078, above) carried as a caveat throughout: `sma_crossover` clears
+  cleanly (Sharpe 1.13, +615.88%, +508pp vs. BTC/USD); `momentum` clears more
+  modestly (Sharpe 0.68, +55pp vs. benchmark, info ratio 0.03); `mean_reversion`
+  is a borderline pass with a **negative** info ratio (-0.39, -51.76pp vs.
+  benchmark) — flagged as the weakest of the three but not killed by the letter of
+  the step-3 criteria, its step-4 disposition left open; `cross_sectional` is
+  **killed at step 3 on structural underpowering** (11.2 trades/param, `sweep`'s
+  own warning fires — `crypto10`'s 10-symbol universe cannot support the default
+  `top_k=8`, and `trading backtest` has no `--param` override to shrink it,
+  mirroring the exact tooling gap the equity KAN-642 verdict already named). Step
+  4 sweeps run for the two clear candidates (small grids, no bar cache to hit
+  repeatedly): `sma_crossover` (12 combos, winner `fast=5,slow=30`, deflated
+  P=0.92) and `momentum` (4 combos, winner `lookback=20`, deflated P=0.89) — both
+  **below the 0.95 significance bar**, reported honestly rather than smoothed
+  over. New `research/crypto_research_ledger.jsonl`, kept **separate** from the
+  equity line's `kan642_trial_ledger.jsonl` (reasoned as a genuinely different
+  population for ADR-0039/0062 deflation purposes, not merely a different
+  project). Every command finished in 5-42s against real Alpaca — far faster than
+  the scoping doc's worst-case fears about the zero-cache path — so the session
+  stopped early by choice (43 minutes ahead of its own deadline), not under
+  pressure. **Explicitly a partial/stage-1 result**: steps 5-8 (true `--folds` OOS,
+  robustness battery, cumulative-ledger deflation, portfolio fit) were not
+  attempted for any candidate, deliberately, per this session's own "do not rush
+  a walk-forward to beat a clock" instruction — a follow-up session's job.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
