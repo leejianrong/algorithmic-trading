@@ -1359,6 +1359,74 @@ As of this writing:
   **no paired-bootstrap win rate against `--diversified-baseline`** (only against
   `--benchmark`) — ADR-0071's gap, independently re-hit. Recommended next step:
   pre-committed paper incubation (playbook step 9) for `sma_crossover`/`momentum`.
+- **Crypto strategy research, scoped but not executed (2026-09-02, KAN-1077, EPIC-140):**
+  `docs/crypto-research-pass-2026-09-02.md` answers the research-playbook's step 1-2
+  questions for a crypto-side KAN-642 *before* any command runs, mirroring
+  `deployment-decision-2026-09-01.md`'s own discipline. Decisions: `--source alpaca`
+  only (`yfinance` has no crypto; `SyntheticAdapter` is GBM-only, fine for a plumbing
+  smoke test, never for a hypothesis-confirming number); `crypto10` at `--interval 1d`
+  (sidesteps ADR-0073's 5m/1m tape-density failures rather than screening around
+  them, and matches the equity pass's own daily interval for an apples-to-apples
+  comparison); proceed on `CostConfig.crypto()`'s shared 5.0 bps slippage default
+  despite ADR-0061's n=11/non-independent sample, with the caveat repeated in every
+  result table rather than gating the research on a cost number this bench cannot
+  yet tighten. Two operational rules for whoever executes it: never concurrent with
+  an EPIC-139 live equity paper session (same Alpaca account), and `nice`/`ionice`
+  plus a `free -h`/`uptime` check before every heavy step (this machine hit swap
+  exhaustion during KAN-642's own `cross_sectional` walk-forward). Execution is
+  KAN-1079 (8 points), explicitly deferred by this scoping session for machine-time
+  reasons — a first cheap sub-step (KAN-1078) has since run; see below.
+- **Paper incubation for `sma_crossover`/`momentum`, pre-registered but not yet run
+  (2026-09-02, KAN-1076, EPIC-139):** `docs/paper-incubation-2026-09-02.md` commits
+  the plan for two future live sessions before either runs — the same
+  pre-registration discipline as the crypto scoping doc above. `sma_crossover` and
+  `momentum` are the only two of KAN-642's five candidates that qualified (see the
+  verdict bullet above); they run as **two separate, sequential** sessions, never
+  concurrently, both operationally (one Alpaca account) and statistically (0.773
+  correlation — conflating their order flow would attribute every fill to "the
+  combined book," not to either strategy). Both sessions: `@blue20 --interval 5m`
+  (the only combination ADR-0052 measured reliably clearing `MIN_PAIRED_FILLS = 30`
+  in one session), `--divergence --bootstrap --ledger
+  research/kan642_trial_ledger.jsonl --hypothesis "..."` (the same cross-invocation
+  ledger the whole KAN-642 line has used, so cumulative deflation keeps accruing),
+  one full trading day each. Kill criteria fixed in advance: **>10 bps** adverse
+  divergence at n≥30 paired fills is a hard stop (5-10 bps flagged but continues,
+  mirroring `monday-divergence-run.md`'s reading bands); the drawdown kill switch
+  actually latching during a single supervised day is a stop-and-investigate signal
+  (both candidates show exactly one halt in 16 backtested years each); a contaminated
+  first order (`submitted_ts` before warmup-complete) means the ADR-0042 guard
+  regressed. `<30` paired fills in a session is not a conclusion — a second session
+  for that strategy is required, decided now rather than rationalized later.
+- **Launcher bug found and fixed before the first incubation session
+  (2026-09-09, KAN-1076-adjacent):** preparing to actually launch the session above,
+  `scripts/paper_session.sh`'s `build_cmd` split the operator-supplied
+  `PAPER_EXTRA_ARGS` with `read -r -a`, which splits on whitespace but performs no
+  shell quote-removal — so the multi-word `--hypothesis "..."` value the incubation
+  doc's §6/§7 instructs operators to pass this way tore into stray tokens with
+  literal quote characters glued onto the first and last words, which a Click-based
+  CLI would either reject as unexpected extra arguments or silently truncate. Fixed
+  by re-parsing with `eval "extra=($PAPER_EXTRA_ARGS)"` (real shell quote-removal;
+  safe here because the variable is always operator-supplied, never externally
+  controlled), plus a "sourced vs executed" dispatch guard so a test can reach
+  `build_cmd` directly. 12 new fast tests, reproduced failing against the old code
+  and passing against the fix before landing.
+- **Does Alpaca's daily crypto tape have holes too? (2026-09-09, KAN-1078, EPIC-140):**
+  ADR-0073 measured 5m/1m tape-density failures on `crypto10` but nobody had checked
+  `--interval 1d`, the interval KAN-1079's research pass actually plans to use.
+  Measured directly (`docs/crypto-daily-tape-density-2026-09-09.md`,
+  `scripts/crypto_daily_tape_density.py`): **no, not the same problem** — 7 of 10
+  `crypto10` symbols come back ~100% complete at daily granularity (bars aggregate
+  over whatever sub-daily gaps existed within a day), and `AAVE/USD`/`AVAX/USD`'s
+  apparently-low coverage over the full window is a pure late-listing artifact
+  (100.1% complete since their own first bar). **`SOL/USD` is a genuine, confirmed
+  hole**: listed since the window start same as `BTC`/`ETH`, yet missing 417 of
+  2,076 expected daily bars (79.9% coverage) — independently cross-validating
+  `universe.py`'s own pre-existing SOL comment (1,634/2,052 = 79.63%, a different,
+  earlier, shorter measurement) to within 0.3 points. Recommendation for KAN-1079:
+  run `crypto10` at `1d` as scoped, but flag `SOL/USD`'s ~20% gap rate explicitly in
+  every result table rather than silently trusting a lookback/rebalance calculation
+  that assumes a bar exists at every expected step. Not an ADR — a measurement, no
+  behavior changed.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
