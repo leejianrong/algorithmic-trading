@@ -12,6 +12,8 @@ from datetime import UTC, datetime, timedelta
 import pytest
 
 from trading.data.alpaca_client import (
+    ASSET_CLASS_CRYPTO,
+    ASSET_CLASS_US_EQUITY,
     STATUS_CANCELED,
     STATUS_FILLED,
     STATUS_NEW,
@@ -483,3 +485,50 @@ class TestFakeSubmitRefusal:
         client.set_submit_refusal("AAPL", "nope")
 
         assert client.submit_order("MSFT", 1.0, Side.BUY).status == STATUS_NEW
+
+
+class TestAssetClassScopedPositions:
+    """``list_positions`` must not leak a position across asset classes.
+
+    Reproduces a live bug (2026-09-13): a real Alpaca paper account can hold
+    equity and crypto positions at once (verified directly against the account
+    this bug was found on: six stray equity positions, left over from an
+    unrelated incident, and zero crypto positions). Constructing
+    ``RealAlpacaClient(asset_class=ASSET_CLASS_CRYPTO)`` and calling
+    ``list_positions()`` returned all six equity positions anyway, which then
+    crashed ``AlpacaBroker._reconcile`` -> ``Guardrails.halted`` ->
+    ``Portfolio.equity`` with a ``KeyError`` for a symbol (``AMZN``) the crypto
+    session never traded and had no price for.
+
+    ``FakeAlpacaClient`` had no ``asset_class`` concept at all before this fix,
+    so it could not have caught the bug: these tests are only meaningful because
+    the fake is now scoped the same way the real client always was (ADR-0058).
+    """
+
+    @staticmethod
+    def _mixed_account(asset_class: str | None) -> FakeAlpacaClient:
+        client = FakeAlpacaClient(cash=1_000_000.0, asset_class=asset_class)
+        client.seed_position("AAPL", 10.0, 150.0)
+        client.seed_position("BTC/USD", 0.5, 30_000.0)
+        return client
+
+    def test_equity_scoped_client_never_returns_crypto(self) -> None:
+        client = self._mixed_account(ASSET_CLASS_US_EQUITY)
+
+        symbols = {pos.symbol for pos in client.list_positions()}
+
+        assert symbols == {"AAPL"}
+
+    def test_crypto_scoped_client_never_returns_equity(self) -> None:
+        client = self._mixed_account(ASSET_CLASS_CRYPTO)
+
+        symbols = {pos.symbol for pos in client.list_positions()}
+
+        assert symbols == {"BTC/USD"}
+
+    def test_unscoped_client_keeps_the_old_unfiltered_behavior(self) -> None:
+        client = self._mixed_account(None)
+
+        symbols = {pos.symbol for pos in client.list_positions()}
+
+        assert symbols == {"AAPL", "BTC/USD"}
