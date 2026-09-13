@@ -1,0 +1,50 @@
+# Keep the build context to what the image actually needs. Mirrors .gitignore's
+# shape rather than diverging from it -- if it's excluded from version control
+# for being an artifact/cache/secret, it has no reason to enter a build context
+# either. See CLAUDE.md / ADR-0043's "no secrets in the image" invariant.
+
+# Secrets -- must never reach a layer. gitleaks scans git history; it does not
+# scan Docker layers, so this is a separate exposure path (KAN-683).
+.env
+.env.*
+!.env.example
+
+# Local dependency/runtime state -- rebuilt inside the image by `uv sync`.
+.venv
+env/
+venv/
+ENV/
+
+# VCS metadata and agent worktree scaffolding.
+.git
+.gitignore
+.github
+.claude
+
+# Run artifacts (mirrors .gitignore's /results/) and research scratch output.
+results/
+research/
+
+# Caches.
+__pycache__/
+*.py[codz]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.cache/
+.coverage
+.coverage.*
+htmlcov/
+*.egg-info/
+.hypothesis/
+
+# Editor/OS noise.
+.DS_Store
+*.swp
+
+# Docs not needed at build time (kept out to shrink context; not a secret
+# concern). README.md stays -- hatchling's build metadata reads it.
+docs/
+PLAN.md
+SLICES.md
+QUESTIONS.md
