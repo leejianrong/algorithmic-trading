@@ -3269,6 +3269,15 @@ def dashboard(
         "--serve",
         help="Serve the dashboard over HTTP (needs the optional 'dashboard' extra).",
     ),
+    live_dir: Path | None = typer.Option(
+        None,
+        "--live-dir",
+        help=(
+            "Serve a LIVE view of a running `trading paper --out DIR` session instead "
+            "of a finished result.json (an alternative to --result, --serve only; "
+            "ADR-0075)."
+        ),
+    ),
     host: str = typer.Option("127.0.0.1", "--host", help="Bind host for --serve."),
     port: int = typer.Option(8000, "--port", help="Bind port for --serve."),
 ) -> None:
@@ -3278,6 +3287,13 @@ def dashboard(
     single self-contained HTML file (no external references, no extra dependencies).
     ``--serve`` runs the FastAPI dashboard server — install it with
     ``pip install 'algo-trading-bench[dashboard]'``.
+
+    ``--serve --live-dir DIR`` serves a *live*, self-polling view of a running
+    ``trading paper --out DIR`` session instead — reading only its on-disk
+    artifacts (``paper_state.json`` / ``paper_session.log`` /
+    ``fill_divergence.csv``), never the process itself (ADR-0075). It has no
+    meaning under ``--static`` (there is nothing to poll in a static export), so
+    combining the two is a CLI error.
     """
     from trading.dashboard import server as dashboard_server
     from trading.dashboard.payload import load_payload
@@ -3285,6 +3301,14 @@ def dashboard(
 
     if (static is not None) == serve:
         typer.echo("error: pass exactly one of --static or --serve", err=True)
+        raise typer.Exit(2)
+
+    if live_dir is not None and static is not None:
+        typer.echo(
+            "error: --live-dir cannot be combined with --static "
+            "(a live view has nothing to export statically; use --serve --live-dir)",
+            err=True,
+        )
         raise typer.Exit(2)
 
     if static is not None:
@@ -3303,8 +3327,14 @@ def dashboard(
     # --serve: hand off to the (lazy-FastAPI) server; a missing extra raises a clear
     # ImportError naming the install, which we surface as a clean CLI error.
     try:
-        typer.echo(f"Serving dashboard for {result} at http://{host}:{port} (Ctrl-C to stop)")
-        dashboard_server.serve(result, host=host, port=port)
+        if live_dir is not None:
+            typer.echo(
+                f"Serving LIVE dashboard for {live_dir} at http://{host}:{port} (Ctrl-C to stop)"
+            )
+            dashboard_server.serve_live(live_dir, host=host, port=port)
+        else:
+            typer.echo(f"Serving dashboard for {result} at http://{host}:{port} (Ctrl-C to stop)")
+            dashboard_server.serve(result, host=host, port=port)
     except ImportError as exc:
         typer.echo(f"error: {exc}", err=True)
         raise typer.Exit(1) from exc

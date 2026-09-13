@@ -214,3 +214,35 @@ def test_dashboard_static_missing_result_errors(tmp_path: Path) -> None:
     )
     assert result.exit_code == 2
     assert "not found" in result.output
+
+
+# --- dashboard --live-dir (ADR-0075) ------------------------------------------
+#
+# The live server itself needs the optional `dashboard` extra and blocks on
+# uvicorn.run, so it is never invoked for real here (mirroring how no fast test
+# invokes a real `--serve` either) — only the CLI-level validation is exercised.
+
+
+def test_dashboard_live_dir_with_static_is_rejected(tmp_path: Path) -> None:
+    live_dir = tmp_path / "paper_out"
+    live_dir.mkdir()
+    result = runner.invoke(
+        app,
+        [
+            "dashboard",
+            "--live-dir",
+            str(live_dir),
+            "--static",
+            str(tmp_path / "d.html"),
+        ],
+    )
+    assert result.exit_code == 2
+    assert "--live-dir cannot be combined with --static" in result.output
+
+
+def test_dashboard_live_dir_alone_still_requires_serve_or_static(tmp_path: Path) -> None:
+    live_dir = tmp_path / "paper_out"
+    live_dir.mkdir()
+    result = runner.invoke(app, ["dashboard", "--live-dir", str(live_dir)])
+    assert result.exit_code == 2
+    assert "exactly one" in result.output
