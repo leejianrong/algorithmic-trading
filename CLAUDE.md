@@ -1508,6 +1508,50 @@ As of this writing:
   (`make paper-flatten`, EPIC-78, now in progress). `momentum`'s still-pending
   second session should run on infrastructure less
   prone to sleep/reboot, or wait for KAN-686.
+- **A reproducible container image for unattended paper trading (2026-09-13,
+  KAN-683, EPIC-86):** a multi-stage `Dockerfile` (builder resolves the venv via
+  `uv sync --frozen --extra alpaca`, never `--extra dashboard`; runtime copies
+  only `.venv` + `src`, runs as a non-root `trading` user) plus a `.dockerignore`
+  that keeps `.env` physically out of the build context — gitleaks scans git
+  history but not image layers, a separate exposure path this closes structurally
+  rather than by policy. `ENTRYPOINT ["trading"]` / `CMD ["--help"]`: no
+  hardcoded subcommand, so KAN-686's future supervisor or a plain `docker run
+  ... paper --broker alpaca --live ...` both work unmodified. `/app/results` is a
+  declared `VOLUME` for KAN-685 to mount over. Verified: `docker build` succeeds;
+  a synthetic `backtest` and a `paper --once` session both ran correctly inside
+  the container with `--network none` and no credentials, writing artifacts to a
+  mounted volume; `docker history` plus a full extraction of every layer
+  (~15,900 files) grepped clean for `.env*`/credential assignments — no secrets
+  in any layer. Still open in EPIC-86: KAN-684 (credential delivery), KAN-685
+  (persist artifacts across restarts, needs KAN-680 first), KAN-686 (crash
+  supervision — its prerequisites KAN-669/671 are already done), KAN-687 (market-
+  calendar-aware sleep), KAN-688 (VPS provisioning — on hold, owner's choice),
+  KAN-689 (CI-gated deploy, deliberately last/lowest priority in the epic).
+- **A live view of a running paper session (2026-09-13, ADR-0075, KAN-712):**
+  the existing dashboard (ADR-0023) only ever reads a finished `result.json`
+  (written once, at `finalize()`), so it could not show a session while it ran.
+  `trading.dashboard.live_payload` reads a live session's three durable, growing
+  artifacts instead — `paper_state.json`, `paper_session.log`,
+  `fill_divergence.csv` (when `--divergence` was passed) — and degrades to
+  `None`/empty on any file that is missing or momentarily mid-write rather than
+  raising. **Read-only over the artifact files, and nothing else**: this module
+  never imports `trading.engine`/`PaperSession`, opens no socket, and reaches
+  into no running process, so a dashboard bug is structurally incapable of
+  touching a live run. The equity curve is reconstructed from the log (the only
+  artifact that accumulates history — `paper_state.json` is overwritten each
+  bar), reusing `payload.py`'s existing chart-geometry functions verbatim.
+  `trading.dashboard.live_view.render_live_html` is a self-polling page (reuses
+  `static_export`'s CSS, polls `GET /api/live` every 5s); `server.py` gains a
+  second, independent FastAPI app (`create_live_app`/`serve_live`) rather than
+  bolting live routes onto the finished-run one, since the two modes need
+  different startup behavior (the live app must work before a session has
+  written anything at all). CLI: `trading dashboard --serve --live-dir DIR`,
+  refused under `--static` (exit 2 — a live view has nothing to export
+  statically). No change to `_persist_state`, `_format_bar`, `DivergenceJournal`,
+  `engine.py`, or `result.json`'s schema. Verified against a real
+  `paper --once --source synthetic --divergence` session's actual output
+  directory, and by serving it over HTTP and hitting `GET /` / `GET /api/live`
+  with `curl`.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
