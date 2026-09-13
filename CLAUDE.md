@@ -1459,6 +1459,33 @@ As of this writing:
   robustness battery, cumulative-ledger deflation, portfolio fit) were not
   attempted for any candidate, deliberately, per this session's own "do not rush
   a walk-forward to beat a clock" instruction — a follow-up session's job.
+- **`sma_crossover`'s paper incubation ran its full trading day — and then the
+  machine crashed (2026-09-09 → discovered 2026-09-13, KAN-1076, EPIC-139):**
+  the first of the two pre-registered incubation sessions
+  (`docs/paper-incubation-2026-09-02.md`) launched normally and traded correctly
+  the whole regular session — see
+  `docs/paper-incubation-sma-crossover-results-2026-09-13.md` for the full
+  investigation. **All four kill criteria clear, cleanly:** 71 paired fills
+  (>> `MIN_PAIRED_FILLS = 30`), mean realized-vs-modelled slippage **−5.59 bps**
+  (realized *better* than the 5.0 bps model — the same conservative direction
+  ADR-0052 found originally), no halt, no contamination, no duplicate-order
+  problem. **Separately, the host machine (WSL2) crashed or was suspended
+  overnight**, unrelated to the trading logic — `PaperSession.finalize()` never
+  ran (`result.json`/`equity_curve.csv` absent, exactly ADR-0048's documented
+  "crashed session" case; `fill_divergence.csv` survived intact by that same
+  ADR's durability design, and is what the kill-criteria analysis above is built
+  on). Alpaca's own order history — not local logs — proved the trading day
+  itself was not truncated by the crash: normal activity ran the full session,
+  a few end-of-day exits parked overnight (ADR-0036) and filled automatically at
+  the next open, and nothing traded after that. On return, the account held 6
+  unmanaged positions with no working orders; flattening SELLs were submitted by
+  hand (with the user's explicit confirmation) via `RealAlpacaClient` directly,
+  parked pending the next market open, **not yet confirmed complete** as of this
+  writing. This incident is concrete evidence for two existing backlog cards:
+  **KAN-686** (process supervision/restart-on-crash, EPIC-86) and **KAN-829**
+  (`make paper-flatten`, EPIC-78, now in progress). `momentum`'s still-pending
+  second session should run on infrastructure less
+  prone to sleep/reboot, or wait for KAN-686.
 - **NOT yet built:** tick frequency and other asset classes (each its own ADR).
   Real Alpaca paper/live-quote runs need `uv sync --extra alpaca` plus
   `ALPACA_API_KEY` / `ALPACA_SECRET_KEY` in the environment (see `.env.example`);
