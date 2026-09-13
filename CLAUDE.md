@@ -1481,6 +1481,28 @@ As of this writing:
   (correctly) — they apply only to survivors, and neither candidate survived.
   `mean_reversion`/`cross_sectional` untouched (stage-1 dispositions stand);
   `trend_following` still out of scope.
+- **`mean_reversion` also killed at true walk-forward, closing out KAN-1079
+  (2026-09-13, stage 3, EPIC-140):** stage 1 had explicitly left `mean_reversion`'s
+  disposition open — a borderline cheap-kill pass (Sharpe 0.47) already carrying a
+  **negative** info ratio (-0.39) vs. `BTC/USD`, with its step-4 sweep skipped on
+  time-budget grounds. This session ran it: a 9-combo in-sample sweep
+  (`period=10,14,20 × oversold=20,30,40`, winner = the shipped defaults, deflated
+  P=0.68 — the weakest step-4 result of the three time-series candidates), then a
+  3-fold anchored `--folds` walk-forward over the same grid — see
+  `docs/crypto-research-pass-results-2026-09-13-mean-reversion.md`. **Fails
+  decisively, worse than stage 2's candidates**: mean OOS Sharpe **-0.09** (IS
+  +0.64, retention **-14%** — the OOS mean is outright negative), 0/3 folds
+  profitable OOS, every fold's bootstrap CI straddles zero. Unlike `sma_crossover`/
+  `momentum` (strong in-sample signal that collapsed), `mean_reversion`'s in-sample
+  signal was already the weakest of the three before any OOS step ran — this is a
+  third, independent confirmation of a weak signal rather than a surprise reversal.
+  **All four in-scope crypto candidates from the scoping doc now have a
+  disposition**: `sma_crossover`/`momentum`/`mean_reversion` killed at true
+  walk-forward, `cross_sectional` killed at the cheap-kill step on structural
+  underpowering (stage 1). **Nothing qualifies for crypto paper incubation
+  today.** KAN-1079 (8 pts) is closed. Follow-ups left open, untouched: KAN-1074
+  (a broader crypto universe, to re-open `cross_sectional`) and KAN-1075 (a
+  sizing dust-rounding bug that can block a crypto long-or-cash exit).
 - **`sma_crossover`'s paper incubation ran its full trading day — and then the
   machine crashed (2026-09-09 → discovered 2026-09-13, KAN-1076, EPIC-139):**
   the first of the two pre-registered incubation sessions
