@@ -1,7 +1,7 @@
 # One-command dev loop (dev-playbook principle 17). Every target is stack-aware
 # via `uv run`, so a newcomer needs only `make setup` then `make check`.
 
-.PHONY: help setup install-hooks check lint format typecheck test test-integration test-network test-all audit ci-local paper-preflight paper-dryrun paper-live paper-stop paper-status
+.PHONY: help setup install-hooks check lint format typecheck test test-integration test-network test-all audit ci-local paper-preflight paper-dryrun paper-live paper-stop paper-status paper-flatten
 
 # Bare `make` prints this list; it never *does* anything. Before this, the default
 # goal was whatever came first in the file -- `setup` -- so a reflexive `make` ran
@@ -121,3 +121,6 @@ paper-stop:  ## Stop the launched session with SIGTERM so it finalizes (ADR-0043
 
 paper-status:  ## Where the launched run's artifacts are, its state file, and the tail of its console.
 	./scripts/paper_session.sh status
+
+paper-flatten:  ## Liquidate the account after a session (KAN-829): cancel working BUYs, sell every position.
+	uv run $(PAPER_ENV_ARG) python scripts/paper_flatten.py
