@@ -1459,6 +1459,28 @@ As of this writing:
   robustness battery, cumulative-ledger deflation, portfolio fit) were not
   attempted for any candidate, deliberately, per this session's own "do not rush
   a walk-forward to beat a clock" instruction — a follow-up session's job.
+- **Stage 1's promising crypto in-sample numbers collapse out-of-sample — both
+  candidates killed (2026-09-13, stage 2 of KAN-1079, EPIC-140):** the true
+  `--folds` walk-forward (playbook step 5) for `sma_crossover` and `momentum` on
+  `crypto10` (3 anchored folds, 2021-01-01..2026-09-12) — see
+  `docs/crypto-research-pass-results-2026-09-13.md`. **Both fail decisively**:
+  `sma_crossover` mean OOS Sharpe **+0.08** (IS +1.36, retained **6%**),
+  `momentum` **+0.22** (IS +1.57, retained **14%**) — both far below the
+  pre-registered 50% retention / 0.3 Sharpe kill bars, and every fold's own
+  bootstrap CI straddles zero. **The opposite of the equivalent equity pass**,
+  which found the same two candidates retaining 99%/107% (OOS *improving*) —
+  exactly the asymmetry a true walk-forward exists to catch, not a tooling
+  defect. Corroborating signal: both in-sample searches picked their grid's
+  fastest-reacting parameter (`slow=20`, `lookback=10`, both grid minimums) in
+  **every** fold, consistent with fitting short-horizon noise rather than a
+  stable mechanism. Two honest readings, not mutually exclusive: the drafted
+  crypto-native mechanism (retail narrative-chasing) may simply not hold on this
+  venue at daily granularity, **or** 5.7 years of crypto history (vs. equities'
+  16) doesn't yet span enough independent regimes to trust a null result either
+  — this session's data cannot distinguish which. Steps 6-8 not attempted
+  (correctly) — they apply only to survivors, and neither candidate survived.
+  `mean_reversion`/`cross_sectional` untouched (stage-1 dispositions stand);
+  `trend_following` still out of scope.
 - **`sma_crossover`'s paper incubation ran its full trading day — and then the
   machine crashed (2026-09-09 → discovered 2026-09-13, KAN-1076, EPIC-139):**
   the first of the two pre-registered incubation sessions
