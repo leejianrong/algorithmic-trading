@@ -482,6 +482,62 @@ class TestBrokerIsAssetClassAgnostic:
         assert broker.rejections == []
 
 
+class TestReconcileIsScopedToTheClientsOwnAssetClass:
+    """A stray position from the *other* asset class must not reconcile in.
+
+    Found live (2026-09-13): a real Alpaca paper account held six stray equity
+    positions (left over from an unrelated incident) and zero crypto positions.
+    A ``trading paper --market crypto --broker alpaca --live`` session crashed on
+    its very first bar, before the strategy or any order ran, because
+    ``AlpacaBroker._reconcile`` built its ``Portfolio`` from
+    ``RealAlpacaClient(asset_class=crypto).list_positions()``, which returned all
+    six equity positions anyway. ``Guardrails.halted`` then called
+    ``Portfolio.equity(prices)`` with only that bar's crypto quotes, and
+    ``Portfolio.equity`` correctly raised ``KeyError: "No price to mark held
+    position 'AMZN'"`` -- correctly, because a position the run never traded and
+    was never given a price for really is unpriceable. The defect is upstream:
+    the equity position should never have reconciled into a crypto-scoped
+    broker's portfolio in the first place (fixed in
+    ``RealAlpacaClient.list_positions`` / ``FakeAlpacaClient.list_positions``,
+    both now scoped to the client's own ``asset_class``).
+    """
+
+    def test_a_crypto_broker_reconciles_only_the_crypto_position(self) -> None:
+        client = FakeAlpacaClient(cash=1_000_000.0, asset_class=ASSET_CLASS_CRYPTO)
+        # The stray equity positions from the live incident, seeded directly
+        # (no submit/fill round trip -- they were never traded by this broker).
+        # Prices are set for the fake's own internal get_account() accounting
+        # only (it marks every seeded position, unscoped); the assertion below
+        # is what proves the *broker's* reconciled book never saw them.
+        client.set_price("AMZN", 180.0)
+        client.set_price("CVX", 150.0)
+        client.set_price("BTC/USD", 30_000.0)
+        client.seed_position("AMZN", 5.0, 180.0)
+        client.seed_position("CVX", 10.0, 150.0)
+        client.seed_position("BTC/USD", 0.5, 30_000.0)
+
+        broker = AlpacaBroker(client, calendar=CRYPTO_24_7)
+
+        assert set(broker.portfolio.positions) == {"BTC/USD"}
+        # This is exactly the call that crashed live: marking the reconciled
+        # book with only the bars a crypto session actually has prices for.
+        assert broker.portfolio.equity({"BTC/USD": 31_000.0}) == pytest.approx(
+            1_000_000.0 + 0.5 * 31_000.0
+        )
+
+    def test_an_equity_broker_reconciles_only_equity_positions(self) -> None:
+        """The symmetric direction: a crypto position must not leak into equity."""
+        client = FakeAlpacaClient(cash=1_000_000.0, asset_class=ASSET_CLASS_US_EQUITY)
+        client.set_price("AAPL", 150.0)
+        client.set_price("BTC/USD", 30_000.0)
+        client.seed_position("AAPL", 10.0, 150.0)
+        client.seed_position("BTC/USD", 0.5, 30_000.0)
+
+        broker = AlpacaBroker(client, calendar=US_EQUITY)
+
+        assert set(broker.portfolio.positions) == {"AAPL"}
+
+
 class TestAnExitIsNeverBlockedByRounding:
     """A live crypto session could not sell what it held (ADR-0058).
 

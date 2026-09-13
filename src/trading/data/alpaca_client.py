@@ -432,6 +432,20 @@ class FakeAlpacaClient:
     default; :meth:`set_asset` scripts a specific answer (e.g. a non-fractionable
     or halted name) and :meth:`set_asset_failure` scripts a lookup that blows up,
     which is what lets the universe validator (ADR-0028) be tested offline.
+
+    ``asset_class`` is ``None`` by default, meaning this client is unscoped and
+    :meth:`list_positions` returns every position it holds, regardless of
+    symbol shape -- the historical behaviour every pre-existing caller relies
+    on. Pass :data:`ASSET_CLASS_US_EQUITY` / :data:`ASSET_CLASS_CRYPTO` to scope
+    it the way :class:`RealAlpacaClient` always is, which is what makes it
+    possible to test the venue's own real shape offline: one Alpaca account can
+    hold positions of both asset classes at once, and only a client actually
+    scoped to one of them can be used to prove a same-class filter holds. There
+    is no per-position ``asset_class`` field to key on here (the fake has no SDK
+    object to read one from), so the scope is inferred from **symbol shape** --
+    a crypto pair is always slash-separated (``BTC/USD``), matching the same
+    convention :func:`canonical_crypto_symbol` and ADR-0057's shape guard both
+    already use.
     """
 
     def __init__(
@@ -441,6 +455,7 @@ class FakeAlpacaClient:
         cash: float = 100_000.0,
         auto_fill: bool = True,
         assets: dict[str, AssetInfo] | None = None,
+        asset_class: str | None = None,
     ) -> None:
         self._bars: dict[str, list[Bar]] = {
             symbol: sorted(series, key=lambda b: b.ts) for symbol, series in (bars or {}).items()
@@ -455,12 +470,23 @@ class FakeAlpacaClient:
         # (symbol, side-or-None) -> the exception submit_order should raise.
         self._submit_failures: dict[tuple[str, Side | None], Exception] = {}
         self._next_id = 1
+        self._asset_class = None if asset_class is None else require_asset_class(asset_class)
 
     # -- test/setup helpers (not part of the protocol) --
 
     def set_price(self, symbol: str, price: float) -> None:
         """Set the price ``submit_order`` (and :meth:`fill_order`) will fill at."""
         self._prices[symbol] = price
+
+    def seed_position(self, symbol: str, qty: float, avg_price: float) -> None:
+        """Script an existing open position directly, with no order or fill.
+
+        For building the "one account, two asset classes" fixtures the
+        asset-class scoping tests need (ADR-0058's ``list_positions`` fix): a
+        stray equity position and a crypto position can be seeded onto the same
+        account state without a submit/fill round trip through either one.
+        """
+        self._state.positions[symbol] = PositionSnapshot(symbol, qty, avg_price)
 
     def set_asset(
         self,
@@ -674,7 +700,19 @@ class FakeAlpacaClient:
         return AccountSnapshot(cash=self._state.cash, equity=self._equity())
 
     def list_positions(self) -> list[PositionSnapshot]:
-        return [pos for pos in self._state.positions.values() if abs(pos.qty) > SHARE_EPS]
+        """All open positions, scoped to ``asset_class`` when one was given.
+
+        Unscoped (the default), every position is returned regardless of symbol
+        shape -- the pre-existing behaviour. Scoped, a position is kept only when
+        its symbol shape matches: slash-separated (``BTC/USD``) for crypto,
+        anything else for equity -- mirroring :class:`RealAlpacaClient`'s
+        positive same-venue match rather than "not obviously the other one".
+        """
+        positions = [pos for pos in self._state.positions.values() if abs(pos.qty) > SHARE_EPS]
+        if self._asset_class is None:
+            return positions
+        want_crypto = self._asset_class == ASSET_CLASS_CRYPTO
+        return [pos for pos in positions if ("/" in pos.symbol) == want_crypto]
 
     def get_asset(self, symbol: str) -> AssetInfo:
         """Return the scripted asset for ``symbol``, else a fully usable default.
@@ -1270,15 +1308,40 @@ class RealAlpacaClient:
         )
 
     def list_positions(self) -> list[PositionSnapshot]:
-        """Open positions, with crypto symbols restored to the venue's slash form.
+        """Open positions on this client's own venue, with crypto symbols restored
+        to the venue's slash form.
 
-        On the equity venue this is exactly what it always was. On crypto it is
-        not cosmetic: Alpaca echoes ``BTC/USD`` on the order and ``BTCUSD`` on the
-        position it creates, and the concatenated key would make the holding
-        invisible to sizing and the guardrails. See
-        :func:`canonical_crypto_symbol` for the measurement and the consequence.
+        ``get_all_positions`` answers for the **account**, not the venue: one
+        Alpaca paper account can hold both equity and crypto positions at once
+        (measured 2026-09-13 -- a crypto-scoped session crashed on its first bar
+        because six stray equity positions, left over from an unrelated incident,
+        came back from a client constructed with ``asset_class=crypto``). Every
+        other call on this seam is already scoped to ``self._asset_class``
+        (bars, orders, the feed, :meth:`list_assets`); this one was not, and
+        :meth:`~trading.brokers.alpaca.AlpacaBroker._reconcile` builds its
+        :class:`~trading.types.Portfolio` straight from whatever this returns, so
+        an unrelated position from the *other* asset class reconciled into a
+        book the engine then tried to mark with that bar's prices --
+        :class:`~trading.types.Portfolio.equity` correctly raised ``KeyError``
+        for a symbol the run never asked for. The fix is here, not there: the
+        position should never have reconciled into this venue's portfolio in the
+        first place.
+
+        Filtered on the position's own ``asset_class`` (via
+        :func:`is_crypto_asset_class`, the same reader :meth:`_position_symbol`
+        already uses for canonicalization) against this client's ``asset_class``
+        -- a positive match on *this* venue, not merely "not obviously the other
+        one", so a future third asset class cannot leak into either client by
+        accident.
+
+        On the equity venue the symbol itself is otherwise exactly what it always
+        was. On crypto it is not cosmetic: Alpaca echoes ``BTC/USD`` on the order
+        and ``BTCUSD`` on the position it creates, and the concatenated key would
+        make the holding invisible to sizing and the guardrails. See
+        :func:`canonical_crypto_symbol` for that measurement and consequence.
         """
         positions = _require_model(self._trading.get_all_positions(), "get_all_positions")
+        want_crypto = self._asset_class == ASSET_CLASS_CRYPTO
         return [
             PositionSnapshot(
                 symbol=self._position_symbol(position),
@@ -1286,6 +1349,7 @@ class RealAlpacaClient:
                 avg_price=_require_float(position.avg_entry_price, "Position.avg_entry_price"),
             )
             for position in positions
+            if is_crypto_asset_class(getattr(position, "asset_class", "")) == want_crypto
         ]
 
     def _position_symbol(self, position: Any) -> str:  # pragma: no cover - SDK only
