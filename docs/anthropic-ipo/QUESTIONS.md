@@ -3,6 +3,11 @@
 ## Open forks
 None. Round 1 closed.
 
+## Owner to-dos
+
+- [ ] **Q12:** confirm whether a funded LIVE broker account exists with options Level 3 (spreads). The repo's Alpaca keys are paper-only (verified 2026-11-12: they authenticate on the paper endpoint, are rejected by live; paper account is options level 3 on simulated money). Check the broker dashboard's Live/Paper switch, the account's options level, and jurisdiction. If no live account, opening/approving/funding may not finish before ANT options list; paper-rehearse the multi-leg order meanwhile.
+- [ ] Verify the comp-set offer prices against prospectuses (Q10).
+
 ## Register
 
 | ID | Question | Status | Answer or default | Landed |
@@ -18,7 +23,7 @@ None. Round 1 closed.
 | Q9 | Spread/exit numbers | ASSUMED | 20% wide, 40% debit cap, 60% TP, day 22 | PLAN rules |
 | Q10 | Comp offer prices | ASSUMED | Unverified vs prospectus | ADR-0077 |
 | Q11 | IV for illustration | ASSUMED | 100%, guess | ADR-0077 |
-| Q12 | Broker, options approval, jurisdiction | FORK | Candidate: Alpaca (the bench's broker, paper only so far). Docs say a put spread is a Level 3 multi-leg (`order_class: mleg`) order, available in paper and the API. UNKNOWN: whether the owner has a funded live Alpaca account and Level 3 approval, and their jurisdiction | PLAN S4 |
+| Q12 | Broker, options approval, jurisdiction | TODO (owner) | Candidate: Alpaca (the bench's broker, paper only so far). Docs say a put spread is a Level 3 multi-leg (`order_class: mleg`) order, available in paper and the API. UNKNOWN: whether the owner has a funded live Alpaca account and Level 3 approval, and their jurisdiction | PLAN S4 |
 | Q13 | Bench support for options | DEFERRED | Out of scope (ADR-0011) | PLAN |
 
 ## Coverage
