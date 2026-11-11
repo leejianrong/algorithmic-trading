@@ -606,7 +606,7 @@ def _run_combo(
     unusable, which is why this does not swallow it here.
     """
     broker = SimulatedBroker(Portfolio(cash=cash), costs)
-    engine = Engine(adapter, broker, Guardrails(risk))
+    engine = Engine(adapter, broker, Guardrails(risk, periods_per_year=periods_per_year))
     result = engine.run(_build_strategy(strategy, combo), tickers, start, end)
     return (
         compute(result, periods_per_year),

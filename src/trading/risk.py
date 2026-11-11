@@ -57,26 +57,18 @@ from trading.sizing import SHARE_PRECISION
 from trading.types import SHARE_EPS, Order, Portfolio, Side
 
 # Volatility-target tuning (ADR-0015). The window is the lookback (in bars) over
-# which realized volatility is estimated; TRADING_DAYS annualizes the per-bar
-# standard deviation (same 252 basis as the Sharpe metric, Q17). The floor keeps a
+# which realized volatility is estimated; the per-bar standard deviation is
+# annualized by the run's ``periods_per_year`` (same basis as the Sharpe metric). The floor keeps a
 # near-flat book from dividing by ~zero and demanding infinite leverage, and the
 # max scale caps how far the cap can be levered up when realized vol is very low.
 #
-# Both constants are equity-calendar assumptions, and both are counts of bars rather
-# than durations — the mistake ADR-0049 named for the live silence tolerance, sitting
-# here too. On a market that never closes there are ~365 daily bars a year, not 252,
-# so _TRADING_DAYS understates realized volatility by sqrt(252/365) = 0.8309 and
-# therefore overstates the ``target / realized`` scale by sqrt(365/252) = 1.2035 —
-# a volatility-targeted 24/7 book would be allowed **20.4% more gross** than it asked
-# for. Nothing is mis-annualized today: ``target_volatility`` is off by default and
-# both market postures (ADR-0055) leave it off, so this is a latent seam, not a live
-# bug. It is deliberately NOT fixed here — the periods-per-year of a market is the
-# market calendar's to state (KAN-687/KAN-705), and guessing it a second time inside
-# the guardrails is how two answers to one question get out of step. The same applies
-# to _VOL_WINDOW: 20 bars is four weeks of an equity calendar and 20 days of a 24/7
-# one. When the calendar lands, these two read from it.
+# _VOL_WINDOW is still a count of bars, not a duration (20 bars is four weeks of an
+# equity calendar, 20 days of a 24/7 one) -- left as is. The annualization basis is
+# NOT a constant: it is the market's ``periods_per_year`` (ADR-0054), passed to
+# ``Guardrails`` by whoever built the run (ADR-0078). 252.0 is only the default, so
+# a caller that states no market gets the historical US-equity daily year.
 _VOL_WINDOW = 20
-_TRADING_DAYS = 252
+DEFAULT_PERIODS_PER_YEAR = 252.0
 _VOL_FLOOR = 1e-6
 _MAX_VOL_SCALE = 3.0
 
@@ -96,8 +88,16 @@ class Guardrails:
     turns the transitions into the timestamped episodes on ``BacktestResult``.
     """
 
-    def __init__(self, config: RiskConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: RiskConfig | None = None,
+        *,
+        periods_per_year: float = DEFAULT_PERIODS_PER_YEAR,
+    ) -> None:
+        if periods_per_year <= 0:
+            raise ValueError(f"periods_per_year must be positive, got {periods_per_year}")
         self._config = config or RiskConfig()
+        self._periods_per_year = periods_per_year
         self._peak: float | None = None
         self._prev_equity: float | None = None
         self._halted = False
@@ -436,7 +436,8 @@ class Guardrails:
 
         Returns ``1.0`` (a no-op) when targeting is off or fewer than two returns
         are in the window. Otherwise estimates realized volatility as the sample
-        standard deviation of the windowed returns annualized by ``√252``, and
+        standard deviation of the windowed returns annualized by
+        ``√periods_per_year`` (ADR-0078), and
         returns ``target_vol / max(realized_vol, floor)`` clamped to
         ``[0, _MAX_VOL_SCALE]`` so a calm book earns more gross and a turbulent one
         less, without ever demanding unbounded leverage.
@@ -447,7 +448,7 @@ class Guardrails:
         n = len(self._returns)
         mean = sum(self._returns) / n
         variance = sum((r - mean) ** 2 for r in self._returns) / (n - 1)
-        realized_vol = sqrt(variance) * sqrt(_TRADING_DAYS)
+        realized_vol = sqrt(variance) * sqrt(self._periods_per_year)
         scale = target / max(realized_vol, _VOL_FLOOR)
         return min(scale, _MAX_VOL_SCALE)
 

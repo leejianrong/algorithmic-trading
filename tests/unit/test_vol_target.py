@@ -14,6 +14,9 @@ and the accepted quantity compared with and without the target.
 from __future__ import annotations
 
 from collections.abc import Sequence
+from math import sqrt
+
+import pytest
 
 from trading.config import RiskConfig
 from trading.risk import Guardrails
@@ -113,3 +116,37 @@ class TestOffByDefault:
         assert guard.vol_scale == 1.0
         guard.halted(_portfolio(1000.0), {})  # two returns: scaling engages
         assert guard.vol_scale < 1.0
+
+
+class TestAnnualizationBasis:
+    """Realized-vol annualization comes from the market's year, not 252 (ADR-0078)."""
+
+    @staticmethod
+    def _scale(periods_per_year: float | None) -> float:
+        cfg = RiskConfig(
+            target_volatility=0.10,
+            max_gross_exposure=1.0,
+            max_position_pct=1.0,
+            max_drawdown_pct=1.0,
+        )
+        guard = (
+            Guardrails(cfg)
+            if periods_per_year is None
+            else Guardrails(cfg, periods_per_year=periods_per_year)
+        )
+        _feed(guard, [1000.0, 1010.0, 1005.0, 1020.0, 1012.0, 1030.0])
+        return guard.vol_scale
+
+    def test_default_basis_is_the_equity_daily_year(self) -> None:
+        assert self._scale(None) == self._scale(252.0)
+
+    def test_continuous_market_gets_the_smaller_scale_by_sqrt_ratio(self) -> None:
+        # A larger year annualizes the same per-bar stdev to a LARGER realized vol,
+        # so target/realized shrinks by exactly sqrt(252/365).
+        equity, crypto = self._scale(252.0), self._scale(365.0)
+        assert crypto < equity
+        assert crypto / equity == pytest.approx(sqrt(252 / 365))
+
+    def test_rejects_nonpositive_basis(self) -> None:
+        with pytest.raises(ValueError, match="periods_per_year"):
+            Guardrails(RiskConfig(), periods_per_year=0.0)

@@ -589,3 +589,50 @@ class TestSignificanceCli:
         assert result.exit_code == 0, result.output
         assert "Trades:" in result.output
         assert "Trades/param:" not in result.output
+
+
+def _spy_guardrail_basis(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Record the ``periods_per_year`` every CLI-built main Guardrails receives."""
+    import trading.cli as cli_mod
+    import trading.sweep as sweep_mod
+
+    seen: list[float] = []
+    from trading.risk import Guardrails as real
+
+    def spy(config: object, *args: object, **kwargs: object) -> object:
+        # The unconstrained benchmark guard carries no target; ignore it.
+        if getattr(config, "target_volatility", None) is not None:
+            seen.append(float(kwargs.get("periods_per_year", 252.0)))  # type: ignore[arg-type]
+        return real(config, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(cli_mod, "Guardrails", spy, raising=True)
+    monkeypatch.setattr(sweep_mod, "Guardrails", spy)
+    return seen
+
+
+@pytest.mark.parametrize(
+    ("extra", "expected"),
+    [
+        ([], 252.0),
+        (["--market", "crypto"], 365.0),
+        (["--market", "crypto", "--interval", "1h"], 365.0 * 24),
+    ],
+)
+@pytest.mark.parametrize("command", ["backtest", "sweep", "paper"])
+def test_target_vol_basis_follows_the_market(
+    command: str,
+    extra: list[str],
+    expected: float,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _spy_guardrail_basis(monkeypatch)
+    args = [command, "--strategy", "sma_crossover", "--source", "synthetic", "--target-vol", "0.1"]
+    args += ["--out", str(tmp_path / "o"), *_COMMON, *extra]
+    if command == "sweep":
+        args += ["--param", "fast=5,10"]
+    if command == "paper":
+        args += ["--once"]
+    result = runner.invoke(app, args)
+    assert result.exit_code == 0, result.output
+    assert seen and set(seen) == {expected}
