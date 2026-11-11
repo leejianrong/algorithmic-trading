@@ -28,6 +28,7 @@ Two design choices from the ADRs and the dev-playbook:
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
 from datetime import datetime
 from pathlib import Path
@@ -48,6 +49,23 @@ class ProviderRefusedError(RuntimeError):
     ADR-0040's reason for keeping them honest). "Yahoo said no" and "AAPL had not
     listed yet" must never render as the same sentence.
     """
+
+
+_SHARE_CLASS_DOT = re.compile(r"^([A-Z]{1,5})\.([ABC])$")
+
+
+def to_yahoo_symbol(symbol: str) -> str:
+    """Spell a US share-class ticker the way yfinance does (``BRK.B`` -> ``BRK-B``).
+
+    The S&P 500 membership fixture (ADR-0064) uses the dot convention; yfinance
+    404s on it, which read as historical absence (ADR-0080). Deliberately narrow:
+    only 1-5 capitals, a dot, and a single class letter A/B/C. Exchange suffixes
+    such as ``VOD.L`` or ``0700.HK`` and anything else pass through untouched.
+    Applied only at the network boundary: cache keys, ``Bar.symbol`` and absence
+    reports keep the name the user typed.
+    """
+    m = _SHARE_CLASS_DOT.match(symbol)
+    return f"{m.group(1)}-{m.group(2)}" if m else symbol
 
 
 def cache_filename(symbol: str, start: datetime, end: datetime) -> str:
@@ -170,7 +188,7 @@ class YFinanceAdapter:
 
         path = self._cache_path(symbol, start, end)
         if not path.exists():
-            df = self._fetch(symbol, start, end)
+            df = self._fetch(to_yahoo_symbol(symbol), start, end)
             self._write_cache(df, path)
 
         return self._to_bars(symbol, self._read_cache(path))

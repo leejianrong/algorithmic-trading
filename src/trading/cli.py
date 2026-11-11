@@ -1661,19 +1661,34 @@ def gen_data(
     symbols: str = typer.Option(..., "--symbols", help="Comma-separated tickers to generate."),
     from_: str = typer.Option(..., "--from", help="Start date, YYYY-MM-DD."),
     to: str = typer.Option(..., "--to", help="End date, YYYY-MM-DD."),
+    market: str = typer.Option(DEFAULT_MARKET, "--market", help=MARKET_OPTION_HELP),
     seed: int = typer.Option(0, "--seed", help="RNG seed (same seed → same data)."),
     out_dir: Path = typer.Option(Path(".cache/data"), "--out-dir", help="Where to write CSVs."),
 ) -> None:
     """Write deterministic synthetic daily bars to CSV, one file per symbol.
 
     Files use the same naming and columns as the yfinance cache, so a subsequent
-    `backtest --source yfinance --cache-dir <out-dir>` reads them offline.
+    `backtest --source yfinance --cache-dir <out-dir>` reads them offline. With
+    `--market crypto` every calendar day gets a bar, weekends included (ADR-0056).
     """
     start = _parse_date("--from", from_)
     end = _parse_date("--to", to)
     tickers = _parse_symbols(symbols, as_of=start)
+    chosen_market = _resolve_market(market)
+    _check_symbol_shapes(chosen_market, tickers)
+    # The file name is built from the symbol, so a pair such as BTC/USD would be
+    # written into a subdirectory that does not exist (and `--source csv` could not
+    # find it again either). Refuse before touching the disk.
+    for symbol in tickers:
+        if any(sep in symbol for sep in ("/", "\\")):
+            typer.echo(
+                f"error: symbol {symbol!r} contains a path separator and cannot be a "
+                "file name; use a bare symbol such as BTC.",
+                err=True,
+            )
+            raise typer.Exit(2)
 
-    adapter = SyntheticAdapter(seed=seed)
+    adapter = SyntheticAdapter(seed=seed, frequency=_parse_frequency("1d", chosen_market.calendar))
     out_dir.mkdir(parents=True, exist_ok=True)
     for symbol in tickers:
         bars = adapter.get_bars(symbol, start, end)
