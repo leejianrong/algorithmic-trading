@@ -172,6 +172,10 @@ from trading.engine import (
     DEFAULT_PAPER_LOOKBACK,
     LIVE_SILENCE_TOLERANCE,
     MIN_LIVE_EMPTY_POLLS,
+    STOP_INTERRUPTED,
+    STOP_REPLAY_COMPLETE,
+    STOP_SILENCE_TOLERANCE,
+    STOP_TERMINATED,
     BacktestResult,
     BarOutcome,
     EmptyUniverseError,
@@ -2217,6 +2221,10 @@ def paper(
             try:
                 result = session.run(reporter=reporter, on_warmup=announce_warmup, **run_kwargs)
                 announce_warmup()
+                # A --once replay drains its range and meets one quiet poll by
+                # design: that is completion, not silence (ADR-0083).
+                if not live and session.stop and session.stop.reason == STOP_SILENCE_TOLERANCE:
+                    session.record_stop(STOP_REPLAY_COMPLETE, "replay range exhausted")
             except KeyboardInterrupt as exc:
                 announce_warmup()
                 # A --live session has no natural exit: Ctrl-C *is* how it ends.
@@ -2231,6 +2239,10 @@ def paper(
                     f"{termination.trigger} received"
                     if isinstance(exc, SessionTerminated)
                     else "Interrupted"
+                )
+                session.record_stop(
+                    STOP_TERMINATED if isinstance(exc, SessionTerminated) else STOP_INTERRUPTED,
+                    trigger,
                 )
                 logger.warning("%s — finalizing the session", trigger)
                 typer.echo(f"\n{trigger} — finalizing with the bars processed so far.")
@@ -2282,6 +2294,7 @@ def paper(
             market=chosen_market.name,
             metrics=metrics,
             significance=significance,
+            stop=(session.stop.reason, session.stop.detail) if session.stop else None,
         )
 
         # Appended whether or not --bootstrap ran: the ledger's own bookkeeping is
@@ -2331,11 +2344,17 @@ def paper(
             artifacts.append(f"Fill divergence: {divergence_csv}")
 
         typer.echo(f"\nProcessed {len(session.session_log)} completed bar(s).")
+        stop_line = (
+            f"Stopped: {session.stop.reason} ({session.stop.detail})" if session.stop else ""
+        )
+        if stop_line:
+            typer.echo(stop_line)
         typer.echo("\n".join(artifacts))
         logger.info(
-            "paper session finished: %d completed bar(s) processed, artifacts written to %s",
+            "paper session finished: %d completed bar(s) processed, artifacts written to %s; %s",
             len(session.session_log),
             out,
+            stop_line,
         )
 
 

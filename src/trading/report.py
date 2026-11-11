@@ -871,6 +871,7 @@ def result_to_dict(
     diversified_baseline: DiversifiedBaselineReport | None = None,
     baseline_paired: PairedBootstrap | None = None,
     strategy_params: Mapping[str, object] | None = None,
+    stop: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
 
@@ -1193,6 +1194,10 @@ def result_to_dict(
     # write the exact bytes it always has.
     if strategy_params:
         payload["strategy_params"] = dict(strategy_params)
+    # Paper sessions only (ADR-0083): why the loop ended. Omitted entirely when
+    # absent, so a backtest's bytes never move.
+    if stop is not None:
+        payload["stop"] = {"reason": stop[0], "detail": stop[1]}
     return payload
 
 
@@ -1214,6 +1219,7 @@ def write_result_json(
     diversified_baseline: DiversifiedBaselineReport | None = None,
     baseline_paired: PairedBootstrap | None = None,
     strategy_params: Mapping[str, object] | None = None,
+    stop: tuple[str, str] | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
 
@@ -1236,6 +1242,7 @@ def write_result_json(
         diversified_baseline=diversified_baseline,
         baseline_paired=baseline_paired,
         strategy_params=strategy_params,
+        stop=stop,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:

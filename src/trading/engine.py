@@ -630,6 +630,27 @@ def prime_history(state: _RunState, feed: Feed) -> None:
             state.last_close[symbol] = bar.close
 
 
+STOP_SILENCE_TOLERANCE = "silence_tolerance"
+STOP_BAR_LIMIT = "bar_limit"
+STOP_POLL_LIMIT = "poll_limit"
+STOP_REPLAY_COMPLETE = "replay_complete"
+STOP_INTERRUPTED = "interrupted"
+STOP_TERMINATED = "terminated"
+
+
+@dataclass(frozen=True)
+class SessionStop:
+    """Why a paper session ended, in one value (ADR-0083).
+
+    ``reason`` is one of the ``STOP_*`` codes; ``detail`` is a human sentence
+    carrying the numbers (polls, duration) that make it checkable. Recorded, never
+    acted on: nothing in the loop reads it, so it cannot change when a session stops.
+    """
+
+    reason: str
+    detail: str
+
+
 class PaperSession:
     """Drives the shared per-bar step over a completed-bar feed on a clock (ADR-0014).
 
@@ -697,6 +718,8 @@ class PaperSession:
         self._warmup_pending = warmup
         self._warmup_span: tuple[datetime, datetime] | None = None
         self._warmup_bars = 0
+        # Why the session ended; None until it has (ADR-0083).
+        self.stop: SessionStop | None = None
 
     @property
     def state(self) -> _RunState:
@@ -761,6 +784,18 @@ class PaperSession:
         """
         return self._engine._finalize(self._symbols, self._state)
 
+    def record_stop(self, reason: str, detail: str) -> None:
+        """Record why the session ended. ``run`` does it at its own exits; the CLI
+        calls it for the ones ``run`` cannot see (a signal raises out of the loop)."""
+        self.stop = SessionStop(reason, detail)
+
+    def _silent(self, empty_polls: int) -> None:
+        self.record_stop(
+            STOP_SILENCE_TOLERANCE,
+            f"{empty_polls} consecutive poll(s) with no new bar, "
+            f"polling every {self._poll_interval}",
+        )
+
     def _absorb_warmup(self, fresh: Feed) -> None:
         """Take ``fresh`` as the session's opening history and close the boundary.
 
@@ -812,6 +847,7 @@ class PaperSession:
                     # quiet poll it is.
                     empty_polls += 1
                     if empty_polls >= max_empty_polls:
+                        self._silent(empty_polls)
                         break
                     self._clock.sleep_until(self._next_due())
                     continue
@@ -832,6 +868,7 @@ class PaperSession:
                 if call_reporter is not None:
                     call_reporter(outcome)
                 if max_new_bars is not None and len(self.session_log) >= max_new_bars:
+                    self.record_stop(STOP_BAR_LIMIT, f"{max_new_bars} bar(s) processed")
                     return self.finalize()
 
             if fresh:
@@ -839,8 +876,10 @@ class PaperSession:
             else:
                 empty_polls += 1
                 if empty_polls >= max_empty_polls:
+                    self._silent(empty_polls)
                     break
-
             self._clock.sleep_until(self._next_due())
 
+        if self.stop is None:
+            self.record_stop(STOP_POLL_LIMIT, f"{max_polls} poll(s) made")
         return self.finalize()
