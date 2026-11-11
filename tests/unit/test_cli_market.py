@@ -594,9 +594,9 @@ class TestTheRiskPostureSeam:
     ) -> RiskConfig:
         captured: list[RiskConfig] = []
 
-        def spy(config: RiskConfig) -> Guardrails:
+        def spy(config: RiskConfig, **kwargs: float) -> Guardrails:
             captured.append(config)
-            return Guardrails(config)
+            return Guardrails(config, **kwargs)
 
         monkeypatch.setattr("trading.cli.Guardrails", spy)
         result = run(*extra)
@@ -659,9 +659,9 @@ class TestPrecedenceOfFlagsOverThePreset:
     def _config(self, monkeypatch: pytest.MonkeyPatch, tmp_path: Path, *extra: str) -> RiskConfig:
         captured: list[RiskConfig] = []
 
-        def spy(config: RiskConfig) -> Guardrails:
+        def spy(config: RiskConfig, **kwargs: float) -> Guardrails:
             captured.append(config)
-            return Guardrails(config)
+            return Guardrails(config, **kwargs)
 
         monkeypatch.setattr("trading.cli.Guardrails", spy)
         result = _backtest(tmp_path / "e.csv", *extra)
