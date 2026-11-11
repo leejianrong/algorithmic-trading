@@ -27,6 +27,11 @@ class Momentum:
         self.weight = weight
         self._long: dict[str, bool] = {}
 
+    @property
+    def min_history_bars(self) -> int:
+        """Bars of history needed before this strategy can emit a signal (KAN-702)."""
+        return self.lookback + 1
+
     def on_bar(
         self,
         ts: datetime,

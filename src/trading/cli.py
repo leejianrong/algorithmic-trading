@@ -221,7 +221,12 @@ from trading.report import (
     write_result_json,
 )
 from trading.risk import Guardrails
-from trading.strategies import STRATEGIES, free_parameter_count, get_strategy
+from trading.strategies import (
+    STRATEGIES,
+    free_parameter_count,
+    get_strategy,
+    required_history_bars,
+)
 from trading.sweep import (
     CostSensitivitySummary,
     EdgeDeath,
@@ -870,6 +875,29 @@ def _format_span(span: timedelta) -> str:
             value = seconds / size
             return f"{value:g} {unit}" + ("" if value == 1.0 else "s")
     return f"{seconds:g} seconds"
+
+
+def _warmup_shortfall_line(
+    strategy: Strategy, primed: int, interval: timedelta, label: str
+) -> str | None:
+    """One loud line when the primed history is too short for the strategy (KAN-702).
+
+    Warns only; never blocks. ``None`` when the strategy declares no need, or when
+    the first live bar (which joins the primed history) already completes its
+    lookback. The wait is a lower bound: it counts bars, not weekends or halts.
+    """
+    needed = required_history_bars(strategy)
+    if needed is None:
+        return None
+    live_bars = needed - primed  # live bar k sees primed + k bars
+    if live_bars <= 1:
+        return None
+    return (
+        f"WARNING: primed {primed} bar(s) but the strategy needs {needed} "
+        f"({needed - primed} short): it cannot act until live bar {live_bars}, "
+        f"at least {_format_span(live_bars * interval)} of {label} bars away; "
+        "it will sit flat until then (KAN-702)."
+    )
 
 
 def _make_adapter(
@@ -2191,6 +2219,12 @@ def paper(
                 log_fh.write(line + "\n")
                 log_fh.flush()
                 logger.info("%s", line)
+                short = _warmup_shortfall_line(strat, session.warmup_bars, freq.delta, freq.label)
+                if short:
+                    typer.echo(short + "\n")
+                    log_fh.write(short + "\n")
+                    log_fh.flush()
+                    logger.warning("%s", short)
 
             def reporter(outcome: BarOutcome) -> None:
                 announce_warmup()
