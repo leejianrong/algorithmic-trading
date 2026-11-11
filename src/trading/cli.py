@@ -219,12 +219,12 @@ from trading.report import (
 from trading.risk import Guardrails
 from trading.strategies import STRATEGIES, free_parameter_count, get_strategy
 from trading.sweep import (
-    _build_strategy,
     CostSensitivitySummary,
     EdgeDeath,
     NeighborStability,
     SweepSummary,
     WalkForwardSummary,
+    _build_strategy,
     combo_key,
     run_cost_sensitivity_sweep,
     run_sweep,
