@@ -6,17 +6,25 @@ bars two ways — `backtest` over history and `paper` on recent data — with th
 same execution, sizing, costs, and risk limits in both, so a backtest result is
 one you can carry toward real capital.
 
-> Status: **the MVP is built and green.** The engine, simulated broker, sizing,
-> enforced risk guardrails, six strategies, metrics, paper mode, a parameter
-> sweep, an Alpaca paper-trading path, intraday bars, and a web dashboard all
-> ship and are tested. The fast gate runs offline in seconds.
+```mermaid
+flowchart LR
+  D[Data adapter<br/>yfinance / synthetic / csv / alpaca] --> E
+  S[Strategy] --> E[Engine._step<br/>sizing · guardrails · costs]
+  E --> B[Broker<br/>simulated or Alpaca paper]
+  E --> R[Report<br/>metrics · result.json · dashboard]
+```
+
+> **Status:** built and green — backtest, paper (offline replay and live on
+> Alpaca), seven strategies, enforced risk guardrails, parameter sweep and
+> walk-forward validation, intraday bars, a 24/7 crypto market mode, and a web
+> dashboard. The fast gate runs offline in seconds.
 >
-> Not built: tick frequency, non-equity asset classes, and a
-> survivorship-bias-free historical universe (see
-> [`docs/adr/0027-survivorship-bias.md`](docs/adr/0027-survivorship-bias.md)).
-> `alpaca-py` is deliberately not in the lockfile — install it separately for
-> real paper trading. [`CLAUDE.md`](CLAUDE.md) carries the honest, detailed build
-> status; when it disagrees with the code, the code wins.
+> **Not real-money.** The Alpaca path targets the paper endpoint. Known limits are
+> written down, notably survivorship bias in curated universes
+> ([ADR-0027](docs/adr/0027-survivorship-bias.md)). No candidate strategy has
+> qualified to trade real capital yet. Detailed history:
+> [`docs/build-history.md`](docs/build-history.md); when docs disagree with the
+> code, the code wins.
 
 ## Quickstart
 
@@ -50,13 +58,14 @@ split/dividend-adjusted data once you have network access.
 | `trading gen-data` | Write deterministic synthetic OHLCV bars to CSV |
 
 **Strategies:** `buy_and_hold` (correctness baseline), `sma_crossover`,
-`equal_weight`, `momentum`, `mean_reversion`, `cross_sectional`.
+`equal_weight`, `momentum`, `mean_reversion`, `cross_sectional`,
+`trend_following`.
 
 **Data sources:** `yfinance` (cached, adjusted), `synthetic` (offline,
-deterministic), `csv` (bring your own), `alpaca` (real bars, daily or intraday).
+deterministic), `csv` (bring your own), `alpaca` (real bars, daily or intraday; crypto with `--market crypto`).
 
-**Optional extras:** `plot` (matplotlib PNG), `dashboard` (FastAPI server) —
-`uv sync --extra dashboard`.
+**Optional extras:** `plot` (matplotlib PNG), `dashboard` (FastAPI server),
+`alpaca` (live paper trading) — e.g. `uv sync --extra dashboard`.
 
 ## What this bench refuses to do
 
@@ -80,21 +89,16 @@ over flattering ones:
 
 ## Docs
 
-- [`PLAN.md`](PLAN.md) — problem, scope, requirements, and the shape of the build.
-- [`SLICES.md`](SLICES.md) — vertical, demoable slices, riskiest first.
+- [`docs/research-playbook.md`](docs/research-playbook.md) — the hypothesis-to-paper-trading loop.
 - [`docs/adr/`](docs/adr/) — one architectural decision per file.
-- [`QUESTIONS.md`](QUESTIONS.md) — the decision register.
-- [`CLAUDE.md`](CLAUDE.md) — agent/developer brief: build status, commands,
-  conventions, and domain invariants.
+- [`docs/build-history.md`](docs/build-history.md) — dated log of what was built and measured.
+- [`PLAN.md`](PLAN.md), [`SLICES.md`](SLICES.md), [`QUESTIONS.md`](QUESTIONS.md) — scope, slices, decision register.
+- [`CLAUDE.md`](CLAUDE.md) — the brief for coding agents.
 
-## Development
+## Contributing
 
-```bash
-make check             # fast gate: lint + type-check + no-infra tests
-make test-integration  # integration layer (needs network / yfinance)
-make audit             # dependency vulnerability scan
-make ci-local          # everything CI runs, locally
-```
+See [`CONTRIBUTING.md`](CONTRIBUTING.md) for setup, the quality gates and workflow.
 
-Branch per slice off fresh `main`, PR only. The pre-push hook runs the fast gate;
-bypass a single push with `git push --no-verify` and a scoped reason.
+## License
+
+See [`LICENSE`](LICENSE) (Apache License 2.0).
