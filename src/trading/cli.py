@@ -124,6 +124,7 @@ from __future__ import annotations
 
 import contextlib
 import csv
+import inspect
 import json
 import logging
 import os
@@ -179,7 +180,7 @@ from trading.engine import (
     silence_tolerance_polls,
 )
 from trading.frequency import DAILY, Frequency
-from trading.interfaces import Broker, DataAdapter
+from trading.interfaces import Broker, DataAdapter, Strategy
 from trading.ledger import TrialLedger, TrialRecord
 from trading.liquidity import (
     DEFAULT_FORMATION_DAYS,
@@ -216,8 +217,9 @@ from trading.report import (
     write_result_json,
 )
 from trading.risk import Guardrails
-from trading.strategies import free_parameter_count, get_strategy
+from trading.strategies import STRATEGIES, free_parameter_count, get_strategy
 from trading.sweep import (
+    _build_strategy,
     CostSensitivitySummary,
     EdgeDeath,
     NeighborStability,
@@ -1410,6 +1412,16 @@ def backtest(
         "--hypothesis",
         help=HYPOTHESIS_HELP,
     ),
+    param: list[str] = typer.Option(
+        [],
+        "--param",
+        "-p",
+        help=(
+            "Repeatable strategy constructor override: name=value (e.g. fast=5). One "
+            "value per name, parsed exactly as `sweep --param`, so a confirm run can "
+            "use a sweep winner's parameters. Unset names keep the shipped defaults."
+        ),
+    ),
     plot: bool = typer.Option(
         False, "--plot/--no-plot", help="Also write an equity_curve.png next to the CSV."
     ),
@@ -1428,11 +1440,7 @@ def backtest(
     _check_cost_budget_options(cost_budget_pct)
     _check_tape_density_options(min_tape_density, chosen_market)
 
-    try:
-        strat = get_strategy(strategy)
-    except KeyError as exc:
-        typer.echo(f"error: {exc}", err=True)
-        raise typer.Exit(2) from exc
+    strat, strat_params = _build_strategy_from_params(strategy, param)
 
     try:
         risk = _build_risk(
@@ -1598,6 +1606,7 @@ def backtest(
             monte_carlo=monte_carlo_report,
             cost_budget=cost_budget_report,
             diversified_baseline=diversified_baseline_report,
+            strategy_params=strat_params,
         )
     )
     write_equity_csv(result, out, bench_result)
@@ -1646,6 +1655,7 @@ def backtest(
         monte_carlo=monte_carlo_report,
         cost_budget=cost_budget_report,
         diversified_baseline=diversified_baseline_report,
+        strategy_params=strat_params,
     )
     typer.echo(f"Wrote result JSON to {result_json}")
     if plot:
@@ -2336,6 +2346,64 @@ def _parse_grid(params: list[str]) -> dict[str, list[object]]:
             raise typer.Exit(2)
         grid[name] = values
     return grid
+
+
+def _build_strategy_from_params(
+    strategy: str, specs: list[str]
+) -> tuple[Strategy, dict[str, object]]:
+    """Instantiate ``strategy`` with single-valued ``--param name=value`` overrides.
+
+    The same parse + coercion as ``sweep`` (:func:`_parse_grid`) and the same
+    constructor path (:func:`trading.sweep._build_strategy`), so a confirm run of a
+    sweep's winner builds the strategy exactly as the sweep did. Every failure exits
+    2 *before* any data is fetched: a malformed spec, a name the strategy does not
+    take (the valid names are listed), a grid of several values (that is a sweep),
+    or a value the constructor rejects (a backtest has no "skip this combo"
+    path as a sweep does). With no specs this is ``get_strategy(strategy)``.
+    """
+    if not specs:
+        try:
+            return get_strategy(strategy), {}
+        except KeyError as exc:
+            typer.echo(f"error: {exc}", err=True)
+            raise typer.Exit(2) from exc
+    grid = _parse_grid(specs)
+    multi = [name for name, values in grid.items() if len(values) != 1]
+    if multi:
+        typer.echo(
+            f"error: backtest --param takes a single value per name; {', '.join(multi)} "
+            "has several (use `trading sweep` to search a grid)",
+            err=True,
+        )
+        raise typer.Exit(2)
+    params = {name: values[0] for name, values in grid.items()}
+    try:
+        factory = STRATEGIES[strategy]
+    except KeyError:
+        typer.echo(
+            f"error: unknown strategy {strategy!r}; known strategies: "
+            f"{', '.join(sorted(STRATEGIES))}",
+            err=True,
+        )
+        raise typer.Exit(2) from None
+    valid = [
+        n
+        for n, p in inspect.signature(factory).parameters.items()
+        if p.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
+    ]
+    unknown = [name for name in params if name not in valid]
+    if unknown:
+        typer.echo(
+            f"error: strategy {strategy!r} has no parameter {', '.join(map(repr, unknown))}; "
+            f"valid names: {', '.join(valid) or '(none)'}",
+            err=True,
+        )
+        raise typer.Exit(2)
+    try:
+        return _build_strategy(strategy, params), params
+    except (ValueError, TypeError) as exc:
+        typer.echo(f"error: invalid --param for {strategy!r}: {exc}", err=True)
+        raise typer.Exit(2) from exc
 
 
 def _parse_bps_grid(raw: str) -> list[float]:
