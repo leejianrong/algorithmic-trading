@@ -1480,7 +1480,9 @@ def backtest(
             symbol_slippage_bps=tiered_rates,
         )
     broker = SimulatedBroker(Portfolio(cash=cash), costs)
-    result = Engine(adapter, broker, Guardrails(risk)).run(strat, tickers, start, end)
+    result = Engine(adapter, broker, Guardrails(risk, periods_per_year=freq.periods_per_year)).run(
+        strat, tickers, start, end
+    )
 
     # Optional buy-and-hold benchmark on the same dates/source, run UNCONSTRAINED
     # (unlimited guardrails) so the benchmark itself is never clamped (Q24).
@@ -2069,7 +2071,9 @@ def paper(
             journal=DivergenceJournal(divergence_csv),
         )
         tracked_broker = shadow
-    engine = Engine(adapter, tracked_broker, Guardrails(risk))
+    engine = Engine(
+        adapter, tracked_broker, Guardrails(risk, periods_per_year=freq.periods_per_year)
+    )
 
     # Warmup is what separates the two modes' *first* poll (ADR-0042). A --live
     # session opens onto a window of bars that closed before it started: those are
