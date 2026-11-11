@@ -103,6 +103,7 @@ def summarize(
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
     diversified_baseline: DiversifiedBaselineReport | None = None,
+    baseline_paired: PairedBootstrap | None = None,
     strategy_params: Mapping[str, object] | None = None,
 ) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
@@ -210,7 +211,15 @@ def summarize(
         )
     if diversified_baseline is not None:
         lines.extend(
-            diversified_baseline_lines(diversified_baseline, metrics, len(result.equity_curve))
+            diversified_baseline_lines(
+                diversified_baseline,
+                metrics,
+                len(result.equity_curve),
+                paired=baseline_paired,
+                # ``--bootstrap`` is what asks for the paired figure; significance is
+                # only ever supplied then, so its presence is the request (ADR-0084).
+                paired_requested=significance is not None,
+            )
         )
     if significance is not None:
         lines.extend(significance_lines(significance))
@@ -377,6 +386,9 @@ def diversified_baseline_lines(
     baseline: DiversifiedBaselineReport,
     metrics: PerformanceMetrics,
     strategy_bars: int,
+    *,
+    paired: PairedBootstrap | None = None,
+    paired_requested: bool = False,
 ) -> list[str]:
     """The ADR-0071 diversified-baseline block: a second, harder bar to clear.
 
@@ -423,6 +435,34 @@ def diversified_baseline_lines(
             f"{baseline_metrics.avg_exposure * 100:.2f}% invested)",
         ]
     )
+    if paired is not None:
+        lines.extend(_baseline_paired_lines(paired))
+    elif paired_requested:
+        lines.append(
+            "  note: no paired win rate against the diversified baseline: the curves share "
+            f"fewer than {MIN_BOOTSTRAP_OBSERVATIONS} return periods"
+        )
+    return lines
+
+
+def _baseline_paired_lines(paired: PairedBootstrap) -> list[str]:
+    """The ADR-0039 paired win rate, against the diversified baseline (ADR-0084)."""
+    lines = [
+        f"Beats baseline: {paired.win_rate * 100:.1f}% of {paired.resamples} PAIRED resamples "
+        f"(strategy Sharpe > baseline Sharpe on the same blocks; "
+        f"observed edge {paired.observed_edge:+.2f} over {paired.observations} shared periods; "
+        f"{paired.block_length}-bar blocks, seed {paired.seed})"
+    ]
+    if paired.block_length_was_reduced:
+        lines.append(
+            f"  note: block length cut from {paired.requested_block_length} to "
+            f"{paired.block_length} bars — the shared span is too short to hold blocks that long"
+        )
+    if 0.05 < paired.win_rate < 0.95:
+        lines.append(
+            "  ⚠ the win rate is not decisive — this sample cannot distinguish the strategy "
+            "from the diversified baseline"
+        )
     return lines
 
 
@@ -829,6 +869,7 @@ def result_to_dict(
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
     diversified_baseline: DiversifiedBaselineReport | None = None,
+    baseline_paired: PairedBootstrap | None = None,
     strategy_params: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
@@ -1143,6 +1184,10 @@ def result_to_dict(
     # ``--diversified-baseline`` must write the exact bytes it always has.
     if diversified_baseline is not None:
         payload["diversified_baseline"] = asdict(diversified_baseline)
+        # The paired win rate against it (ADR-0084): nested, and omitted unless
+        # ``--bootstrap`` produced one, so the ADR-0071 block's bytes are unchanged.
+        if baseline_paired is not None:
+            payload["diversified_baseline"]["paired"] = asdict(baseline_paired)
     # Strategy parameters the operator overrode (``backtest --param``). Same
     # omitted-entirely convention as ``regimes``: a run on shipped defaults must
     # write the exact bytes it always has.
@@ -1167,6 +1212,7 @@ def write_result_json(
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
     diversified_baseline: DiversifiedBaselineReport | None = None,
+    baseline_paired: PairedBootstrap | None = None,
     strategy_params: Mapping[str, object] | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
@@ -1188,6 +1234,7 @@ def write_result_json(
         monte_carlo=monte_carlo,
         cost_budget=cost_budget,
         diversified_baseline=diversified_baseline,
+        baseline_paired=baseline_paired,
         strategy_params=strategy_params,
     )
     path.parent.mkdir(parents=True, exist_ok=True)

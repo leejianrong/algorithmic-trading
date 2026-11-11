@@ -200,12 +200,14 @@ from trading.metrics import (
     DEFAULT_BOOTSTRAP_SEED,
     CostBudgetReport,
     DiversifiedBaselineReport,
+    PairedBootstrap,
     SignificanceReport,
     assess_cost_budget,
     assess_diversified_baseline,
     assess_significance,
     compute_regime_report,
     monte_carlo_shuffle,
+    paired_bootstrap,
     trial_count_note,
 )
 from trading.metrics import compute as compute_metrics
@@ -1516,6 +1518,7 @@ def backtest(
     # --benchmark above, generalized to a strategy + symbol list rather than
     # buy_and_hold + one symbol.
     diversified_baseline_report: DiversifiedBaselineReport | None = None
+    baseline_run: BacktestResult | None = None
     if diversified_baseline:
         baseline_symbols = _parse_symbols(baseline_basket, as_of=start)
         _check_symbol_shapes(chosen_market, baseline_symbols)
@@ -1537,6 +1540,7 @@ def backtest(
             diversified_baseline_report = assess_diversified_baseline(
                 result, baseline_result, freq.periods_per_year, label=baseline_label
             )
+            baseline_run = baseline_result
 
     # Read BEFORE the significance is assembled, not after: the whole point of the
     # ledger (ADR-0062) is that this invocation's own trial count is widened by
@@ -1560,6 +1564,18 @@ def backtest(
         if bootstrap
         else None
     )
+
+    # ADR-0084: the paired win rate against the diversified baseline, same seed,
+    # resamples and block length as the benchmark's, one index sequence for both.
+    baseline_paired: PairedBootstrap | None = None
+    if bootstrap and baseline_run is not None:
+        baseline_paired = paired_bootstrap(
+            result.equity_curve,
+            baseline_run.equity_curve,
+            freq.periods_per_year,
+            resamples=bootstrap_resamples,
+            seed=bootstrap_seed,
+        )
 
     # The strategy's tunable-argument count turns on the trades-per-parameter
     # sample-size check and its warning (ADR-0029).
@@ -1617,6 +1633,7 @@ def backtest(
             monte_carlo=monte_carlo_report,
             cost_budget=cost_budget_report,
             diversified_baseline=diversified_baseline_report,
+            baseline_paired=baseline_paired,
             strategy_params=strat_params,
         )
     )
@@ -1666,6 +1683,7 @@ def backtest(
         monte_carlo=monte_carlo_report,
         cost_budget=cost_budget_report,
         diversified_baseline=diversified_baseline_report,
+        baseline_paired=baseline_paired,
         strategy_params=strat_params,
     )
     typer.echo(f"Wrote result JSON to {result_json}")
