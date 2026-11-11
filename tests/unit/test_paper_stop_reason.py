@@ -47,7 +47,7 @@ class _Flat:
         return []
 
 
-def _session(n_bars: int) -> PaperSession:
+def _session(n_bars: int, *, warmup: bool = False) -> PaperSession:
     first = datetime(2024, 1, 2, tzinfo=UTC)
     bars = [Bar("AAA", first + timedelta(days=i), 10, 10, 10, 10, 1) for i in range(n_bars)]
     adapter = FakeAdapter(bars)
@@ -55,7 +55,7 @@ def _session(n_bars: int) -> PaperSession:
     feed = RecentWindowFeed(adapter, clock, default_is_complete)
     broker = SimulatedBroker(Portfolio(cash=1_000.0), CostConfig(0.0, 0.0))
     engine = Engine(adapter, broker, Guardrails(RiskConfig()))
-    return PaperSession(engine, _Flat(), ["AAA"], feed, clock, warmup=False)
+    return PaperSession(engine, _Flat(), ["AAA"], feed, clock, warmup=warmup)
 
 
 class TestSessionRecordsWhyItStopped:
@@ -69,6 +69,15 @@ class TestSessionRecordsWhyItStopped:
         assert session.stop is not None
         assert session.stop.reason == STOP_SILENCE_TOLERANCE
         assert "3 consecutive poll(s)" in session.stop.detail
+
+    def test_silence_before_the_session_ever_opened(self) -> None:
+        """The warmup boundary has its own quiet-poll exit; it reports the same way."""
+        session = _session(0, warmup=True)
+        session.run(max_empty_polls=2)
+
+        assert session.stop is not None
+        assert session.stop.reason == STOP_SILENCE_TOLERANCE
+        assert "2 consecutive poll(s)" in session.stop.detail
 
     def test_bar_limit(self) -> None:
         session = _session(5)
