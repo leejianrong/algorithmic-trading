@@ -4,7 +4,7 @@ version = "0.0.0"
 description = "A test bench for backtesting, paper trading, and algorithmic trading strategies on US equities."
 readme = "README.md"
 requires-python = ">=3.13"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = [
     "numpy>=1.26",
     "pandas>=2.1",
