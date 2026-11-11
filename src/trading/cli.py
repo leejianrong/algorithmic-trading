@@ -323,6 +323,7 @@ class _TerminationGuard:
     def __init__(self) -> None:
         self.armed = True
         self.signals = 0
+        self.trigger = "SIGTERM"
 
     def handle(self, signum: int, frame: FrameType | None) -> None:
         self.signals += 1
@@ -338,6 +339,7 @@ class _TerminationGuard:
             )
             return
         self.armed = False
+        self.trigger = signal.Signals(signum).name
         raise SessionTerminated
 
     def disarm(self) -> None:
@@ -347,7 +349,7 @@ class _TerminationGuard:
 
 @contextlib.contextmanager
 def _sigterm_stops_the_session() -> Iterator[_TerminationGuard]:
-    """Install the SIGTERM handler for the length of a session, then restore it.
+    """Install the SIGTERM and SIGHUP handler for the length of a session, then restore it.
 
     Scoped to ``paper`` rather than the whole CLI, and installed at the entry point
     rather than on import, for the same reason logging is: a signal disposition is
@@ -361,20 +363,27 @@ def _sigterm_stops_the_session() -> Iterator[_TerminationGuard]:
     before ADR-0043, and says so once.
     """
     guard = _TerminationGuard()
+    # SIGHUP (a closed terminal / dropped ssh) takes the same finalizing exit; it
+    # does not exist on every platform, hence the getattr guard.
+    signums = [signal.SIGTERM]
+    sighup = getattr(signal, "SIGHUP", None)
+    if sighup is not None:
+        signums.append(sighup)
+    previous: dict[signal.Signals, object] = {}
     try:
-        previous = signal.signal(signal.SIGTERM, guard.handle)
+        for signum in signums:
+            previous[signum] = signal.signal(signum, guard.handle)
     except (ValueError, OSError, AttributeError) as exc:  # pragma: no cover - platform-specific
         logger.warning(
             "SIGTERM handling unavailable (%s); a stop signal will end this session "
             "without writing its artifacts — exit with Ctrl-C instead",
             exc,
         )
-        yield guard
-        return
     try:
         yield guard
     finally:
-        signal.signal(signal.SIGTERM, previous)
+        for signum, handler in previous.items():
+            signal.signal(signum, handler)  # type: ignore[arg-type]
 
 
 def _parse_date(label: str, value: str) -> datetime:
@@ -1488,7 +1497,9 @@ def backtest(
             symbol_slippage_bps=tiered_rates,
         )
     broker = SimulatedBroker(Portfolio(cash=cash), costs)
-    result = Engine(adapter, broker, Guardrails(risk)).run(strat, tickers, start, end)
+    result = Engine(adapter, broker, Guardrails(risk, periods_per_year=freq.periods_per_year)).run(
+        strat, tickers, start, end
+    )
 
     # Optional buy-and-hold benchmark on the same dates/source, run UNCONSTRAINED
     # (unlimited guardrails) so the benchmark itself is never clamped (Q24).
@@ -2079,7 +2090,9 @@ def paper(
             journal=DivergenceJournal(divergence_csv),
         )
         tracked_broker = shadow
-    engine = Engine(adapter, tracked_broker, Guardrails(risk))
+    engine = Engine(
+        adapter, tracked_broker, Guardrails(risk, periods_per_year=freq.periods_per_year)
+    )
 
     # Warmup is what separates the two modes' *first* poll (ADR-0042). A --live
     # session opens onto a window of bars that closed before it started: those are
@@ -2197,7 +2210,9 @@ def paper(
                 # because "the orchestrator stopped the container" and "someone
                 # pressed Ctrl-C" are different facts to read in a log afterwards.
                 trigger = (
-                    "SIGTERM received" if isinstance(exc, SessionTerminated) else "Interrupted"
+                    f"{termination.trigger} received"
+                    if isinstance(exc, SessionTerminated)
+                    else "Interrupted"
                 )
                 logger.warning("%s — finalizing the session", trigger)
                 typer.echo(f"\n{trigger} — finalizing with the bars processed so far.")

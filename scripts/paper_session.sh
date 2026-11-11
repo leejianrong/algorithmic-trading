@@ -7,8 +7,8 @@
 #   * a --out that is unique per launch. ADR-0048 truncates fill_divergence.csv at
 #     session start, so a retry into an occupied directory destroys exactly the
 #     partial rows ADR-0048 exists to preserve.
-#   * a detached launch. SIGHUP is not handled (ADR-0043's stated gap), so a closed
-#     terminal kills the run.
+#   * a detached launch. A closed terminal sends SIGHUP, which `paper` now finalizes on
+#     (exit 0) rather than trading on; detaching keeps the run going.
 #   * a stop that is SIGTERM and never SIGKILL, so the session finalizes (ADR-0043).
 #
 # The command itself is never rewritten here: it is echoed in full at every launch
