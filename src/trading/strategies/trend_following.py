@@ -60,6 +60,11 @@ class TrendFollowing:
         self._bar_index = 0
         self._last_rebalance: int | None = None
 
+    @property
+    def min_history_bars(self) -> int:
+        """Bars of history needed before this strategy can emit a signal (KAN-702)."""
+        return self.lookback + self.skip_recent + 1
+
     def on_bar(
         self,
         ts: datetime,

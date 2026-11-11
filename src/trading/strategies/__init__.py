@@ -67,3 +67,17 @@ def free_parameter_count(strategy: Strategy | type[Strategy]) -> int:
         if name != "self"
         and param.kind not in (inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD)
     )
+
+
+def required_history_bars(strategy: Strategy) -> int | None:
+    """Bars of history ``strategy`` declares it needs, or ``None`` if it declares none.
+
+    The optional ``min_history_bars`` attribute is how a lookback strategy says how
+    many bars it must see before it can act, derived from its own constructor
+    params. A live session compares it with the primed bar count (KAN-702); a
+    strategy that does not declare it, or declares something unusable, is silent.
+    """
+    needed = getattr(strategy, "min_history_bars", None)
+    if isinstance(needed, bool) or not isinstance(needed, int) or needed < 1:
+        return None
+    return needed
