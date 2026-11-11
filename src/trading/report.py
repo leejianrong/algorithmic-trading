@@ -42,6 +42,7 @@ from __future__ import annotations
 
 import csv
 import json
+from collections.abc import Mapping
 from dataclasses import asdict
 from datetime import timedelta
 from pathlib import Path
@@ -102,6 +103,7 @@ def summarize(
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
     diversified_baseline: DiversifiedBaselineReport | None = None,
+    strategy_params: Mapping[str, object] | None = None,
 ) -> str:
     """A human-readable run summary: the metrics block plus guardrail lines.
 
@@ -154,6 +156,11 @@ def summarize(
     metrics = compute(result, periods_per_year, free_parameters=free_parameters)
     lines = [f"Symbols:       {', '.join(result.symbols)}"]
     lines.extend(_absent_lines(result))
+    # Only when the operator overrode strategy parameters (``backtest --param``): a
+    # run on shipped defaults prints exactly the block it always has.
+    if strategy_params:
+        pretty = ", ".join(f"{k}={v}" for k, v in strategy_params.items())
+        lines.append(f"Params:        {pretty}")
     lines.extend(
         [
             f"Starting cash: ${result.starting_cash:,.2f}",
@@ -822,6 +829,7 @@ def result_to_dict(
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
     diversified_baseline: DiversifiedBaselineReport | None = None,
+    strategy_params: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     """Build the canonical, JSON-serializable dict describing a completed run.
 
@@ -1135,6 +1143,11 @@ def result_to_dict(
     # ``--diversified-baseline`` must write the exact bytes it always has.
     if diversified_baseline is not None:
         payload["diversified_baseline"] = asdict(diversified_baseline)
+    # Strategy parameters the operator overrode (``backtest --param``). Same
+    # omitted-entirely convention as ``regimes``: a run on shipped defaults must
+    # write the exact bytes it always has.
+    if strategy_params:
+        payload["strategy_params"] = dict(strategy_params)
     return payload
 
 
@@ -1154,6 +1167,7 @@ def write_result_json(
     monte_carlo: MonteCarloShuffleReport | None = None,
     cost_budget: CostBudgetReport | None = None,
     diversified_baseline: DiversifiedBaselineReport | None = None,
+    strategy_params: Mapping[str, object] | None = None,
 ) -> None:
     """Serialize ``result`` via :func:`result_to_dict` and write it to ``path``.
 
@@ -1174,6 +1188,7 @@ def write_result_json(
         monte_carlo=monte_carlo,
         cost_budget=cost_budget,
         diversified_baseline=diversified_baseline,
+        strategy_params=strategy_params,
     )
     path.parent.mkdir(parents=True, exist_ok=True)
     with path.open("w") as fh:
