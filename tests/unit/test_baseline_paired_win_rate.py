@@ -68,8 +68,10 @@ class TestReport:
         strat, base = _pair()
         rep = assess_diversified_baseline(strat, base, label="eq/x")
         paired = paired_bootstrap(strat.equity_curve, base.equity_curve, resamples=50, seed=2)
-        with_p = result_to_dict(strat, diversified_baseline=rep, baseline_paired=paired)
-        without = result_to_dict(strat, diversified_baseline=rep)
+        with_p = result_to_dict(
+            strat, mode="backtest", diversified_baseline=rep, baseline_paired=paired
+        )
+        without = result_to_dict(strat, mode="backtest", diversified_baseline=rep)
         assert with_p["diversified_baseline"]["paired"]["win_rate"] == 1.0
         assert "paired" not in without["diversified_baseline"]
         assert with_p["schema_version"] == 1
