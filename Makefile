@@ -76,7 +76,7 @@ ci-local:  ## Everything on CI's merge path, locally (the six required checks).
 # things an overnight run needs and the CLI does not provide: a preflight, a
 # --out that is unique per launch (ADR-0048 truncates fill_divergence.csv at
 # session start, so a retry into an occupied directory destroys the previous
-# attempt's rows), and a detached launch (SIGHUP is unhandled, ADR-0043). The raw
+# attempt's rows), and a detached launch (SIGHUP finalizes and stops a foreground run; detaching keeps it trading). The raw
 # command stays visible: it is echoed at every launch and written to
 # <out>/launch.cmd. Nothing here runs in CI or touches `check`.
 PAPER_STRATEGY ?= sma_crossover

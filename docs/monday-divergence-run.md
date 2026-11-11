@@ -121,7 +121,7 @@ uv run --env-file .env trading paper --strategy sma_crossover --symbols @blue20 
 symbols, interval, source, broker, feed and flags — so the block above is still
 what executes, and every launch echoes it in full and copies it to
 `<out>/launch.cmd`. Two reasons the target exists rather than typing this: a
-closed terminal kills a foreground session (SIGHUP is not handled), and a fixed
+closed terminal ends a foreground session (SIGHUP now finalizes it, but detaching is still the safer habit), and a fixed
 `--out` would truncate an earlier attempt's `fill_divergence.csv` at startup
 (ADR-0048), which is precisely the evidence a retry is trying not to lose. The
 strategy, symbols and interval stay overridable — `make paper-live
@@ -172,7 +172,8 @@ finalizes cleanly (ADR-0043) — but it changes what "watch for X" means everywh
 below. You are not watching; you are reading the evidence on Tuesday morning. Two
 consequences worth acting on:
 
-- **Detach the session, or a closed terminal kills it.** SIGHUP is not handled.
+- **Detach the session; a closed terminal sends SIGHUP.** `paper` now treats SIGHUP like
+  SIGTERM (finalizes, exit 0), but a detached run keeps trading rather than stopping.
   `make paper-live` does this for you — `tmux` if it is installed (recommended: you
   can reattach on Tuesday with `tmux attach -t paper-<stamp>` and read the
   scrollback), `setsid` otherwise, and it prints which one it used. Launching the
@@ -218,8 +219,9 @@ unexpectedly when it finally exits. It is not.
 artifacts, and since ADR-0043 SIGTERM takes the same path, so `kill <pid>` from
 another terminal — or `docker stop`, or `systemd stop` — finalizes the run instead of
 destroying it. The summary names which one stopped it. Two things that are still not
-safe: `kill -9`, which by definition cannot be caught, and **closing the terminal**,
-which sends SIGHUP and is not handled. Watched directly: a SIGHUP to a running
+safe: `kill -9`, which by definition cannot be caught, and (historically)
+**closing the terminal**: SIGHUP is now handled like SIGTERM and finalizes, but before
+that a SIGHUP to a running
 session's process group killed it in under a second and left `equity_curve.csv` and
 `result.json` unwritten — only `paper_session.log` and the incrementally journaled
 `fill_divergence.csv` (ADR-0048) survived. `make paper-live` is what avoids that; it

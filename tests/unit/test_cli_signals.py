@@ -65,7 +65,9 @@ def _drain(stream: IO[str], sink: queue.Queue[str | None]) -> None:
     sink.put(None)
 
 
-def _run_until_warmup_then_signal(out_dir: Path, signals: int) -> TerminatedRun:
+def _run_until_warmup_then_signal(
+    out_dir: Path, signals: int, sig: signal.Signals = signal.SIGTERM
+) -> TerminatedRun:
     """Start a live paper session, wait for its warmup line, then signal it.
 
     ``signals`` SIGTERMs are delivered back to back; one is the deployment case,
@@ -116,7 +118,7 @@ def _run_until_warmup_then_signal(out_dir: Path, signals: int) -> TerminatedRun:
 
         sent_at = time.monotonic()
         for _ in range(signals):
-            child.send_signal(signal.SIGTERM)
+            child.send_signal(sig)
         returncode = child.wait(timeout=EXIT_TIMEOUT_S)
         finalize_seconds = time.monotonic() - sent_at
     finally:
@@ -258,3 +260,35 @@ class TestSecondSigtermDoesNotAbortFinalization:
         payload = json.loads((run.out_dir / "result.json").read_text())
         assert payload["mode"] == "paper"
         assert (run.out_dir / "equity_curve.csv").exists()
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGHUP"), reason="no SIGHUP on this platform")
+class TestSighupFinalizes:
+    """A closed terminal (SIGHUP) takes the same finalizing exit as SIGTERM.
+
+    The child is launched as ``python -m trading.cli``, never via ``uv run``: uv
+    installs its own SIGHUP handler in the wrapper (CLAUDE.md, ADR-0051), which
+    would swallow or alter the signal under test. Readiness is polled from the
+    child's own warmup line (see the helper), not a fixed sleep.
+    """
+
+    def test_real_sighup_exits_zero_with_every_artifact(self, tmp_path: Path) -> None:
+        run = _run_until_warmup_then_signal(tmp_path, signals=1, sig=signal.SIGHUP)
+
+        assert run.returncode == 0, run.stdout
+        assert "SIGHUP received" in run.stdout, run.stdout
+        for name in ("equity_curve.csv", "result.json", "paper_session.log"):
+            assert (run.out_dir / name).exists(), f"{name} missing\n{run.stdout}"
+        assert json.loads((run.out_dir / "result.json").read_text())["mode"] == "paper"
+
+    def test_the_sighup_handler_is_installed_then_restored(self) -> None:
+        before = signal.getsignal(signal.SIGHUP)
+        with _sigterm_stops_the_session() as guard:
+            assert signal.getsignal(signal.SIGHUP) == guard.handle
+        assert signal.getsignal(signal.SIGHUP) == before
+
+    def test_sighup_during_finalization_is_dropped(self) -> None:
+        guard = _TerminationGuard()
+        guard.disarm()
+        guard.handle(signal.SIGHUP, None)  # returns instead of raising
+        assert guard.signals == 1
