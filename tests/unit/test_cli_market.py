@@ -32,6 +32,7 @@ from __future__ import annotations
 import csv
 import json
 from datetime import UTC, datetime, timedelta
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -822,25 +823,6 @@ class TestCryptoShapedSymbolGuard:
 class TestUnsupportedSurfacesError:
     """An unsupported combination must error, never be accepted and dropped."""
 
-    def test_gen_data_has_no_market_flag(self, tmp_path: Path) -> None:
-        """Generation is the sibling card's axis (KAN-830), so the flag is absent."""
-        result = runner.invoke(
-            app,
-            [
-                "gen-data",
-                "--symbols",
-                "AAA",
-                "--market",
-                "crypto",
-                "--out-dir",
-                str(tmp_path),
-                *_RANGE,
-            ],
-        )
-
-        assert result.exit_code == 2
-        assert "No such option" in result.output
-
     def test_dashboard_has_no_market_flag(self, tmp_path: Path) -> None:
         """The market is a property of the ``result.json`` it reads, not an input."""
         result = runner.invoke(
@@ -871,3 +853,123 @@ class TestUnsupportedSurfacesError:
         assert result.exit_code == 0, result.output
         assert "Market:" not in result.output
         assert "annualized on the us_equity basis" not in result.output
+
+
+# --- gen-data takes the same market (KAN-830 follow-up) -------------------------
+
+
+def _gen(out_dir: Path, *extra: str, symbols: str = "AAA") -> Result:
+    return runner.invoke(
+        app,
+        [
+            "gen-data",
+            "--symbols",
+            symbols,
+            "--seed",
+            "5",
+            "--out-dir",
+            str(out_dir),
+            *_RANGE,
+            *extra,
+        ],
+    )
+
+
+def _read_ts(path: Path) -> list[datetime]:
+    with path.open(newline="") as fh:
+        return [datetime.strptime(r["ts"], "%Y-%m-%d") for r in csv.DictReader(fh)]
+
+
+class TestGenDataMarket:
+    def test_crypto_writes_every_calendar_day(self, tmp_path: Path) -> None:
+        result = _gen(tmp_path, "--market", "crypto")
+
+        assert result.exit_code == 0, result.output
+        ts = _read_ts(tmp_path / "AAA_20210101_20210630_adj.csv")
+        # 2021-01-01..2021-06-30 inclusive is 181 calendar days, weekends included.
+        assert len(ts) == 181
+        assert {t.weekday() for t in ts} >= {5, 6}
+        assert all(b - a == timedelta(days=1) for a, b in pairwise(ts))
+
+    def test_equity_default_stays_weekday_only_and_matches_explicit_flag(
+        self, tmp_path: Path
+    ) -> None:
+        default, explicit = tmp_path / "d", tmp_path / "e"
+        assert _gen(default).exit_code == 0
+        assert _gen(explicit, "--market", "us_equity").exit_code == 0
+        name = "AAA_20210101_20210630_adj.csv"
+
+        assert (default / name).read_bytes() == (explicit / name).read_bytes()
+        assert all(t.weekday() < 5 for t in _read_ts(default / name))
+        assert len(_read_ts(default / name)) == 129
+
+    def test_equity_default_bytes_are_pinned(self, tmp_path: Path) -> None:
+        import hashlib
+
+        assert _gen(tmp_path, symbols="AAA,BBB").exit_code == 0
+        digests = {
+            p.name: hashlib.sha256(p.read_bytes()).hexdigest()[:16]
+            for p in sorted(tmp_path.glob("*.csv"))
+        }
+        assert digests == {
+            "AAA_20210101_20210630_adj.csv": "e8aa949f394f7ca4",
+            "BBB_20210101_20210630_adj.csv": "834dfc2c04b34480",
+        }
+
+    def test_unknown_market_exits_2_and_writes_nothing(self, tmp_path: Path) -> None:
+        result = _gen(tmp_path / "o", "--market", "mars")
+
+        assert result.exit_code == 2
+        assert "unknown --market" in result.output
+        assert not (tmp_path / "o").exists()
+
+    def test_crypto_shaped_symbol_on_session_market_is_refused(self, tmp_path: Path) -> None:
+        result = _gen(tmp_path / "o", symbols="BTC-USD")
+
+        assert result.exit_code == 2
+        assert "BTC-USD" in result.output
+        assert not (tmp_path / "o").exists()
+
+    def test_pair_with_slash_is_refused_rather_than_written_into_a_subdirectory(
+        self, tmp_path: Path
+    ) -> None:
+        result = _gen(tmp_path / "o", "--market", "crypto", symbols="BTC/USD")
+
+        assert result.exit_code == 2
+        assert "path separator" in result.output
+        assert not (tmp_path / "o").exists()
+
+    def test_generated_crypto_csv_round_trips_into_a_crypto_backtest(self, tmp_path: Path) -> None:
+        gen_dir, data = tmp_path / "gen", tmp_path / "data"
+        assert _gen(gen_dir, "--market", "crypto", symbols="BTC,ETH").exit_code == 0
+        data.mkdir()
+        for sym in ("BTC", "ETH"):
+            (data / f"{sym}.csv").write_bytes(
+                (gen_dir / f"{sym}_20210101_20210630_adj.csv").read_bytes()
+            )
+
+        out = tmp_path / "e.csv"
+        bt = runner.invoke(
+            app,
+            [
+                "backtest",
+                "--strategy",
+                "buy_and_hold",
+                "--source",
+                "csv",
+                "--cache-dir",
+                str(data),
+                "--symbols",
+                "BTC,ETH",
+                "--market",
+                "crypto",
+                "--no-plot",
+                "--out",
+                str(out),
+                *_RANGE,
+            ],
+        )
+
+        assert bt.exit_code == 0, bt.output
+        rows = list(csv.DictReader(out.open()))
+        assert len(rows) == 181
