@@ -95,7 +95,7 @@ import os
 import statistics
 from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
-from typing import IO, TYPE_CHECKING, Protocol, cast
+from typing import IO, TYPE_CHECKING, Any, Protocol, cast
 
 from trading.broker import SimulatedBroker
 from trading.config import CostConfig
@@ -922,6 +922,72 @@ def divergence_rows(records: Sequence[FillDivergence]) -> list[dict[str, str]]:
             }
         )
     return rows
+
+
+def _seconds_or_none(value: timedelta | None) -> float | None:
+    return value.total_seconds() if value is not None else None
+
+
+def divergence_to_dict(
+    summary: DivergenceSummary, records: Sequence[FillDivergence]
+) -> dict[str, Any]:
+    """The printed block's numbers as a JSON-serializable dict (``result.json``).
+
+    Nothing is recomputed differently from :func:`render_report`: the aggregates are
+    the :class:`DivergenceSummary` fields, the wording is :func:`_verdict` verbatim,
+    and ``rows`` is :func:`divergence_rows` (the same flat strings the CSV holds).
+    The only derived figure is the buy/sell split, taken over the same *comparable*
+    rows the summary's mean uses.
+    """
+    by_side: dict[str, dict[str, Any]] = {}
+    for side in (Side.BUY, Side.SELL):
+        values = [
+            bps
+            for r in records
+            if r.comparable and r.side is side and (bps := r.realized_slippage_bps) is not None
+        ]
+        by_side[side.value] = {
+            "n": len(values),
+            "mean_realized_bps": statistics.fmean(values) if values else None,
+        }
+    stale = summary.stale_reference_fills > 0
+    return {
+        "price_notion": summary.price_notion,
+        "modelled_slippage_bps": summary.modelled_slippage_bps,
+        "modelled_commission_per_share": summary.modelled_commission_per_share,
+        "modelled_taker_fee_bps": summary.modelled_taker_fee_bps,
+        "orders": summary.orders,
+        "comparable": summary.comparable,
+        "min_samples": summary.min_samples,
+        "conclusive": summary.conclusive,
+        "verdict": _verdict(summary).strip(),
+        "outcome_divergences": summary.outcome_divergences,
+        "live_only_fills": summary.live_only_fills,
+        "model_only_fills": summary.model_only_fills,
+        "unmatched_live_fills": summary.unmatched_live_fills,
+        "unmatched_live_rejections": summary.unmatched_live_rejections,
+        "submit_refusals": summary.submit_refusals,
+        "mean_realized_bps": summary.mean_realized_bps,
+        "median_realized_bps": summary.median_realized_bps,
+        "max_realized_bps": summary.max_realized_bps,
+        "stdev_realized_bps": summary.stdev_realized_bps,
+        "mean_error_bps": summary.mean_error_bps,
+        "mean_latency_seconds": _seconds_or_none(summary.mean_latency),
+        "max_latency_seconds": _seconds_or_none(summary.max_latency),
+        "by_side": by_side,
+        "reference_staleness": (
+            {
+                "stale_fills": summary.stale_reference_fills,
+                "lag_min_seconds": _seconds_or_none(summary.reference_lag_min),
+                "lag_median_seconds": _seconds_or_none(summary.reference_lag_median),
+                "lag_max_seconds": _seconds_or_none(summary.reference_lag_max),
+            }
+            if stale
+            else None
+        ),
+        "errors": list(summary.errors),
+        "rows": divergence_rows(records),
+    }
 
 
 class DivergenceJournal:

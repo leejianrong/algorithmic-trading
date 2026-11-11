@@ -12,6 +12,7 @@ width and broke CI once.
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from typer.testing import CliRunner, Result
@@ -19,8 +20,6 @@ from typer.testing import CliRunner, Result
 from trading.cli import app
 
 runner = CliRunner()
-
-_ARTIFACTS = ("equity_curve.csv", "result.json")
 
 
 def _invoke(out: Path, *extra: str) -> Result:
@@ -68,8 +67,17 @@ class TestDivergenceIsOffByDefault:
         assert _invoke(plain).exit_code == 0
         assert _invoke(tracked, "--divergence").exit_code == 0
 
-        for name in _ARTIFACTS:
-            assert (tracked / name).read_bytes() == (plain / name).read_bytes(), name
+        assert (tracked / "equity_curve.csv").read_bytes() == (
+            plain / "equity_curve.csv"
+        ).read_bytes()
+        # result.json gains exactly one additive key (ADR-0086); everything else,
+        # and the file without the flag, is unchanged.
+        plain_doc = json.loads((plain / "result.json").read_text())
+        tracked_doc = json.loads((tracked / "result.json").read_text())
+        assert "divergence" not in plain_doc
+        assert "divergence" in tracked_doc
+        del tracked_doc["divergence"]
+        assert tracked_doc == plain_doc
 
 
 class TestDivergenceOutput:

@@ -870,6 +870,7 @@ def result_to_dict(
     cost_budget: CostBudgetReport | None = None,
     diversified_baseline: DiversifiedBaselineReport | None = None,
     baseline_paired: PairedBootstrap | None = None,
+    divergence: Mapping[str, object] | None = None,
     strategy_params: Mapping[str, object] | None = None,
     stop: tuple[str, str] | None = None,
 ) -> dict[str, Any]:
@@ -974,6 +975,11 @@ def result_to_dict(
                            "correlation": float | null, "information_ratio": float | null},
             "notes": list[str]
           }   # present only when the caller supplied a DiversifiedBaselineReport
+          "divergence": {   # ADR-0086, additive; KEY OMITTED ENTIRELY unless paper --divergence
+            # divergence.divergence_to_dict: price_notion, modelled_*_bps, comparable,
+            # min_samples, conclusive, verdict, mean/median/max/stdev_realized_bps,
+            # by_side, reference_staleness | null, errors, rows (flat CSV rows)
+          }
         }
 
     The ``episode_count``/``episodes`` keys (ADR-0031), the top-level ``absent``
@@ -1189,6 +1195,10 @@ def result_to_dict(
         # ``--bootstrap`` produced one, so the ADR-0071 block's bytes are unchanged.
         if baseline_paired is not None:
             payload["diversified_baseline"]["paired"] = asdict(baseline_paired)
+    # The fill-divergence block (ADR-0038/0086). Omitted entirely unless
+    # ``paper --divergence`` supplied it, so every other run keeps its bytes.
+    if divergence is not None:
+        payload["divergence"] = dict(divergence)
     # Strategy parameters the operator overrode (``backtest --param``). Same
     # omitted-entirely convention as ``regimes``: a run on shipped defaults must
     # write the exact bytes it always has.
@@ -1218,6 +1228,7 @@ def write_result_json(
     cost_budget: CostBudgetReport | None = None,
     diversified_baseline: DiversifiedBaselineReport | None = None,
     baseline_paired: PairedBootstrap | None = None,
+    divergence: Mapping[str, object] | None = None,
     strategy_params: Mapping[str, object] | None = None,
     stop: tuple[str, str] | None = None,
 ) -> None:
@@ -1241,6 +1252,7 @@ def write_result_json(
         cost_budget=cost_budget,
         diversified_baseline=diversified_baseline,
         baseline_paired=baseline_paired,
+        divergence=divergence,
         strategy_params=strategy_params,
         stop=stop,
     )

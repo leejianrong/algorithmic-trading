@@ -165,6 +165,7 @@ from trading.divergence import (
     NOTION_RAW,
     DivergenceJournal,
     ShadowBroker,
+    divergence_to_dict,
     render_report,
     write_divergence_csv,
 )
@@ -2320,6 +2321,11 @@ def paper(
 
         metrics = compute_metrics(result, freq.periods_per_year, free_parameters=free_params)
         result_json = out / "result.json"
+        # The shadow's rows are final once the session is (open orders are rows
+        # too, ADR-0036), so the same records feed result.json and the CSV below.
+        divergence_block = (
+            divergence_to_dict(shadow.summary, shadow.divergences) if shadow is not None else None
+        )
         write_result_json(
             result,
             result_json,
@@ -2329,6 +2335,7 @@ def paper(
             metrics=metrics,
             significance=significance,
             stop=(session.stop.reason, session.stop.detail) if session.stop else None,
+            divergence=divergence_block,
         )
 
         # Appended whether or not --bootstrap ran: the ledger's own bookkeeping is
