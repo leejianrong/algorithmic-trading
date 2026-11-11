@@ -18,6 +18,8 @@ If code and prose disagree, **the code wins** — fix the prose in the same PR.
   slices, decision register.
 - [`docs/research-playbook.md`](docs/research-playbook.md) — hypothesis-to-live-capital loop.
   [`docs/monday-divergence-run.md`](docs/monday-divergence-run.md) — live paper runbook.
+- [`docs/anthropic-ipo/`](docs/anthropic-ipo/) — pre-registered plan for a manual, defined-risk put-spread trade
+  on a post-IPO fade (ADR-0076/0077). Manual only: the bench has no options support.
 - Code map: `src/trading/` — `engine.py` (shared `_step`, `Engine.run`, `PaperSession`),
   `broker.py`, `brokers/alpaca.py`, `risk.py`, `sizing.py`, `metrics.py`, `sweep.py`,
   `report.py`, `divergence.py`, `cli.py`, `data/*` adapters, `strategies/`. Explore the
