@@ -1614,3 +1614,37 @@ As of this writing:
 
 If code and prose disagree, the code wins — update the prose.
 
+- **A ten-card hardening batch, landed in one day (2026-11-12, PRs #122–#131):** gaps this
+  log had recorded against itself, each closed by its own PR with a failing test first and a
+  mutation check. **Vol-target basis** (ADR-0078): `Guardrails` takes `periods_per_year`
+  instead of a hard-coded 252, so `--market crypto --target-vol` no longer allows ~20.4% more
+  gross; a US-equity *intraday* `--target-vol` run now also annualizes on its own interval
+  (previously wrong the same way as ADR-0059's sweep bug); daily equity byte-identical.
+  **`gen-data --market`** writes 24/7 bars; it also refuses `/` or `\` in a symbol (a real
+  crypto symbol like `BTC/USD` would have become a subdirectory and crashed). **yfinance
+  share-class tickers** (ADR-0080): `BRK.B` → `BRK-B` at the adapter boundary only (cache key,
+  `Bar.symbol` and absence reports keep the typed name); a plain 404 for a still-listed name
+  is **deliberately still read as absence** — it cannot be told from a late listing without a
+  live lookup, which belongs in the nightly `network` layer. **SIGHUP** now takes the same
+  finalizing exit as SIGTERM, proved with a real signal to a real subprocess. **`backtest
+  --param`** reuses sweep's parser, so a confirm run can use the tested winner; parity with a
+  single-combo `sweep` is asserted. **`PaperSession.stop`** records *why* a session ended
+  (ADR-0083; silence tolerance, bar/poll limit, replay complete, interrupted, terminated),
+  surfaced on stdout, the log and `result.json`; a crash or `kill -9` still records nothing.
+  **Paired win rate vs the diversified baseline** (ADR-0084), under `--bootstrap`.
+  **Primed-history warning** (KAN-702): strategies declare `min_history_bars`; a live session
+  warns once if priming left it short, never blocks. **Divergence in `result.json`** (ADR-0086)
+  plus a static-dashboard panel, key omitted unless `--divergence`. `RESULT_SCHEMA_VERSION`
+  stays **1**. **Also recorded:** `tests/unit/test_cli_signals.py::TestSigtermFinalizes::
+  test_the_session_log_kept_the_warmup_record` is flaky under heavy machine load (observed
+  failing on an unmodified base commit; passes in isolation and in CI) — fix it by polling
+  rather than reading once. Not yet built: the live-view divergence panel has no verdict
+  wording or fee caveat (the static export does).
+- **A manual defined-risk plan for a post-IPO fade (2026-11-12, ADR-0076/0077, PR #121):**
+  `docs/anthropic-ipo/` pre-registers rules for one manual bear-put-spread trade (max loss
+  $500, no-trade is a valid result) on the thesis that hyped tech IPOs fade. The bench has
+  **no options support** (ADR-0011) and cannot test it; `research/ipo-fade/ipo_comps.py`
+  measures 21 US IPOs from the day-2 close (first day options trade): down at +20 trading days
+  in 16/21 (median -11.7%), **not stronger for bigger pops**, with violent right tails (CRWV
+  +326%, CRCL +90%). Offer prices are unverified and the set is hindsight-picked. Alpaca paper
+  keys have options Level 3; whether a funded **live** account exists is an open owner to-do.

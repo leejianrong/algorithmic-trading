@@ -121,7 +121,8 @@ orders; flattening is manual (see the runbook).
 
 ## Known live gaps (verify against code before relying on)
 
-No market-calendar-aware sleep (KAN-687); `fetch_span`, `MIN_LIVE_EMPTY_POLLS` and
-`risk.py`'s `_TRADING_DAYS = 252` are still equity-shaped; `halt_cooldown_bars` is a count,
-not a duration; survivorship bias is documented and unfixed on price data (ADR-0027/0064);
-the fill-divergence report cannot see the crypto fee, which is taken in quantity.
+No market-calendar-aware sleep (KAN-687); `fetch_span` and `MIN_LIVE_EMPTY_POLLS` are still
+equity-shaped; `halt_cooldown_bars` is a count, not a duration; survivorship bias is
+documented and unfixed on price data (ADR-0027/0064); the fill-divergence report cannot see
+the crypto fee (taken in quantity); a plain yfinance 404 reads as absence (ADR-0080);
+`TestSigtermFinalizes::test_the_session_log_kept_the_warmup_record` is flaky under load.
