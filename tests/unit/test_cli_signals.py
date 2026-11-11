@@ -197,6 +197,12 @@ class TestSigtermFinalizes:
         assert "SIGTERM received" in terminated.stdout, terminated.stdout
         assert "paper session finished" in terminated.stdout, terminated.stdout
 
+    def test_the_stop_reason_names_the_signal(self, terminated: TerminatedRun) -> None:
+        """ADR-0083: a real SIGTERM is reported as ``terminated`` on every surface."""
+        assert "Stopped: terminated" in terminated.stdout, terminated.stdout
+        payload = json.loads((terminated.out_dir / "result.json").read_text())
+        assert payload["stop"]["reason"] == "terminated"
+
     def test_finalizes_inside_the_docker_grace_period(self, terminated: TerminatedRun) -> None:
         """SIGKILL lands 10s after SIGTERM by default; finalizing must fit inside it."""
         assert terminated.finalize_seconds < DOCKER_GRACE_PERIOD_S, terminated.finalize_seconds
