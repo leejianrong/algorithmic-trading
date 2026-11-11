@@ -86,3 +86,20 @@ class TestWarmupShortfallLine:
              "--out", str(tmp_path)],
         )  # fmt: skip
         assert "WARNING: primed" not in res.output
+
+
+class TestBoundary:
+    """The first live bar joins the primed history, so primed == needed - 1 is enough."""
+
+    def test_edges(self) -> None:
+        from datetime import timedelta
+
+        from trading.cli import _warmup_shortfall_line
+
+        strat = SmaCrossover(fast=5, slow=30)
+        day = timedelta(days=1)
+        assert _warmup_shortfall_line(strat, 30, day, "1d") is None
+        assert _warmup_shortfall_line(strat, 29, day, "1d") is None
+        two = _warmup_shortfall_line(strat, 28, day, "1d")
+        assert two is not None and "live bar 2" in two and "2 days" in two
+        assert _warmup_shortfall_line(strat, 0, timedelta(minutes=5), "5m") is not None
