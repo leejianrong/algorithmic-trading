@@ -277,6 +277,86 @@ def _significance_panel(document: dict[str, Any]) -> str:
     )
 
 
+def _opt(value: Any) -> str:
+    """Like :func:`_num`, but a missing statistic reads ``n/a`` rather than ``None``."""
+    return "n/a" if value is None else _num(value)
+
+
+def _divergence_panel(document: dict[str, Any]) -> str:
+    """The fill-divergence panel (ADR-0038/0086), or nothing at all.
+
+    Rendered only when ``paper --divergence`` put a ``divergence`` key in the
+    document; a run without the flag has no such key and the page stays silent. The
+    verdict is the report's own sentence, passed through verbatim, so a sample
+    below the minimum reads "neither confirmed nor refuted" here exactly as it does
+    in the terminal. The venue-fee caveat is shown whenever the cost model carries
+    a fee or the run's market is not a session market, because the report compares
+    fill prices and cannot see a fee taken out of the received asset.
+    """
+    block = document.get("divergence")
+    if not isinstance(block, dict):
+        return ""
+    stdev = block.get("stdev_realized_bps")
+    tiles = [
+        _tile(
+            "Paired fills", f"{_num(block.get('comparable'))} / {_num(block.get('min_samples'))}"
+        ),
+        _tile("Mean realized (bps)", _opt(block.get("mean_realized_bps"))),
+        _tile("Median realized (bps)", _opt(block.get("median_realized_bps"))),
+        _tile("Stdev (bps)", _opt(stdev)),
+        _tile("Modelled (bps)", _num(block.get("modelled_slippage_bps"))),
+        _tile("Price notion", str(block.get("price_notion", "n/a"))),
+    ]
+    side_rows = [
+        [_esc(side), _num(v.get("n")), _opt(v.get("mean_realized_bps"))]
+        for side, v in (block.get("by_side") or {}).items()
+    ]
+    verdict_class = "muted" if block.get("conclusive") else "warn"
+    parts = [
+        '<section class="panel"><h2>Fill divergence</h2>',
+        f'<div class="tiles">{"".join(tiles)}</div>',
+        f'<p class="{verdict_class}">{_esc(block.get("verdict", ""))}</p>',
+    ]
+    fee = block.get("modelled_taker_fee_bps") or 0
+    if fee or document.get("market", "us_equity") != "us_equity":
+        parts.append(
+            f'<p class="warn">Venue fee: {_num(fee)} bps of notional &mdash; NOT MEASURED BY '
+            "THIS REPORT. The figures here compare fill prices, and this fee is taken out of "
+            "the received asset, so it moves neither the realized nor the modelled number.</p>"
+        )
+    stale = block.get("reference_staleness")
+    if isinstance(stale, dict):
+        parts.append(
+            f'<p class="warn">Reference staleness: {_num(stale.get("stale_fills"))} fill(s) '
+            "were priced against a bar later than the tightest gap seen; this tape skips "
+            "intervals, so that drift is inside the slippage above.</p>"
+        )
+    parts.append(_table(["Side", "Paired fills", "Mean realized (bps)"], side_rows, "No fills."))
+    rows = block.get("rows") or []
+    table_rows = [
+        [
+            _esc(r.get("submitted_ts", "")),
+            _esc(r.get("symbol", "")),
+            _esc(r.get("side", "")),
+            _esc(r.get("live_outcome", "")),
+            _esc(r.get("model_outcome", "")),
+            _esc(r.get("realized_slippage_bps", "")),
+            _esc(r.get("modelled_slippage_bps", "")),
+        ]
+        for r in rows
+        if isinstance(r, dict)
+    ]
+    parts.append(
+        _table(
+            ["Submitted", "Symbol", "Side", "Live", "Model", "Realized bps", "Modelled bps"],
+            table_rows,
+            "No tracked orders.",
+        )
+    )
+    parts.append("</section>")
+    return "".join(parts)
+
+
 def _tile(label: str, rendered: str) -> str:
     """One metric tile — the shape every panel above already uses."""
     return (
@@ -583,6 +663,7 @@ def render_html(payload: dict[str, Any]) -> str:
 </section>
 {_benchmark_panel(document)}
 {_significance_panel(document)}
+{_divergence_panel(document)}
 <section class="panel">
   <h2>Fills</h2>
   {_fills_table(document.get("fills", []))}
