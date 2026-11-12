@@ -1637,8 +1637,10 @@ If code and prose disagree, the code wins — update the prose.
   plus a static-dashboard panel, key omitted unless `--divergence`. `RESULT_SCHEMA_VERSION`
   stays **1**. **Also recorded:** `tests/unit/test_cli_signals.py::TestSigtermFinalizes::
   test_the_session_log_kept_the_warmup_record` is flaky under heavy machine load (observed
-  failing on an unmodified base commit; passes in isolation and in CI) — fix it by polling
-  rather than reading once. Not yet built: the live-view divergence panel has no verdict
+  failing on an unmodified base commit; passes in isolation and in CI) — root cause found
+  2026-11-12: `announce_warmup` echoed to stdout before writing `paper_session.log`, so a
+  SIGTERM sent on seeing `Warmup:` could finalize before the log record existed. Fixed by
+  writing the log first (PR #133). Not yet built: the live-view divergence panel has no verdict
   wording or fee caveat (the static export does).
 - **A manual defined-risk plan for a post-IPO fade (2026-11-12, ADR-0076/0077, PR #121):**
   `docs/anthropic-ipo/` pre-registers rules for one manual bear-put-spread trade (max loss
