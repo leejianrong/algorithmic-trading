@@ -2234,15 +2234,17 @@ def paper(
                         f"{span[0]:%Y-%m-%d %H:%M}..{span[1]:%Y-%m-%d %H:%M} as history; "
                         "no orders submitted for them (ADR-0042)."
                     )
-                typer.echo(line + "\n")
+                # Log before echo: stdout is what a supervisor (and the signal test)
+                # reads as "warmed up", so the durable record must already exist then.
                 log_fh.write(line + "\n")
                 log_fh.flush()
+                typer.echo(line + "\n")
                 logger.info("%s", line)
                 short = _warmup_shortfall_line(strat, session.warmup_bars, freq.delta, freq.label)
                 if short:
-                    typer.echo(short + "\n")
                     log_fh.write(short + "\n")
                     log_fh.flush()
+                    typer.echo(short + "\n")
                     logger.warning("%s", short)
 
             def reporter(outcome: BarOutcome) -> None:
